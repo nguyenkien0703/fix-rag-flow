@@ -162,3 +162,28 @@ KB 500 doc nhanh (payload nhỏ, process không bị chiếm).
 - 2026-07-22: Xác định A gọi 2 API (162+241). Sửa nhận định (trước tưởng get_list 114). Chờ đo duration.
 - 2026-07-22: Điều tra B sơ bộ — nghi rerank 1024 candidate. Để TODO.
 - 2026-07-22: Root cause A = fetch-all 10k metadata parse Python. Verify cạm bẫy _id vs _source.
+
+═══════════════════════════════════════════════════════════════════
+## CÂU HỎI ANH ĐÔNG (2026-07-22): tích hợp trace có nhìn được request RagFlow→ES→về không?
+═══════════════════════════════════════════════════════════════════
+### FACT (đọc từ source RagFlow v0.24.0):
+1. RagFlow KHÔNG có tracing built-in được KÍCH HOẠT: grep opentelemetry|jaeger|zipkin|otel trong *.py = TRỐNG.
+2. Thư viện ES: elasticsearch==8.19.3, elastic-transport==8.17.1 (bản 8.x → CÓ OTEL support built-in trong elastic-transport._otel).
+3. opentelemetry-api/sdk/exporter-otlp CÓ trong uv.lock NHƯNG:
+   - KHÔNG có trong pyproject.toml → là transitive dependency, RagFlow không chủ động dùng.
+   - Code KHÔNG có TracerProvider/set_tracer_provider/OTLPSpanExporter/config nào → OTEL CHƯA được kích hoạt.
+   → Span ES (nếu elastic-transport tạo) KHÔNG được export đi đâu vì thiếu TracerProvider.
+4. Log duration ES (`ESConnection.search ... duration:4.9s`) KHÔNG phải RagFlow tự đo — là log của
+   logger `elastic_transport.transport` (thư viện tự log mỗi HTTP request tới ES kèm duration).
+   values.yaml có LOG_LEVELS "root=DEBUG" nên log này đang HIỆN.
+
+### TRẢ LỜI 100%:
+- CÓ THỂ trace được request RagFlow→ES→về. elastic-transport 8.x tự tạo span cho MỖI ES call NẾU config OTEL.
+- NHƯNG hiện tại CHƯA trace được: OTEL lib có sẵn nhưng CHƯA kích hoạt (không TracerProvider/exporter).
+- Để trace được cần TÍCH HỢP THÊM (không cần code nhiều):
+  (1) opentelemetry-instrumentation-flask (auto span cho HTTP request vào Flask)
+  (2) set TracerProvider + OTLPSpanExporter trỏ về collector (Jaeger/Tempo)
+  (3) elastic-transport tự thêm span ES con → thấy được ES tốn bao nhiêu ms trong tổng 30s.
+- CÁCH NHẸ HƠN (đã có sẵn, không cần tích hợp gì): 
+  * Log duration đã CÓ SẴN (elastic_transport, LOG_LEVELS=DEBUG) → grep log là biết ES tốn mấy giây / tổng bao nhiêu.
+  * ES ?profile=true → profile chi tiết 1 query. ES slowlog → log query chậm phía ES server.
