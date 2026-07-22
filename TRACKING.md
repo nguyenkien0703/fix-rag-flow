@@ -43,7 +43,16 @@
 ### 🔬 ĐANG CHỜ ĐO (bước hiện tại)
 - Log duration TỪNG API khi mở KB Voffice: /list vs /filter vs knowledge_graph — cái nào 44s?
   → quyết định fix cần đụng /list, /filter, hay cả hai.
-- [DÁN OUTPUT LOG VÀO ĐÂY]: _______________________________________________
+- ĐÃ ĐO (2026-07-22 18:27): KB Voffice thực tế = **141779 files (~142k doc, 1GB)**, KHÔNG phải 10k.
+  Network tab khi mở KB:
+    detail?kb_id=... → 200, 995ms & 1.94s (chậm nhưng KHÔNG 502)
+    list?kb_id=...&page_size=50&page=1 → **502 sau 34ms** (tức thì, KHÔNG phải 44s)
+    knowledge_graph → 502 sau 70ms
+    filter → 502 sau 38ms
+  Log: metadata _search duration 4.924s (1 search); knowledge_graph search size:1024.
+  ⚠️ PHÁT HIỆN MỚI: 502 lần này TỨC THÌ (34-70ms), KHÁC lần trước (8.7s). → KHÔNG phải request tự
+     chạy 44s rồi timeout. Nghi: server Werkzeug single-process đang BẬN (chạy _search 4.9s + search khác)
+     → request mới bị 502 ngay (upstream bận/đóng connection). CẦN đọc log full tìm nguyên nhân 502 tức thì.
 
 ### Bước tiếp theo (sau khi có log)
 1. Chốt API nào 44s → fix đúng chỗ.
@@ -80,6 +89,7 @@
 ═══════════════════════════════════════════════════════════════════
 ## NHẬT KÝ (mới nhất trên cùng)
 ═══════════════════════════════════════════════════════════════════
+- 2026-07-22 18:27: KB Voffice = 142k doc (không phải 10k). 502 TỨC THÌ 34ms (khác 8.7s lần trước). Nghi server single-process bận → 502 ngay. Cần log full.
 - 2026-07-22: Xác định A gọi 2 API (162+241). Sửa nhận định (trước tưởng get_list 114). Chờ đo duration.
 - 2026-07-22: Điều tra B sơ bộ — nghi rerank 1024 candidate. Để TODO.
 - 2026-07-22: Root cause A = fetch-all 10k metadata parse Python. Verify cạm bẫy _id vs _source.
