@@ -54,6 +54,23 @@
      chạy 44s rồi timeout. Nghi: server Werkzeug single-process đang BẬN (chạy _search 4.9s + search khác)
      → request mới bị 502 ngay (upstream bận/đóng connection). CẦN đọc log full tìm nguyên nhân 502 tức thì.
 
+### PHÂN TÍCH SỐ LIỆU 18:27 (fact vs giả thuyết — đọc kỹ)
+
+**FACT (quan sát trực tiếp):**
+1. KB Voffice = **141,779 files (~142k doc, 1GB)** — KHÔNG phải 10k. `size:10000` chỉ là limit trần của
+   `_search_metadata`; thực tế KB có 142k doc → kéo full càng nặng hơn nhiều.
+2. list/filter/knowledge_graph trả **502 nhưng RẤT NHANH (34-70ms)** — KHÔNG phải chậm 44s. 502 tức thì.
+   Còn `detail` thì 200 nhưng chậm (995ms, 1.94s).
+3. `list?kb_id=...&page_size=50&page=1` → UI xin đúng 50 doc/trang (phân trang UI HOẠT ĐỘNG). Vẫn 502.
+4. Log: `ragflow_doc_meta/_search duration:4.924s` — 1 metadata search mất 4.9s. Với 142k doc, load full còn lâu hơn.
+
+**GIẢ THUYẾT (chưa xác nhận — cần log full):**
+- 502 lần này KHÔNG do request tự chạy 44s rồi timeout (vì nó 502 ngay 34ms).
+- Server từ chối/không xử lý request ngay. 2 khả năng CHƯA phân biệt:
+  (a) Flask ném exception NGAY khi xử lý (lỗi code với 142k doc) → Flask tự trả lỗi.
+  (b) Flask single-process đang BẬN (chạy _search 4.9s + search khác) → nginx không nối được upstream → nginx trả 502.
+- Phân biệt bằng log full: thấy Traceback/Exception lúc mở KB → (a); Flask im, nginx log 502 → (b).
+
 ### Bước tiếp theo (sau khi có log)
 1. Chốt API nào 44s → fix đúng chỗ.
 2. Fix /list (get_by_kb_id 162): mở KB thường (return_empty_metadata=False) → lấy metadata sau paginate, chỉ 30 doc.
