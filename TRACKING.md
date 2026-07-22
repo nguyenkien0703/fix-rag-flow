@@ -7,7 +7,7 @@
 ═══════════════════════════════════════════════════════════════════
 | ID | Issue | Ưu tiên | Trạng thái |
 |----|-------|---------|-----------|
-| A | Mở KB "Voffice doc sum" (~10k doc) → UI trắng, API 502, 10-15' tự hồi | **P0 (làm trước)** | 🔬 Đang chốt phạm vi fix |
+| A | Mở KB Voffice (142k doc) → UI trắng, API 502, 10-15' tự hồi | **P0 (làm trước)** | ✅ Root cause CHỐT, sẵn sàng fix |
 | B | Retrieval query 120k chunks chậm ~30s (500 chunks thì 40ms) | P1 (làm sau) | 📋 Đã điều tra sơ bộ, để TODO |
 | C | Up file lâu → chờ 10' mới xử lý (nghi stale connection sync) | P2 | ⏸️ Chưa đụng |
 
@@ -71,6 +71,26 @@
   (b) Flask single-process đang BẬN (chạy _search 4.9s + search khác) → nginx không nối được upstream → nginx trả 502.
 - Phân biệt bằng log full: thấy Traceback/Exception lúc mở KB → (a); Flask im, nginx log 502 → (b).
 
+### ✅ KẾT LUẬN CUỐI VẤN ĐỀ A (log 18:42 chốt — bác bỏ giả thuyết a, xác nhận b)
+
+**Bằng chứng log 18:42:**
+- `POST /v1/kb/list → 200, 20-21ms` (LẦN NÀY trả 200, không 502!). Cùng request `list` khi 502(34ms) khi 200(20ms)
+  tùy thời điểm → dấu hiệu server bị chiếm theo lúc.
+- KHÔNG có Traceback/Exception nào (dù grep ERROR|Exception) → **BÁC BỎ (a) Flask ném exception.**
+- `ragflow_doc_meta/_search size:10000 duration:4.756s` + ảnh raw = khối text metadata KHỔNG LỒ (142k doc × nhiều field, hàng MB) được kéo về.
+
+**ROOT CAUSE A (hoàn chỉnh):**
+`_search` metadata kéo FULL (142k doc) → trả khối text khổng lồ → Flask **single-process** (app.run không threaded)
+parse mất nhiều giây, BỊ CHIẾM → request list/filter/knowledge_graph mới đến bị nginx trả **502 (upstream busy)**.
+KHÔNG phải lỗi code (không exception), mà là **quá tải single-process do payload metadata khổng lồ**.
+
+**Khớp mọi mảnh:** 502 tức thì (process bận) · detail chậm 1.9s (chờ process) · 10-15' tự hồi (tải giảm) ·
+KB 500 doc nhanh (payload nhỏ, process không bị chiếm).
+
+**FIX A (không đổi hướng, nhưng hiểu đúng cơ chế):** giảm payload metadata = chỉ kéo metadata của doc trên trang
+(50 doc) thay vì full 142k → process không bị chiếm lâu → hết 502. Cụ thể sửa get_by_kb_id(162)+get_filter(241)
++get_metadata_for_documents(772)+es_conn (ids query). [Bổ trợ dài hạn: cho server nhiều worker — vấn đề riêng.]
+
 ### Bước tiếp theo (sau khi có log)
 1. Chốt API nào 44s → fix đúng chỗ.
 2. Fix /list (get_by_kb_id 162): mở KB thường (return_empty_metadata=False) → lấy metadata sau paginate, chỉ 30 doc.
@@ -106,6 +126,7 @@
 ═══════════════════════════════════════════════════════════════════
 ## NHẬT KÝ (mới nhất trên cùng)
 ═══════════════════════════════════════════════════════════════════
+- 2026-07-22 18:42: CHỐT root cause A = payload metadata khổng lồ chiếm Flask single-process → 502 upstream busy. Không phải lỗi code (không exception). Sẵn sàng fix.
 - 2026-07-22 18:27: KB Voffice = 142k doc (không phải 10k). 502 TỨC THÌ 34ms (khác 8.7s lần trước). Nghi server single-process bận → 502 ngay. Cần log full.
 - 2026-07-22: Xác định A gọi 2 API (162+241). Sửa nhận định (trước tưởng get_list 114). Chờ đo duration.
 - 2026-07-22: Điều tra B sơ bộ — nghi rerank 1024 candidate. Để TODO.
