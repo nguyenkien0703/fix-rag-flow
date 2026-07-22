@@ -83,3 +83,26 @@ CĂN CỨ C3 — mỗi doc có ~15-20 field metadata (receiverId2, promulgateDat
 Đây là codebase NỘI BỘ (RagFlow v0.24.0), không phải nguồn web → "citation" = đường dẫn file + số dòng.
 - Source đối chiếu: github.com/infiniflow/ragflow tag v0.24.0 (tải về, đã verify khớp container qua grep dòng 114/162).
 - Mọi số liệu ở TẦNG A và TẦNG C là OUTPUT LỆNH THẬT chạy trên pod ragflow-78dd4c855-shdq8 (có screenshot trong hội thoại).
+
+═══════════════════════════════════════════════════════════════════
+## 7. CẬP NHẬT — 3 ĐIỂM CÙNG KÉO FULL METADATA (verify lại theo feedback + phân trang UI)
+═══════════════════════════════════════════════════════════════════
+Grep phát hiện get_metadata_for_documents được gọi 3 chỗ:
+| Dòng | Hàm | API | Tham số | Hậu quả |
+|------|-----|-----|---------|---------|
+| 114 | get_list | SDK GET /api/v1/datasets/{kb}/documents | None | kéo full 10k |
+| 162 | get_by_kb_id | WEB POST /v1/document/list | None | kéo full 10k |
+| 241 | get_filter_by_kb_id | WEB POST /v1/document/filter | doc_ids (nhưng bị phớt lờ ở ES) | kéo full 10k |
+
+→ UI web mở KB gọi /list (162) + /filter (241) + knowledge_graph. CẢ /list VÀ /filter đều kéo full 10k.
+→ Log 44s ghi /api/v1/datasets/{kb}/documents = SDK get_list (114).
+
+**HỆ QUẢ CHO FIX:** patch dòng 772 (dạy hàm lọc _meta_id) là fix GỐC CHUNG, nhưng chỉ ăn khi
+chỗ gọi TRUYỀN doc_ids. Dòng 114/162 truyền None → vẫn full. Cần:
+- Sửa dòng 114 (get_list): None → page doc_ids. [đã có trong patch 01]
+- Sửa dòng 162 (get_by_kb_id): CẦN XEM có phải web UI gọi cái này khi mở KB không (đo log).
+  Lưu ý 162 trước paginate + cần full cho return_empty_metadata → sửa phức tạp hơn.
+- Dòng 241 (/filter): tự nhiên nhanh sau khi patch 772 (vì nó đã truyền doc_ids).
+
+**CẦN ĐO:** khi mở KB Voffice, request nào (/list, /filter, /documents) mất 44s → mới biết fix ĐỦ hay chưa.
+Trạng thái: root cause (parse full 10k) ĐÚNG; phạm vi fix cần xác nhận thêm bằng đo duration từng API.
