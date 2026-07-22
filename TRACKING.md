@@ -3,6 +3,36 @@
 > Hệ thống: RagFlow v0.24.0 / K8s Viettel / doc engine = ES Lakehouse 10.211.145.107:8051 / pod ragflow-78dd4c855-shdq8.
 
 ═══════════════════════════════════════════════════════════════════
+## ⏸️ ĐIỂM DỪNG 2026-07-22 — MAI MỞ RA LÀM TỪ ĐÂY
+═══════════════════════════════════════════════════════════════════
+**Đã xong hôm nay:** Điều tra + CHỐT root cause vấn đề A (mở KB 502). Không phải lỗi code.
+Root cause: `_search` metadata kéo FULL 142k doc → payload khổng lồ → Flask single-process bị chiếm
+→ request khác bị nginx 502 (upstream busy). Chi tiết đầy đủ ở mục ISSUE A phía dưới.
+
+**MAI LÀM (theo thứ tự):**
+1. VIẾT PATCH FIX A (fix đầy đủ cả /list + /filter). 4 chỗ sửa:
+   - `document_service.py:162` get_by_kb_id → khi return_empty_metadata=False, lấy metadata SAU paginate chỉ 50 doc.
+   - `document_service.py:241` get_filter_by_kb_id → đếm facet bằng ES aggregation thay vì json.loads 142k.
+   - `doc_metadata_service.py:772` get_metadata_for_documents → đẩy doc_ids xuống ES (dùng key _meta_id).
+   - `es_conn.py` search() → thêm nhánh _meta_id → Q("ids", ...) GUARD theo tên index "ragflow_doc_meta" (hướng B đã chọn).
+2. Đóng gói ConfigMap → sửa values.yaml mount đè → helm upgrade → **rollout restart pod** (BẮT BUỘC).
+3. VERIFY: mở KB Voffice không còn 502; log ES thấy ids ~50 thay size:10000; metadata vẫn hiển thị đúng.
+4. (Nếu còn thời gian) VẤN ĐỀ B retrieval 30s — đo có/không rerank.
+
+**File cần đọc khi mở lại:**
+- TRACKING.md (file này) — trạng thái tổng.
+- 00-ISSUE-ROOTCAUSE.md — issue + root cause + căn cứ.
+- configmap-patch/01,02,03 — nội dung patch (03 đã chọn hướng B guard).
+- Source đã tải: /Users/macboook/.claude/jobs/637911d4/tmp/ragflow-0.24.0 (LƯU Ý: thư mục /tmp có thể bị xóa,
+  nếu mất thì tải lại: curl -sL github.com/infiniflow/ragflow/archive/refs/tags/v0.24.0.tar.gz).
+
+**Quyết định đã chốt:**
+- Phạm vi fix A: ĐẦY ĐỦ cả /list + /filter (không làm nửa vời).
+- es_conn guard: hướng B (guard theo tên index ragflow_doc_meta).
+- Deploy: ConfigMap mount đè (KHÔNG build image), rollout restart.
+
+
+═══════════════════════════════════════════════════════════════════
 ## ISSUE CẦN FIX HÔM NAY
 ═══════════════════════════════════════════════════════════════════
 | ID | Issue | Ưu tiên | Trạng thái |
@@ -126,6 +156,7 @@ KB 500 doc nhanh (payload nhỏ, process không bị chiếm).
 ═══════════════════════════════════════════════════════════════════
 ## NHẬT KÝ (mới nhất trên cùng)
 ═══════════════════════════════════════════════════════════════════
+- 2026-07-22 CUỐI NGÀY: Dừng. Root cause A chốt xong. Mai viết patch (đầy đủ /list+/filter, guard hướng B) + deploy ConfigMap.
 - 2026-07-22 18:42: CHỐT root cause A = payload metadata khổng lồ chiếm Flask single-process → 502 upstream busy. Không phải lỗi code (không exception). Sẵn sàng fix.
 - 2026-07-22 18:27: KB Voffice = 142k doc (không phải 10k). 502 TỨC THÌ 34ms (khác 8.7s lần trước). Nghi server single-process bận → 502 ngay. Cần log full.
 - 2026-07-22: Xác định A gọi 2 API (162+241). Sửa nhận định (trước tưởng get_list 114). Chờ đo duration.
