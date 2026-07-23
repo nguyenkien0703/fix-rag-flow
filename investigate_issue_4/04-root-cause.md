@@ -112,3 +112,67 @@ shard1 top query con: BooleanQuery 2632ms, BoostQuery 2615ms, BooleanQuery 2606m
   Mapping: vector HNSW đúng (loại brute-force). Segment index 141k nhiều/lớn.
 - **2026-07-23 (13:xx):** Đọc code v0.24.0. Loại nghi phạm cũ "rerank 1024" (thực tế 30-64 chunk).
   Tách folder investigate_issue_4 riêng.
+
+---
+
+## 8. ROOT CAUSE CHỐT (2026-07-23, phát hiện từ câu hỏi của Kiên "có phải config match toàn bộ KB?")
+
+### Bằng chứng cuối:
+- Kiên đo lại CÙNG câu hỏi trên KB voffice: `_search duration = 12.66s` (khớp UI 15s, khác lần profile 3.27s
+  trước đó — chênh do tải ES lúc đo khác nhau, KHÔNG mâu thuẫn với root cause dưới đây).
+- Đọc code `rag/nlp/query.py` hàm `FulltextQueryer.question()`:
+  - Dòng 52: `if not self.is_chinese(txt):` — tiếng Việt (Latin có dấu) LUÔN rơi vào nhánh này (is_chinese
+    check ký tự CJK, rag_tokenizer.py:35).
+  - Dòng 84-86 (nhánh non-Chinese): trả `MatchTextExpr(fields, query, 100, {"original_query": ...})`
+    — **KHÔNG có key `minimum_should_match`** trong extra_options.
+  - `es_conn.py:92`: `minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)` → mặc định
+    **0.0** khi thiếu key → dòng 94 convert thành **`"0%"`** gửi cho ES.
+  - `minimum_should_match: "0%"` = ES tính document là match nếu khớp **ÍT NHẤT 1 TRONG CÁC CLAUSE OR**
+    (mỗi từ khóa + đồng nghĩa + fine-grained token đều là 1 clause OR riêng, dòng 67 `q.append(...)`).
+
+### ROOT CAUSE 1 CÂU:
+**Với câu hỏi tiếng Việt, RagFlow KHÔNG set `minimum_should_match` (bug/thiếu sót ở nhánh non-Chinese của
+`FulltextQueryer.question()`) → ES nhận `minimum_should_match="0%"` → document chỉ cần chứa 1 từ khóa bất kỳ
+(kể cả từ phổ biến) là match → trên KB 141k, gần như TOÀN BỘ corpus bị coi là ứng viên match
+(`total_hits>=10000`) → ES phải full-text SCORING hàng chục nghìn document mỗi query → chậm tuyến tính theo
+số chunk KB và theo số từ khóa trong câu hỏi (câu dài = nhiều clause OR = match càng rộng).**
+
+### Khớp MỌI triệu chứng đã quan sát:
+- KB 500 chunk (2s) vs KB 141k (15s): cùng % corpus bị match rộng, nhưng scoring trên tập nhỏ nhanh hơn nhiều.
+- Câu dài chậm hơn câu ngắn: nhiều từ khóa hơn = nhiều clause OR hơn = match set không hề thu hẹp
+  (không có min_match để giới hạn) mà còn dễ RỘNG hơn.
+- Dao động 3.3s-14s trong các lần đo: phụ thuộc tải ES + độ dài câu hỏi cụ thể lúc đo, cùng 1 cơ chế gốc.
+- ES kNN/track_total_hits/embedding đều nhanh — khớp vì chúng KHÔNG liên quan minimum_should_match.
+
+### Đối chứng nhanh (khuyến nghị đo xác nhận cuối, KHÔNG bắt buộc để chốt hướng fix):
+Chạy lại `_search` với `minimum_should_match` ép "30%" hoặc "70%" cho query tiếng Việt y hệt → nếu
+took giảm mạnh (từ ~10s+ xuống dưới 1s) → XÁC NHẬN 100%. (Có thể patch tạm bằng cách gọi ES trực tiếp
+với query đã bắt được, sửa `minimum_should_match` trong JSON rồi replay — giống measure3.sh nhưng đổi field này.)
+
+## 9. HƯỚNG FIX (đề xuất, CHƯA áp dụng — cần thảo luận rủi ro trước khi patch)
+**F1 (fix gốc, đúng root cause):** Sửa `rag/nlp/query.py` hàm `question()`, nhánh non-Chinese (dòng 84-86):
+thêm `"minimum_should_match": min_match` vào `extra_options` giống nhánh Chinese (dòng 170), dùng cùng
+tham số `min_match` đã được truyền vào hàm (mặc định 0.6, search.py gọi với 0.3).
+```python
+# Hiện tại (dòng 84-86):
+return MatchTextExpr(
+    self.query_fields, query, 100, {"original_query": original_query}
+), keywords
+# Đề xuất:
+return MatchTextExpr(
+    self.query_fields, query, 100,
+    {"minimum_should_match": min_match, "original_query": original_query}
+), keywords
+```
+- Rủi ro: `min_match` quá cao có thể làm mất kết quả hợp lệ (câu hỏi dùng từ hiếm). RagFlow đã tự có cơ chế
+  fallback giảm min_match khi total=0 (search.py:135-146) → an toàn để tăng min_match vì có lưới đỡ.
+- Cách áp: patch source thật trong container qua postStart sed (theo ràng buộc deploy đã biết), KHÔNG build image.
+- Cần xác định đúng số dòng trong file container trước khi viết sed (khác source GitHub tải về có thể lệch dòng).
+
+**F2 (giảm đau nhanh, không sửa code):** không có — đây là bug logic, không có config bên ngoài để chỉnh
+minimum_should_match theo request hiện tại.
+
+**F3 (bổ trợ):** cân nhắc kèm min_match hợp lý (không quá cao) để tránh regression độ chính xác tìm kiếm —
+nên test A/B trên vài câu hỏi thực tế trước khi rollout toàn bộ.
+
+### Trạng thái: ROOT CAUSE ĐÃ CHỐT (code + số liệu khớp). Fix ĐỀ XUẤT xong, CHƯA viết patch cuối / CHƯA deploy.
