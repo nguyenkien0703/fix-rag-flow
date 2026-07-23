@@ -59,3 +59,21 @@ Query dài B, CHỈ BM25 query_string (không kNN):
 - **track_total_hits chênh chỉ ~100ms → VÔ CAN.**
 - ⟹ 14.2s của query dài KHÔNG do BM25. Phải do phần probe BỎ QUA: **kNN dense_vector + FusionExpr + rank_feature**,
   hoặc **embedding encode** câu dài. Cần lấy QUERY JSON THẬT của RagFlow (có knn) rồi profile.
+
+---
+## BƯỚC 2c — Đo kNN HNSW (2026-07-23) — CHỐT: ES VÔ CAN
+| Biến thể | took_ms |
+|----------|---------|
+| kNN k=30 num_candidates=2048 | **6ms** |
+| kNN k=30 num_candidates=100 | **4ms** |
+| kNN num_candidates=2048 + filter kb_id | **4ms** |
+
+### KẾT LUẬN CHỐT TẦNG ES:
+- kNN HNSW trên 141k = **4-6ms**. BM25 = 156-262ms. ⟹ **TOÀN BỘ tầng ES ~200-300ms.**
+- RagFlow báo query dài 14.2s ⟹ **~14s bị đốt NGOÀI ES.**
+- Nghi phạm còn lại DUY NHẤT: **embedding encode câu hỏi** (get_vector → emb_mdl.encode_queries).
+
+### ⚠️ MÂU THUẪN cần giải trước khi chốt:
+Nếu là embedding thì tại sao KB nhỏ (500) nhanh 40ms? Cùng model thì encode 1 câu hỏi phải bằng nhau.
+⟹ 2 khả năng: (a) KB lớn & KB nhỏ dùng MODEL EMBEDDING KHÁC NHAU (lớn=model chậm/remote API);
+             (b) thời gian nằm ở chỗ chưa soi. → PHẢI đo trực tiếp thời gian encode, không suy diễn.
