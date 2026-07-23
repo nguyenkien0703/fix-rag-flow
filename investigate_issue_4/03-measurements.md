@@ -43,3 +43,19 @@ shard docs.count  size
 - ~toàn bộ thời gian nằm ở **1 ES `_search`** (1.5s→14s), KHÔNG ở Python/rerank/embedding.
 - Chênh lệch do **độ dài query text** (số keyword) → thủ phạm = **BM25 `query_string` match rộng + `track_total_hits=True`** đếm toàn bộ match trên 120k.
 - kNN HNSW: vô can (mapping đúng). Rerank: vô can (chỉ 30-64 chunk). → khớp `01-code-analysis.md`.
+
+---
+## BƯỚC 2b — Probe tách track_total_hits vs BM25 (2026-07-23) — LẬT GIẢ THUYẾT
+Index đúng: `ragflow_22cdb01e486a11ec9749e86cfe939a` (141,978 docs, 15.4gb).
+Query dài B, CHỈ BM25 query_string (không kNN):
+| Biến thể | took_ms |
+|----------|---------|
+| (1) BM25 + track_total_hits=TRUE  | **262ms** (total=141,773 eq) |
+| (2) BM25 + track_total_hits=FALSE | **156ms** |
+| (3) BM25 + minimum_should_match=70%, tth=false | **89ms** |
+
+### KẾT LUẬN LẬT:
+- **BM25 full-text trên 141k = 156-262ms → BM25 VÔ CAN.**
+- **track_total_hits chênh chỉ ~100ms → VÔ CAN.**
+- ⟹ 14.2s của query dài KHÔNG do BM25. Phải do phần probe BỎ QUA: **kNN dense_vector + FusionExpr + rank_feature**,
+  hoặc **embedding encode** câu dài. Cần lấy QUERY JSON THẬT của RagFlow (có knn) rồi profile.
