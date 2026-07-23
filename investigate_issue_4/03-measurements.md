@@ -92,3 +92,19 @@ Nếu là embedding thì tại sao KB nhỏ (500) nhanh 40ms? Cùng model thì e
 
 ### Bài học phương pháp:
 Đo bằng input MÔ PHỎNG (query tự chế) cho kết quả sai — phải bắt query THẬT RagFlow gửi mới tái hiện 15s.
+
+---
+## BƯỚC 3b — Profile query THẬT (2026-07-23, measure3 v2)
+Query bắt được: keys=['query','knn','from','size'], size=100. Nhánh payload lớn = knn.query_vector 4096-dim (~92KB).
+```
+TOOK_TONG_ms = 3267 ; total_hits = 10000 (gte)
+shard0: BoostQuery 2794ms | BooleanQuery 2789ms | BooleanQuery 2780ms | BoostQuery 1299ms | PhraseQuery 651ms
+        collector QueryPhaseCollector 2447ms
+shard1: BooleanQuery 2632ms | BoostQuery 2615ms | BooleanQuery 2606ms | BoostQuery 1132ms | PhraseQuery 569ms
+        collector QueryPhaseCollector 2341ms
+```
+### Kết luận:
+- ES took=3.27s, nằm ở **full-text scoring (BooleanQuery/BoostQuery/PhraseQuery)** + QueryPhaseCollector, KHÔNG ở kNN.
+- total_hits>=10000 → match rộng.
+- ⚠️ ES 3.27s < UI 15s → CÒN ~12s NGOÀI ES chưa định vị (mạng/transfer payload, Python single-process, nhiều ES call?).
+- ⚠️ Lưu ý: lần này ES 3.3s, lần đầu (elastic_transport) 14.2s — chênh lớn → cần đo took vs duration CÙNG LÚC.
