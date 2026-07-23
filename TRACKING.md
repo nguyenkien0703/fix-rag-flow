@@ -3,9 +3,62 @@
 > Hệ thống: RagFlow v0.24.0 / K8s Viettel / doc engine = ES Lakehouse 10.211.145.107:8051 / pod ragflow-78dd4c855-shdq8.
 
 ═══════════════════════════════════════════════════════════════════
-## ⏸️ ĐIỂM DỪNG 2026-07-22 — MAI MỞ RA LÀM TỪ ĐÂY
+## ⏸️ ĐIỂM DỪNG 2026-07-23 — TỔNG KẾT ĐIỀU TRA ISSUE A (đọc mục này trước)
 ═══════════════════════════════════════════════════════════════════
-**Đã xong hôm nay:** Điều tra + CHỐT root cause vấn đề A (mở KB 502). Không phải lỗi code.
+**TRẠNG THÁI TỔNG:** Issue A (mở KB 502) — ĐÃ CHỐT root cause + verify sâu source. CHƯA viết patch cuối, CHƯA deploy.
+Chuyển sang điều tra issue khác. Khi quay lại A: đọc mục này + "PHÁT HIỆN NGÀY 23/07" bên dưới.
+
+### ✅ ROOT CAUSE (đã chốt, 3 tầng bằng chứng)
+Mở KB → API kéo FULL ~142k metadata từ ES về parse JSON trong Python (~40s). RagFlow web chạy Flask
+**đơn tiến trình** (`app.run` không `threaded`, `ragflow_server.py:151`) → 1 request nặng chiếm trọn server
+→ request khác bị nginx trả **502 tức thì (upstream busy)**. KHÔNG phải lỗi code (không exception).
+
+### 🔬 CÁC PHƯƠNG ÁN ĐIỀU TRA ĐÃ THỬ + KẾT QUẢ
+| # | Giả thuyết / phương án | Kết quả | Bằng chứng |
+|---|------------------------|---------|-----------|
+| 1 | Stale connection (keepalive 7200s) | ❌ BÁC BỎ | ES duration 3-5ms, không timeout |
+| 2 | Metadata parse error (promulgateDate) | ❌ BÁC BỎ | nhiễu sync nền; upload trả 200 |
+| 3 | ES query nặng thuần | ❌ BÁC BỎ | ES chỉ 4.8s; 40s ở Python |
+| 4 | Gateway/nginx timeout cắt 8.7s | ❌ BÁC BỎ | no ingress, NodePort L4; 8.7s = ES client timeout hạ 600→30 |
+| 5 | Fetch-all metadata parse Python | ✅ XÁC NHẬN | ES 4.9s vs API 44s; size:10000; 142k×20 field |
+| 6 | Server đơn tiến trình khuếch đại | ✅ XÁC NHẬN | app.run không threaded → 502 tức thì 34ms, lan cả KB khác |
+
+### 🆕 PHÁT HIỆN NGÀY 23/07 (verify source thật, KHÁC tài liệu cũ — QUAN TRỌNG)
+1. **F1-fix-final-research.md SAI** — bảo dùng condition={"id":[...]} (terms). Nhưng es_conn.py:182-185:
+   insert metadata pop("id") bỏ field id khỏi _source, gán làm ES _id. → terms{id} KHÔNG match → mất metadata.
+   ⟹ ĐÚNG phải dùng `ids` query trên _id (đúng như configmap-patch/03 hướng B). **CẦN ARCHIVE F1.**
+2. **/filter (241) KHÔNG fix được bằng phân trang** — bản chất đếm facet toàn KB (truyền doc_ids của cả 142k).
+   Dù patch es_conn đúng, ids với 142k id vẫn payload lớn. BẮT BUỘC chuyển sang **ES aggregation**.
+   Tin tốt: es_conn.search() ĐÃ có sẵn param agg_fields (dòng 138-140). Nhưng metadata field ĐỘNG
+   → phải dò tên field trước rồi mới aggregate → phần khó nhất, chưa có tiền lệ trong code.
+3. **Còn 4 đường kéo-full CHƯA đụng** ngoài 4 patch: get_flatted_meta_by_kbs (686, limit 10000, chạy khi
+   lọc metadata trên /list); get_by_kb_id bị gọi từ kb_app.py:619/688/757 với page=0 (build graph/raptor).
+4. **ĐÍNH CHÍNH "mất data":** 3 hàm patch (162/241/772) CHỈ search (ĐỌC), không ghi/xóa ES.
+   → Patch KHÔNG THỂ mất data khỏi ES. Rủi ro thật chỉ là "hiển thị thiếu tạm thời" nếu patch lọc sai
+   (API trả metadata rỗng, ES còn nguyên, sửa+restart là hồi). Web stateless → rollback an toàn.
+
+### 🌍 BỐI CẢNH MÔI TRƯỜNG (Kiên xác nhận 23/07 — đổi khẩu vị rủi ro)
+- RagFlow đang là service THỬ NGHIỆM cho các bên cắm API tích hợp, CHƯA production thật.
+- KHÔNG có staging/môi trường test — chỉ 1 môi trường này.
+- ⟹ Rủi ro rollout THỰC TẾ THẤP (web stateless, data ở ES an toàn). "Bắt buộc có staging" là quá cứng.
+  An toàn tối thiểu: backup file gốc + thử KB nhỏ trước + kubectl rollout undo sẵn + BÁO TRƯỚC các bên cắm API giờ deploy.
+
+### 📌 ĐANG PENDING (chưa làm)
+- [ ] Viết patch cuối 4 file (es_conn _meta_id/ids · 772 đẩy doc_ids · 162 paginate-trước · 241 ES aggregation).
+      → 3 patch nháp ở configmap-patch/01,02,03 nhưng 03 đã chốt hướng B + CHƯA test. 241 (aggregation) chưa có patch.
+- [ ] Cân nhắc thêm patch A "bật threaded/gunicorn" — verify Helm override được command khởi động qua ConfigMap không.
+- [ ] Đóng gói ConfigMap → values.yaml mount đè → helm upgrade → **rollout restart** (bắt buộc).
+- [ ] Verify: mở KB Voffice hết 502; log ES thấy ids ~50 thay size:10000; metadata hiển thị đúng; KB nhỏ không regression.
+- [ ] Archive F1-fix-final-research.md (kết luận sai).
+
+### 📎 SẢN PHẨM ĐÃ TẠO (23/07)
+- Báo cáo sếp (artifact riêng tư): https://claude.ai/code/artifact/10b477f3-fe0d-439f-a401-f0feac87e763
+- cau-hoi-cua-Kien.md — giải thích dive-deep process/thread/pod + facet + đính chính "mất data".
+- SecondBrain: KnowledgeHub/Learning/Process-Thread-Pod-va-Faceted-Search.md (kiến thức nền).
+- Source RagFlow v0.24.0 ĐÃ MOVE về repo: ./ragflow-0.24.0 (không còn ở /tmp).
+
+---
+**(Điểm dừng 22/07 cũ — giữ tham khảo):**
 Root cause: `_search` metadata kéo FULL 142k doc → payload khổng lồ → Flask single-process bị chiếm
 → request khác bị nginx 502 (upstream busy). Chi tiết đầy đủ ở mục ISSUE A phía dưới.
 
@@ -156,6 +209,7 @@ KB 500 doc nhanh (payload nhỏ, process không bị chiếm).
 ═══════════════════════════════════════════════════════════════════
 ## NHẬT KÝ (mới nhất trên cùng)
 ═══════════════════════════════════════════════════════════════════
+- 2026-07-23: TỔNG KẾT A trước khi chuyển issue khác. Verify source: F1 SAI (phải ids không phải terms{id}); /filter buộc ES aggregation; còn 4 đường kéo-full khác; ĐÍNH CHÍNH patch chỉ ĐỌC ES nên không mất data. Bối cảnh: môi trường thử nghiệm, không staging → rủi ro rollout thấp. Tạo cau-hoi-cua-Kien.md + note SecondBrain + báo cáo sếp (artifact).
 - 2026-07-22 CUỐI NGÀY: Dừng. Root cause A chốt xong. Mai viết patch (đầy đủ /list+/filter, guard hướng B) + deploy ConfigMap.
 - 2026-07-22 18:42: CHỐT root cause A = payload metadata khổng lồ chiếm Flask single-process → 502 upstream busy. Không phải lỗi code (không exception). Sẵn sàng fix.
 - 2026-07-22 18:27: KB Voffice = 142k doc (không phải 10k). 502 TỨC THÌ 34ms (khác 8.7s lần trước). Nghi server single-process bận → 502 ngay. Cần log full.
