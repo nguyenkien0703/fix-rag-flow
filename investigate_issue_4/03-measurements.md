@@ -77,3 +77,18 @@ Query dài B, CHỈ BM25 query_string (không kNN):
 Nếu là embedding thì tại sao KB nhỏ (500) nhanh 40ms? Cùng model thì encode 1 câu hỏi phải bằng nhau.
 ⟹ 2 khả năng: (a) KB lớn & KB nhỏ dùng MODEL EMBEDDING KHÁC NHAU (lớn=model chậm/remote API);
              (b) thời gian nằm ở chỗ chưa soi. → PHẢI đo trực tiếp thời gian encode, không suy diễn.
+
+---
+## BƯỚC 3 — Fact chốt lại (Kiên xác nhận 2026-07-23)
+- Tất cả KB dùng CHUNG 1 model embedding: **qwen3-8b-embedding** (RagFlow -> LiteLLM cùng cluster khác ns -> model).
+- **CÙNG câu hỏi** "quy định về thời hạn thanh toán và nghiệm thu hợp đồng xây dựng":
+  - KB test_tải (500 file): **~2s**
+  - KB voffice-docs-sum (141k file): **~15s**
+  - Gọi thẳng Postman còn nhanh hơn.
+- ⟹ **LOẠI embedding** (cùng câu hỏi = encode giống nhau, không thể gây chênh 2s vs 15s theo KB).
+- ⟹ Chênh 2s vs 15s SCALE theo số chunk KB. ES đo riêng lẻ nhanh (BM25 156ms, kNN 6ms) NHƯNG
+  probe dùng query TỰ CHẾ, không phải query hybrid THẬT của RagFlow (BM25+kNN+fusion+rank_feature).
+- ⟹ BƯỚC 3b: bắt query THẬT từ log + profile=true (measure3.sh).
+
+### Bài học phương pháp:
+Đo bằng input MÔ PHỎNG (query tự chế) cho kết quả sai — phải bắt query THẬT RagFlow gửi mới tái hiện 15s.
