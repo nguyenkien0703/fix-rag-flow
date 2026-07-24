@@ -25,6 +25,10 @@ spec:
         checksum/config-env: {{ include (print $.Template.BasePath "/env.yaml") . | sha256sum }}
         checksum/config-ragflow: {{ include (print $.Template.BasePath "/ragflow_config.yaml") . | sha256sum }}
     spec:
+      {{- with .Values.ragflow.deployment.nodeSelector }}
+      nodeSelector:
+        {{- . | toYaml | nindent 8 }}
+      {{- end }}
       {{- if or .Values.global.imagePullSecrets .Values.ragflow.image.pullSecrets }}
       imagePullSecrets:
         {{- with .Values.global.imagePullSecrets }}

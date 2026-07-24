@@ -106,6 +106,12 @@ ragflow:
   deployment:
     strategy:
     resources:
+    # Pin the pod to a specific node. Needed while `image.pullPolicy: Never`
+    # is set and the ragflow image is only cached on some nodes (not pulled
+    # from a registry) — without this the scheduler may place the pod on a
+    # node without the image cached, causing ErrImageNeverPull.
+    # Example: {"kubernetes.io/hostname": "vrp-kubeengine07"}
+    nodeSelector: {}
   service:
     # Use LoadBalancer to expose the web interface externally
     type: ClusterIP
