@@ -114,6 +114,26 @@ ragflow:
       enabled: true
       type: ClusterIP
 
+  # --- Issue #4 hotfix: patch rag/nlp/query.py + rag/utils/es_conn.py -------
+  # See investigate_issue_4/04-root-cause.md and 05-FIX.md for the full
+  # analysis. Applied via an initContainer (NOT postStart) so Kubernetes
+  # guarantees the patched files exist on disk before the ragflow container's
+  # ENTRYPOINT starts — postStart runs concurrently with ENTRYPOINT and does
+  # NOT guarantee ordering, which is unacceptable for patching code that gets
+  # imported at process start.
+  #
+  # To disable this hotfix (e.g. once the fix lands upstream), set
+  # codePatch.enabled to false.
+  codePatch:
+    enabled: true
+    # Sed expressions applied, in order, to a copy of /ragflow/rag inside
+    # the initContainer. Each entry is one `sed -i '<expr>' <file>` call.
+    patches:
+      - file: rag/nlp/query.py
+        expr: 's/{"original_query": original_query}/{"minimum_should_match": min_match, "original_query": original_query}/'
+      - file: rag/utils/es_conn.py
+        expr: 's/timeout=600/timeout=30/g'
+
 infinity:
   image:
     repository: infiniflow/infinity

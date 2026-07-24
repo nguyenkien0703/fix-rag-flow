@@ -34,6 +34,26 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
+      {{- if .Values.ragflow.codePatch.enabled }}
+      initContainers:
+        - name: ragflow-code-patch
+          image: {{ include "ragflow.imageRepo" (dict "root" . "repo" .Values.ragflow.image.repository) }}:{{ .Values.ragflow.image.tag }}
+          {{- with .Values.ragflow.image.pullPolicy }}
+          imagePullPolicy: {{ . }}
+          {{- end }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              {{- range .Values.ragflow.codePatch.patches }}
+              mkdir -p "/patched/$(dirname {{ .file }})"
+              cp "/ragflow/{{ .file }}" "/patched/{{ .file }}"
+              sed -i '{{ .expr }}' "/patched/{{ .file }}"
+              {{- end }}
+          volumeMounts:
+            - name: code-patch-volume
+              mountPath: /patched
+      {{- end }}
       containers:
       - name: ragflow
         image: {{ include "ragflow.imageRepo" (dict "root" . "repo" .Values.ragflow.image.repository) }}:{{ .Values.ragflow.image.tag }}
@@ -65,6 +85,13 @@ spec:
             subPath: llm_factories.json
             name: service-conf-volume
           {{- end }}
+          {{- if .Values.ragflow.codePatch.enabled }}
+          {{- range .Values.ragflow.codePatch.patches }}
+          - mountPath: /ragflow/{{ .file }}
+            subPath: {{ .file }}
+            name: code-patch-volume
+          {{- end }}
+          {{- end }}
         envFrom:
           - secretRef:
               name: {{ include "ragflow.fullname" . }}-env-config
@@ -79,6 +106,10 @@ spec:
         - name: service-conf-volume
           configMap:
             name: ragflow-service-config
+        {{- if .Values.ragflow.codePatch.enabled }}
+        - name: code-patch-volume
+          emptyDir: {}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
