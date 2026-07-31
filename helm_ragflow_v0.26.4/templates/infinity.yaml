@@ -26,6 +26,7 @@ metadata:
     {{- include "ragflow.labels" . | nindent 4 }}
     app.kubernetes.io/component: infinity
 spec:
+  serviceName: {{ include "ragflow.fullname" . }}-infinity
   replicas: 1
   selector:
     matchLabels:

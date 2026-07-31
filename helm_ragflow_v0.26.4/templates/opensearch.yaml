@@ -26,6 +26,7 @@ metadata:
     {{- include "ragflow.labels" . | nindent 4 }}
     app.kubernetes.io/component: opensearch
 spec:
+  serviceName: {{ include "ragflow.fullname" . }}-opensearch
   replicas: 1
   selector:
     matchLabels:

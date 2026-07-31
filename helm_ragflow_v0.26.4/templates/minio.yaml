@@ -29,6 +29,7 @@ metadata:
   annotations:
     checksum/config: {{ include (print $.Template.BasePath "/env.yaml") . | sha256sum }}
 spec:
+  serviceName: {{ include "ragflow.fullname" . }}-minio
   replicas: 1
   selector:
     matchLabels:

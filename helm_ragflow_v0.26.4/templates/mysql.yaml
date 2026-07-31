@@ -27,6 +27,7 @@ metadata:
     {{- include "ragflow.labels" . | nindent 4 }}
     app.kubernetes.io/component: mysql
 spec:
+  serviceName: {{ include "ragflow.fullname" . }}-mysql
   replicas: 1
   selector:
     matchLabels:
