@@ -27,7 +27,7 @@ metadata:
     {{- include "ragflow.labels" . | nindent 4 }}
     app.kubernetes.io/component: mysql
 spec:
-  serviceName: {{ include "ragflow.fullname" . }}-mysql
+  serviceName: mysql
   replicas: 1
   selector:
     matchLabels:
@@ -46,6 +46,14 @@ spec:
         checksum/config-mysql: {{ include (print $.Template.BasePath "/mysql-config.yaml") . | sha256sum }}
         checksum/config-env: {{ include (print $.Template.BasePath "/env.yaml") . | sha256sum }}
     spec:
+      {{- with .Values.mysql.deployment.nodeSelector }}
+      nodeSelector:
+        {{- . | toYaml | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mysql.deployment.affinity }}
+      affinity:
+        {{- . | toYaml | nindent 8 }}
+      {{- end }}
       {{- if or .Values.global.imagePullSecrets .Values.mysql.image.pullSecrets }}
       imagePullSecrets:
         {{- with .Values.global.imagePullSecrets }}

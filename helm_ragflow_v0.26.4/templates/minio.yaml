@@ -29,7 +29,7 @@ metadata:
   annotations:
     checksum/config: {{ include (print $.Template.BasePath "/env.yaml") . | sha256sum }}
 spec:
-  serviceName: {{ include "ragflow.fullname" . }}-minio
+  serviceName: {{ include "ragflow.fullname" . }}-minio-headless
   replicas: 1
   selector:
     matchLabels:
@@ -45,6 +45,14 @@ spec:
         {{- include "ragflow.labels" . | nindent 8 }}
         app.kubernetes.io/component: minio
     spec:
+      {{- with .Values.minio.deployment.nodeSelector }}
+      nodeSelector:
+        {{- . | toYaml | nindent 8 }}
+      {{- end }}
+      {{- with .Values.minio.deployment.affinity }}
+      affinity:
+        {{- . | toYaml | nindent 8 }}
+      {{- end }}
       {{- if or .Values.global.imagePullSecrets .Values.minio.image.pullSecrets }}
       imagePullSecrets:
         {{- with .Values.global.imagePullSecrets }}

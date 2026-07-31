@@ -286,11 +286,17 @@ minio:
     pullPolicy: IfNotPresent
     pullSecrets: []
   storage:
-    className:
+    # PHAI khop PVC dang chay tren prod - storageClassName cua PVC la IMMUTABLE,
+    # doi gia tri se lam helm upgrade fail: "spec is immutable after creation".
+    className: local-minio
     capacity: 5Gi
   deployment:
     strategy:
     resources:
+    # Chay tren node co label ragflow-target=true
+    nodeSelector:
+      ragflow-target: "true"
+    affinity: {}
   service:
     type: ClusterIP
 
@@ -302,11 +308,16 @@ mysql:
     pullPolicy: IfNotPresent
     pullSecrets: []
   storage:
-    className:
+    # PHAI khop PVC dang chay tren prod (xem ghi chu o minio.storage.className)
+    className: local-mysql
     capacity: 5Gi
   deployment:
     strategy:
     resources:
+    # Chay tren node co label ragflow-target=true
+    nodeSelector:
+      ragflow-target: "true"
+    affinity: {}
   service:
     type: ClusterIP
 
@@ -318,7 +329,8 @@ redis:
     pullPolicy: IfNotPresent
     pullSecrets: []
   storage:
-    className:
+    # PHAI khop PVC dang chay tren prod (xem ghi chu o minio.storage.className)
+    className: local-redis
     capacity: 5Gi
   persistence:
     enabled: true
@@ -330,6 +342,10 @@ redis:
   deployment:
     strategy:
     resources:
+    # Chay tren node co label ragflow-target=true
+    nodeSelector:
+      ragflow-target: "true"
+    affinity: {}
   service:
     type: ClusterIP
 
