@@ -281,9 +281,16 @@ opensearch:
 minio:
   enabled: true
   image:
-    repository: pgsty/minio
-    tag: RELEASE.2026-03-25T00-00-00Z
+    # Giu image DA CO SAN tren node (cluster air-gapped, khong pull duoc tu
+    # internet). Chart v0.26.4 upstream doi sang pgsty/minio:RELEASE.2026-03-25
+    # nhung node chi cache docker.io/minio/minio:RELEASE.2025-06-13T11-33-47Z
+    # => dung tag upstream se ImagePullBackOff.
+    repository: minio/minio
+    tag: RELEASE.2025-06-13T11-33-47Z
     pullPolicy: IfNotPresent
+    # Upstream v0.26.4 goc:
+    # repository: pgsty/minio
+    # tag: RELEASE.2026-03-25T00-00-00Z
     pullSecrets: []
   storage:
     # PHAI khop PVC dang chay tren prod - storageClassName cua PVC la IMMUTABLE,
