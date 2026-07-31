@@ -137,8 +137,8 @@ ragflow:
     nodeSelector: {}
 
     affinity:
-      # Tranh node vrp-kubeengine04 (tai nguyen sap can kiet).
-      # required... = rang buoc CUNG: pod tha Pending chu khong len node04.
+      # Loai tru 2 node khoi workload ragflow.
+      # required... = rang buoc CUNG: pod tha Pending chu khong len cac node nay.
       nodeAffinity:
         requiredDuringSchedulingIgnoredDuringExecution:
           nodeSelectorTerms:
@@ -146,7 +146,14 @@ ragflow:
                 - key: kubernetes.io/hostname
                   operator: NotIn
                   values:
+                    # Tai nguyen sap can kiet
                     - vrp-kubeengine04
+                    # Danh RIENG cho mysql/minio/redis (chung bi ghim o day boi
+                    # local PV). Image ragflow nang ~7-8GB/ban, de len day se
+                    # day node vuot nguong disk-pressure -> kubelet gan taint
+                    # NoSchedule -> mysql/minio/redis khong schedule duoc nua.
+                    # Da xay ra that ngay 2026-07-31.
+                    - vrp-kubeengine07
       # Uu tien trai 3 pod ra 3 node khac nhau. Dung "preferred" (khong phai
       # "required") de pod van chay duoc neu cluster thieu node.
       podAntiAffinity:
