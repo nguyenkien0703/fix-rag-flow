@@ -485,18 +485,52 @@ knowledgebase (20 KB):  embd_id=qwen3-8b-embedding___OpenAI-API@OpenAI-API-Compa
 
 **Hướng xử lý tiếp**
 
-1. **(Làm được ngay, không downtime)** Chuẩn hoá dữ liệu sang format v0.26 — sửa KB thay vì sửa model:
+1. **(Làm được ngay, không downtime)** Bỏ di sản v0.24 khỏi `model_name`, chuyển `embd_id`
+   sang **format 3 phần** của v0.26.
+
+   **Nguồn gốc `___OpenAI-API`**: đây là quy ước **v0.24** — UI thời đó tự ghép
+   `<model_name>___<api_name>` khi lưu `tenant_llm.llm_name`. UI v0.26 lưu **tên thuần**.
+   Hàm `split("___")[0]` (`rag/llm/embedding_model.py:286`) chỉ là code tương thích ngược.
+
+   **Ba định dạng `embd_id`** (theo `split_model_name()`, `rsplit("@", 2)`):
+
+   | Dạng | Chuỗi | Code xử lý |
+   |---|---|---|
+   | v0.24 (hiện tại) | `model___api@provider` | `n==2` → `instance_name="default"` → cần fallback |
+   | 2 phần | `model@provider` | `n==2` → `instance_name="default"` → **vẫn cần fallback** |
+   | **v0.26 đầy đủ** | `model@instance@provider` | `n==3` → chỉ đích danh instance, **không cần fallback** |
+
+   Chọn dạng 3 phần vì nó không phụ thuộc điều kiện "chỉ có đúng 1 instance ACTIVE"
+   — chính là điểm mong manh mà bug #17578 Gap 3 mô tả.
+
    ```
-   QQ "CREATE TABLE knowledgebase_bak_20260731 AS SELECT * FROM knowledgebase;"
+   QQ "CREATE TABLE knowledgebase_bak_20260802 AS SELECT * FROM knowledgebase;"
    ```
    ```
    QQ "UPDATE tenant_model SET model_name='qwen3-8b-embedding' WHERE id='5d40793e8cd511f18d5d67e68cb92881';"
    ```
    ```
-   QQ "UPDATE knowledgebase SET embd_id='qwen3-8b-embedding@OpenAI-API-Compatible' WHERE embd_id='qwen3-8b-embedding___OpenAI-API@OpenAI-API-Compatible';"
+   QQ "UPDATE knowledgebase SET embd_id='qwen3-8b-embedding@qwen3-8b-embedding@OpenAI-API-Compatible' WHERE embd_id='qwen3-8b-embedding___OpenAI-API@OpenAI-API-Compatible';"
    ```
-   Sau đó UI hoạt động lại bình thường. **Vector trong ES không bị ảnh hưởng** — `embd_id` chỉ là
-   con trỏ tới cấu hình, model thật gọi tới endpoint vẫn là `qwen3-8b-embedding` cùng số chiều.
+
+   Phần giữa `qwen3-8b-embedding` là **tên instance** hiện tại (cột `tenant_model_instance.instance_name`).
+
+   Kết quả: `model_name` tên thuần → **UI hoạt động**; `embd_id` chỉ đích danh instance →
+   **retrieval hoạt động không cần fallback**; thêm model thứ 2 sau này không phá vỡ gì.
+
+   **Vector trong ES không bị ảnh hưởng** — `embd_id` chỉ là con trỏ tới cấu hình; model thật
+   gọi tới endpoint vẫn là `qwen3-8b-embedding`, cùng số chiều.
+
+   Verify sau khi sửa:
+   ```
+   QQ "SELECT DISTINCT embd_id FROM knowledgebase;"
+   ```
+   ```
+   QQ "SELECT id, model_name, model_type, status FROM tenant_model;"
+   ```
+   ```
+   kubectl -n ragflow rollout restart deploy/ragflow
+   ```
 
 2. **(Ngắn hạn)** Thêm UNIQUE constraint để tránh tái phát:
    ```
@@ -582,7 +616,8 @@ knowledgebase (20 KB):  embd_id=qwen3-8b-embedding___OpenAI-API@OpenAI-API-Compa
 | `task_executor` dùng **Redis Stream Consumer Group** → an toàn tuyệt đối khi scale, không bao giờ 2 pod xử lý 1 file |
 | `sync_data_source` **không có** cơ chế chống trùng — poll toàn bộ bảng rồi tự chạy. Chỉ an toàn khi bảng `connector` rỗng (đã verify: 0 dòng) |
 | API là **Quart (ASGI)** chạy bằng `app.run()` — single-process. Log tự cảnh báo: *"Please use an ASGI server (e.g. Hypercorn) directly in production"* |
-| `___` là separator cũ (v0.24): `<model>___<api_name>`. Runtime cắt bằng `split("___")[0]`. v0.26 dùng tên thuần |
+| `___` là separator **v0.24**: UI thời đó tự ghép `<model>___<api_name>`. UI v0.26 lưu tên thuần. `split("___")[0]` chỉ là code tương thích ngược, không phải logic sinh ra hậu tố |
+| Retrieval và UI Model Providers đi **hai đường tra cứu khác nhau**: retrieval đọc `knowledgebase.embd_id` rồi tra `tenant_model`; UI đọc thẳng `tenant_model`. Sửa `model_name` để chiều lòng đường này sẽ làm hỏng đường kia |
 
 ---
 
