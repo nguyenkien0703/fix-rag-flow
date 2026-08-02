@@ -488,11 +488,49 @@ knowledgebase (20 KB):  embd_id=qwen3-8b-embedding___OpenAI-API@OpenAI-API-Compa
 1. **(Làm được ngay, không downtime)** Bỏ di sản v0.24 khỏi `model_name`, chuyển `embd_id`
    sang **format 3 phần** của v0.26.
 
-   **Nguồn gốc `___OpenAI-API`**: đây là quy ước **v0.24** — UI thời đó tự ghép
-   `<model_name>___<api_name>` khi lưu `tenant_llm.llm_name`. UI v0.26 lưu **tên thuần**.
-   Hàm `split("___")[0]` (`rag/llm/embedding_model.py:286`) chỉ là code tương thích ngược.
+   **Nguồn gốc `___OpenAI-API`** (đã verify bằng source, có citation):
 
-   **Ba định dạng `embd_id`** (theo `split_model_name()`, `rsplit("@", 2)`):
+   Backend **v0.24** hardcode ánh xạ từ tên factory sang hậu tố, chỉ cho 4 factory:
+
+   ```python
+   # api/apps/llm_app.py:177-187 (tag v0.24.0)
+   elif factory == "LocalAI":                llm_name += "___LocalAI"
+   elif factory == "HuggingFace":            llm_name += "___HuggingFace"
+   elif factory == "OpenAI-API-Compatible":  llm_name += "___OpenAI-API"
+   elif factory == "VLLM":                   llm_name += "___VLLM"
+   ```
+
+   - https://github.com/infiniflow/ragflow/blob/v0.24.0/api/apps/llm_app.py#L177-L187
+   - https://github.com/infiniflow/ragflow/blob/v0.24.0/api/db/services/tenant_llm_service.py#L46-L54
+     (logic ghép y hệt ở phía tra cứu)
+   - https://github.com/infiniflow/ragflow/blob/v0.24.0/web/src/utils/llm-util.ts#L17
+     (frontend ghi nhận: *"The names of the large models returned by the interface are
+     similar to `deepseek-r1___OpenAI-API`"*)
+
+   **Lưu ý**: hậu tố **không phải** trường `<api_name>` do người dùng nhập — nó là chuỗi
+   **hardcode** ánh xạ từ tên factory. `OpenAI-API-Compatible` → `___OpenAI-API`.
+
+   **v0.26.4 không còn ghép nữa** — `grep -rn '"___"' api/` chỉ ra **1** kết quả duy nhất
+   là `.split("___")[0]` (`api/apps/llm_app.py:319`), tức code tương thích ngược.
+
+   **Ba định dạng `embd_id`** — comment chính thức của upstream v0.26.4:
+
+   ```python
+   # api/db/joint_services/tenant_model_service.py:189-190 (tag v0.26.4)
+   def split_model_name(model_name: str):
+       # Parse model_name: {model_name} or {model_name}@{factory_name}
+       #                   or {model_name}@{instance_name}@{factory_name}
+       parts = model_name.rsplit("@", 2)
+       n = len(parts)
+       if n == 3:   pure_model_name, instance_name, provider_name = parts
+       elif n == 2: pure_model_name, provider_name = parts; instance_name = "default"
+   ```
+
+   https://github.com/infiniflow/ragflow/blob/v0.26.4/api/db/joint_services/tenant_model_service.py#L189-L212
+
+   Dùng `rsplit(maxsplit=2)` neo từ phải vì tên model có thể **tự chứa** `@`
+   (ví dụ LM Studio: `text-embedding-nomic-embed-text-v1.5@q8_0`).
+
 
    | Dạng | Chuỗi | Code xử lý |
    |---|---|---|
