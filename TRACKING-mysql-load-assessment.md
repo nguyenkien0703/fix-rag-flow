@@ -322,7 +322,32 @@ Từ cùng file `local-pv.yaml`, ba PV cùng gốc `/data/ragflow/`:
 | `pv-ragflow-minio` | `/data/ragflow/minio` | local-minio | Bound → `ragflow/ragflow-minio` |
 | `pv-ragflow-redis` | (❓ chưa thấy trong ảnh, suy ra `/data/ragflow/redis`) | local-redis | Bound → `ragflow/redis-data-ragflow-redis-0` |
 
-→ MySQL, MinIO, Redis **và** containerd image store đều nằm trên `/dev/vda1`. **MinIO mới là thứ ăn đĩa nhiều nhất** (lưu file document gốc của 239k document), nhưng khi đĩa đầy thì MySQL cũng chết theo. Không có cách ly nào giữa chúng.
+→ MySQL, MinIO, Redis **và** containerd image store đều nằm trên `/dev/vda1`. Không có cách ly nào giữa chúng — bất kỳ thành phần nào làm đầy đĩa thì cả ba service chết theo.
+
+**Đo thực tế mức chiếm đĩa** (`du -sh /data/ragflow/* /var/lib/containerd` trên node07):
+
+```
+3.3M    /data/ragflow/elasticsearch
+3.2G    /data/ragflow/minio
+2.5G    /data/ragflow/mysql
+37M     /data/ragflow/redis
+27G     /var/lib/containerd
+```
+
+| Thành phần | Dung lượng | Ghi chú |
+|---|---|---|
+| `/var/lib/containerd` | **27 G** | 🔴 **Thủ phạm chính** — gấp ~4.7 lần toàn bộ dữ liệu RagFlow |
+| minio | 3.2 G | |
+| mysql | 2.5 G | Đã dùng 50% của "5Gi" khai báo |
+| redis | 37 M | |
+| elasticsearch | 3.3 M | Rác — đã tắt ES nội bộ |
+| **Tổng `/data/ragflow`** | **~5.8 G** | |
+
+⚠️ **Điều chỉnh giả định trước đó**: ban đầu suy đoán MinIO là thứ ăn đĩa nhiều nhất (vì lưu file gốc 239k document). **Sai** — MinIO chỉ 3.2G. Image store containerd mới là nguyên nhân, khớp với sự cố `disk-pressure` 31/07 do image 7.2GB.
+
+❓ **Chưa lý giải được**: `df` báo đã dùng **70G**, nhưng hai đường dẫn trên chỉ đếm được **32.8G**. Còn ~37G nằm ở chỗ khác trên `/dev/vda1` — cần tìm (log hệ thống, `/var/lib/kubelet`, hoặc workload khác của node07).
+
+**Ghi chú về ngưỡng 5Gi của MySQL**: hiện 2.5G, tức 50% con số khai báo. Vì `hostPath` không enforce, khi vượt 5Gi sẽ **không có cảnh báo nào** — nó chỉ âm thầm lấn sang phần đĩa còn lại. Đây chính là cái nguy hiểm của việc khai báo capacity ảo.
 
 **Phát hiện thêm — 2 bộ PV song song, bộ cũ có thể là rác**
 
@@ -498,6 +523,8 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 | **Local PV trên root filesystem = DB dùng chung đĩa với containerd.** Một image 7.2GB có thể gây `disk-pressure` và hạ gục DB không liên quan | `df -h` bên trong pod — nếu mount point báo cùng size với `/` của node thì đang dùng chung |
 | **Nhiều PV cùng gốc thư mục = không có cách ly giữa các service.** `/data/ragflow/{mysql,minio,redis}` — MinIO ngốn đĩa thì MySQL chết theo | Đọc file định nghĩa PV, so các `hostPath` xem có chung parent không |
 | **`Retain` + xoá PV ≠ giải phóng đĩa.** Dữ liệu vẫn nằm nguyên trong thư mục hostPath, phải xoá tay | Sau khi xoá PV `Retain`, kiểm tra `du -sh` thư mục tương ứng trên node |
+| **Image store thường ăn đĩa nhiều hơn dữ liệu ứng dụng.** Ở đây containerd 27G vs toàn bộ RagFlow 5.8G — đoán "MinIO lưu file nên nặng nhất" là **sai** | `du -sh` **trước** khi kết luận thành phần nào ngốn đĩa, đừng suy từ bản chất service |
+| **`df` và `du` lệch nhau là bình thường và đáng điều tra.** 70G vs 32.8G đếm được → còn 37G ở chỗ chưa biết | `du -sh /var/* \| sort -h` quét rộng thay vì chỉ đo thư mục nghi ngờ |
 | **`resources: {}` = BestEffort = evict đầu tiên.** Chart demo thường bỏ trống mục này | `kubectl get pod X -o jsonpath='{.spec.containers[0].resources}'` — ra `{}` là cờ đỏ |
 | **`describe node` cho biết requests/limits, KHÔNG cho biết mức dùng thực.** Node báo "1% memory" chỉ nghĩa là các pod **khai báo** ít, không nghĩa là RAM đang rảnh | Cần mức dùng thực → phải có metrics-server |
 
@@ -541,9 +568,14 @@ CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DES
 ```
 crictl rmi --prune
 ```
-- [ ] Xem thư mục nào ăn đĩa nhiều nhất trên node07:
+- [x] ~~Xem thư mục nào ăn đĩa nhiều nhất trên node07~~ → **containerd 27G**, `/data/ragflow` chỉ 5.8G
+- [ ] Truy ~37G còn lại chưa xác định (70G `df` − 32.8G đã đếm):
 ```
-du -sh /data/ragflow/* /var/lib/containerd
+du -sh /var/* 2>/dev/null | sort -h | tail -10
+```
+- [ ] Xem containerd đang giữ image gì:
+```
+crictl images
 ```
 - [ ] Kiểm tra lại dung lượng sau khi dọn:
 ```
@@ -587,7 +619,9 @@ SHOW VARIABLES LIKE 'slow_query_log';
 | Rủi ro | Mức độ | Giảm thiểu |
 |---|---|---|
 | Đĩa `/dev/vda1` node07 đầy (còn 25G/99G) → MySQL không ghi được → **hỏng dữ liệu** | 🔴 Cao | Dọn image + PV custom ngay; cảnh báo 80%; dài hạn tách đĩa riêng |
-| **MinIO ăn hết đĩa kéo MySQL chết theo** — cùng `/data/ragflow/`, MinIO lưu file gốc 239k document và còn tăng | 🔴 Cao | Đo `du -sh /data/ragflow/*`; ưu tiên tách MySQL khỏi MinIO |
+| **Image store containerd (27G) ăn đĩa kéo cả 3 service chết theo** — gấp 4.7 lần toàn bộ dữ liệu RagFlow (5.8G) | 🔴 Cao | `crictl rmi --prune` định kỳ; đặt `imageGCHighThresholdPercent` cho kubelet |
+| **~37G trên `/dev/vda1` chưa xác định nằm ở đâu** ❓ | 🟡 TB | `du -sh /var/*` để truy; có thể là log hoặc workload khác của node07 |
+| MySQL đang 2.5G / "5Gi" khai báo — khi vượt sẽ **không có cảnh báo** | 🟡 TB | Giám sát dung lượng thư mục `/data/ragflow/mysql`, không dựa vào PVC |
 | Mất pod MySQL = mất toàn bộ metadata (1 replica, backup ❓) | 🔴 Cao | Kiểm tra backup ngay; đánh giá HA |
 | Pod MySQL bị evict do BestEffort khi node gặp áp lực | 🟡 TB | Đặt resources (Ngắn hạn) |
 | Restart pod làm mất cấu hình slow log đang có | 🟡 TB | Đưa vào ConfigMap **trong cùng lần restart** |
