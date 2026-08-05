@@ -16,8 +16,10 @@ Kiểm tra tải của pod MySQL phục vụ RagFlow, xác định xem MySQL có
 |---|---|---|
 | Chart | `helm_ragflow_v0.26.4` (đã deploy thành công 02/08) | phiên trước |
 | MySQL replicas | 1 | chart |
-| StorageClass | `local-mysql` | `values.yaml` |
-| PVC capacity khai báo | 5Gi | `values.yaml` |
+| StorageClass | `local-mysql` (`kubernetes.io/no-provisioner`, Retain, không cho expand) | `kubectl get storageclass` |
+| PV | `pv-ragflow-mysql` — **hostPath** `/data/ragflow/mysql` | `local-pv.yaml` |
+| PV capacity khai báo | 5Gi (**không được enforce** — xem Issue 3) | `local-pv.yaml` |
+| Dung lượng thật | `/dev/vda1` 99G, đã dùng 70G (74%) | `df -h` trong pod |
 | Node đặt MySQL | `vrp-kubeengine07` (label `ragflow-target=true`) | `values.yaml` nodeSelector |
 | DB schema | `rag_flow` | |
 
@@ -29,7 +31,7 @@ Kiểm tra tải của pod MySQL phục vụ RagFlow, xác định xem MySQL có
 |---|---|---|---|---|
 | 1 | Query list document 11.1s, quét 953,020 dòng cho `LIMIT 50` | 🔴 Cao | 🔶 OPEN | Tạo composite index `(kb_id, create_time DESC)` |
 | 2 | `innodb_buffer_pool_size`=128MB / working set 1.85GB → 6,200 lần đọc đĩa/giây | 🔴 Cao | 🔶 OPEN | Tăng lên 3G, cần restart pod |
-| 3 | PVC khai báo 5Gi nhưng thực tế ghi vào `/dev/vda1` 99G đã dùng 74% | 🔴 Cao | 🔶 OPEN | Dọn image; dài hạn tách đĩa riêng |
+| 3 | PV `hostPath` khai báo 5Gi nhưng thực tế ghi vào `/dev/vda1` 99G đã dùng 74%, chung với MinIO/Redis/containerd | 🔴 Cao | 🔶 OPEN | Dọn image + PV rác; dài hạn tách đĩa riêng |
 | 4 | Pod MySQL `resources: {}` → QoS BestEffort | 🟡 TB | 🔶 OPEN | Đặt requests/limits |
 | 5 | `slow_query_log` OFF + `long_query_time`=10s → mù quan sát | 🟡 TB | ⚠️ WORKAROUND | Đã bật bằng `SET GLOBAL` (mất khi restart) → cần đưa vào ConfigMap |
 | 6 | Chưa có metrics-server → `kubectl top` không dùng được | 🟡 TB | 🔶 OPEN | Cài metrics-server |
@@ -263,12 +265,43 @@ Không có triệu chứng trực tiếp trong phiên này — phát hiện khi 
 
 **Root cause**
 
-StorageClass `local-mysql` dùng local PV trỏ vào một thư mục trên `/dev/vda1` — chính là root filesystem của node07, dùng chung với containerd image store và log.
+PV `pv-ragflow-mysql` là **`hostPath`** trỏ vào `/data/ragflow/mysql` — một thư mục thường trên root filesystem `/dev/vda1` của node07, dùng chung với containerd image store và log.
 
-**Local PV không có cơ chế enforce quota.** `capacity: 5Gi` trong PVC chỉ là metadata cho scheduler tính toán, **không giới hạn gì về mặt vật lý**. MySQL ghi thoải mái cho tới khi đầy cả đĩa node.
+StorageClass `local-mysql` dùng `provisioner: kubernetes.io/no-provisioner` — **không có provisioner nghĩa là không ai tạo volume riêng**. Không có LVM, không có partition, không có quota. `capacity: 5Gi` chỉ là metadata cho scheduler tính toán, **không giới hạn gì về mặt vật lý**. MySQL ghi thoải mái cho tới khi đầy cả đĩa node.
 
 **Bằng chứng**
 
+1) Định nghĩa PV — `local-pv.yaml`:
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-ragflow-mysql
+spec:
+  storageClassName: "local-mysql"
+  capacity: { storage: 5Gi }
+  accessModes: [ ReadWriteOnce ]
+  persistentVolumeReclaimPolicy: Retain
+  hostPath: { path: /data/ragflow/mysql }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: ragflow-target
+              operator: In
+              values: [ "true" ]
+```
+
+2) StorageClass — `kubectl get storageclass`:
+```
+NAME                 PROVISIONER                    RECLAIMPOLICY  VOLUMEBINDINGMODE     ALLOWVOLUMEEXPANSION
+local-minio          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+local-mysql          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+local-path (default) rancher.io/local-path          Delete         WaitForFirstConsumer  false
+local-redis          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+```
+
+3) Dung lượng thật bên trong pod:
 ```
 kubectl -n ragflow exec ragflow-mysql-0 -- df -h /var/lib/mysql
 ```
@@ -277,7 +310,36 @@ Filesystem   Size  Used Avail Use% Mounted on
 /dev/vda1     99G   70G   25G  74% /var/lib/mysql
 ```
 
-Đối chiếu: PVC khai báo 5Gi, nhưng mount point báo 99G tổng / 70G đã dùng. Hai con số không liên quan gì đến nhau.
+Đối chiếu: PV khai báo `5Gi`, nhưng mount point báo 99G tổng / 70G đã dùng — **đó là toàn bộ `/dev/vda1` của node**. Hai con số không liên quan gì đến nhau. `hostPath` + `no-provisioner` giải thích chính xác vì sao.
+
+**Phát hiện thêm — cả 3 service RagFlow dùng chung một gốc đĩa**
+
+Từ cùng file `local-pv.yaml`, ba PV cùng gốc `/data/ragflow/`:
+
+| PV | hostPath | StorageClass | Trạng thái |
+|---|---|---|---|
+| `pv-ragflow-mysql` | `/data/ragflow/mysql` | local-mysql | Bound → `ragflow/ragflow-mysql` |
+| `pv-ragflow-minio` | `/data/ragflow/minio` | local-minio | Bound → `ragflow/ragflow-minio` |
+| `pv-ragflow-redis` | (❓ chưa thấy trong ảnh, suy ra `/data/ragflow/redis`) | local-redis | Bound → `ragflow/redis-data-ragflow-redis-0` |
+
+→ MySQL, MinIO, Redis **và** containerd image store đều nằm trên `/dev/vda1`. **MinIO mới là thứ ăn đĩa nhiều nhất** (lưu file document gốc của 239k document), nhưng khi đĩa đầy thì MySQL cũng chết theo. Không có cách ly nào giữa chúng.
+
+**Phát hiện thêm — 2 bộ PV song song, bộ cũ có thể là rác**
+
+`kubectl get pv` cho thấy:
+
+| PV | Capacity | Age | Claim |
+|---|---|---|---|
+| `pv-ragflow-mysql` / `-minio` / `-redis` | 5Gi mỗi cái | 92d | ns `ragflow` (đang dùng) |
+| `pv-ragflow-custom-mysql` / `-minio` / `-redis` | 5Gi mỗi cái | 8d | ns `ragflow-custom` (từ lần test 31/07) |
+
+Cả 6 PV đều `Retain` + `Bound`, **cùng nằm trên node07**. Bộ `-custom` sinh ra khi test image v2 ở namespace `ragflow-custom`; nếu namespace đó không còn cần thì đây là dung lượng chiếm vô ích trên chính cái đĩa đang 74%.
+
+❓ **Chưa xác minh**: namespace `ragflow-custom` còn dùng hay không, và bộ PV custom đang chiếm bao nhiêu GB. Cần kiểm tra trước khi xoá — `Retain` nghĩa là xoá PV **không** tự xoá dữ liệu, phải xoá thư mục thủ công.
+
+**Phát hiện thêm — rác PVC**
+
+`ragflow-es-data` ở trạng thái **Pending 69 ngày** (storageClass `local-elasticsearch`). Khớp với việc đã tắt `elasticsearch.enabled=false` để dùng ES ngoài. Không gây hại, nhưng là rác nên dọn.
 
 **Hệ quả kép**
 
@@ -285,7 +347,7 @@ Filesystem   Size  Used Avail Use% Mounted on
 
 2. **Rủi ro còn lại** — còn 25GB trống. Nếu đĩa đầy, MySQL không ghi được → **hỏng dữ liệu**, không chỉ là chậm. Kết hợp với Issue 4 (BestEffort), pod này là ứng viên bị evict đầu tiên.
 
-**Đây là bằng chứng cứng nhất cho nhận định "triển khai sơ sài"**: con số 5Gi trong chart không phản ánh gì về thực tế và tạo cảm giác an toàn giả — người vận hành nhìn PVC tưởng DB chỉ chiếm 5GB.
+**Đây là bằng chứng cứng nhất cho nhận định "triển khai sơ sài"**: con số 5Gi trong PV không phản ánh gì về thực tế và tạo cảm giác an toàn giả — người vận hành nhìn PVC tưởng DB chỉ chiếm 5GB, trong khi thực tế là cả 3 service dùng chung 99GB với containerd, đã hết 74%.
 
 **Đã thử / cân nhắc**
 
@@ -293,16 +355,22 @@ Filesystem   Size  Used Avail Use% Mounted on
 |---|---|
 | Tin vào `capacity: 5Gi` của PVC | ❌ **Sai** — chỉ là metadata. Phải `df -h` bên trong pod mới biết thực tế |
 | `crictl rmi --prune` dọn image (đã làm 31/07) | ✅ Gỡ được `disk-pressure` lần đó — nhưng là **workaround**, root cause (dùng chung đĩa) còn nguyên |
+| Mở rộng PV để lấy thêm dung lượng | ❌ **Loại** — `ALLOWVOLUMEEXPANSION: false` trên cả 3 storageclass; hơn nữa với `hostPath` thì "mở rộng" vô nghĩa vì vốn đã dùng cả đĩa |
 
 **Hướng xử lý tiếp**
 
-1. **Ngay** — dọn image cũ trên node07 để lấy lại dung lượng:
+1. **Ngay** — dọn image cũ trên node07:
 ```
 crictl rmi --prune
 ```
-2. **Ngay** — thiết lập cảnh báo dung lượng `/dev/vda1` node07 ở ngưỡng 80%.
-3. **Dài hạn** — tách MySQL sang đĩa/volume riêng. Việc này **quan trọng hơn cả HA**: hiện tại một image lớn bất kỳ có thể hạ gục DB.
-4. ❓ **Chưa xác minh**: đường dẫn thư mục cụ thể mà PV `local-mysql` trỏ tới trên node07. Cần `kubectl get pv -o yaml` để biết trước khi tính chuyện tách đĩa.
+2. **Ngay** — đo xem thư mục nào đang ăn đĩa nhiều nhất trên node07:
+```
+du -sh /data/ragflow/* /var/lib/containerd
+```
+3. **Ngay** — thiết lập cảnh báo dung lượng `/dev/vda1` node07 ở ngưỡng 80%.
+4. **Ngắn hạn** — xác minh namespace `ragflow-custom` còn dùng không; nếu không thì xoá deployment + PV + **thư mục dữ liệu** (vì `Retain` không tự xoá).
+5. **Ngắn hạn** — xoá PVC rác `ragflow-es-data`.
+6. **Dài hạn** — tách `/data/ragflow` sang đĩa/LVM riêng, hoặc ít nhất tách MySQL khỏi MinIO. Việc này **quan trọng hơn cả HA**: hiện tại một image lớn hoặc một đợt upload file bất kỳ có thể hạ gục DB.
 
 ---
 
@@ -424,8 +492,12 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 
 | Bài học | Cách phát hiện sớm lần sau |
 |---|---|
-| **`capacity` của local PV là metadata, không phải giới hạn.** PVC ghi 5Gi nhưng thực tế dùng 99G — không có cơ chế enforce | Luôn `kubectl exec <pod> -- df -h <mountpath>` để biết dung lượng **thật**, không tin PVC |
+| **`capacity` của local PV là metadata, không phải giới hạn.** PV ghi 5Gi nhưng thực tế dùng chung 99G — không có cơ chế enforce | Luôn `kubectl exec <pod> -- df -h <mountpath>` để biết dung lượng **thật**, không tin PVC |
+| **`provisioner: kubernetes.io/no-provisioner` = không ai tạo volume.** PV chỉ là thư mục thường trên node; không LVM, không partition, không quota | `kubectl get storageclass` — thấy `no-provisioner` thì `capacity` chắc chắn là số ảo |
+| **`hostPath` là cờ đỏ mạnh hơn cả `local`.** `local` volume ít ra còn có thể trỏ vào block device riêng; `hostPath` thì luôn là thư mục trên filesystem sẵn có | `kubectl get pv <name> -o yaml \| grep -A2 hostPath` |
 | **Local PV trên root filesystem = DB dùng chung đĩa với containerd.** Một image 7.2GB có thể gây `disk-pressure` và hạ gục DB không liên quan | `df -h` bên trong pod — nếu mount point báo cùng size với `/` của node thì đang dùng chung |
+| **Nhiều PV cùng gốc thư mục = không có cách ly giữa các service.** `/data/ragflow/{mysql,minio,redis}` — MinIO ngốn đĩa thì MySQL chết theo | Đọc file định nghĩa PV, so các `hostPath` xem có chung parent không |
+| **`Retain` + xoá PV ≠ giải phóng đĩa.** Dữ liệu vẫn nằm nguyên trong thư mục hostPath, phải xoá tay | Sau khi xoá PV `Retain`, kiểm tra `du -sh` thư mục tương ứng trên node |
 | **`resources: {}` = BestEffort = evict đầu tiên.** Chart demo thường bỏ trống mục này | `kubectl get pod X -o jsonpath='{.spec.containers[0].resources}'` — ra `{}` là cờ đỏ |
 | **`describe node` cho biết requests/limits, KHÔNG cho biết mức dùng thực.** Node báo "1% memory" chỉ nghĩa là các pod **khai báo** ít, không nghĩa là RAM đang rảnh | Cần mức dùng thực → phải có metrics-server |
 
@@ -444,8 +516,10 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 |---|---|---|
 | `SET GLOBAL slow_query_log/long_query_time` chỉ nằm trong runtime | Issue 5 — workaround trong phiên này | Restart pod (mà Issue 2, 4 đều cần) → mất cấu hình, mù quan sát trở lại |
 | MySQL 1 replica, không HA | Chart mặc định | Mất pod = mất toàn bộ metadata RagFlow (KB, document, user, model config) |
-| MySQL dùng chung đĩa với containerd trên node07 | Issue 3 | Đĩa đầy → MySQL không ghi được → **hỏng dữ liệu** |
-| PVC 5Gi không phản ánh thực tế 70G | Issue 3 | Người vận hành nhìn PVC tưởng an toàn, không ai theo dõi dung lượng thật |
+| MySQL + MinIO + Redis + containerd dùng chung `/dev/vda1` node07 | Issue 3 — `hostPath` cùng gốc `/data/ragflow/` | Đĩa đầy → MySQL không ghi được → **hỏng dữ liệu**. MinIO ngốn đĩa thì MySQL chết theo |
+| PV 5Gi không phản ánh thực tế 70G (`no-provisioner` + `hostPath`) | Issue 3 | Người vận hành nhìn PVC tưởng an toàn, không ai theo dõi dung lượng thật |
+| Bộ PV `pv-ragflow-custom-*` (8d) từ lần test, `Retain` + `Bound`, cùng node07 | Phiên 31/07 | Chiếm đĩa vô ích trên chính đĩa đang 74%; `Retain` nên xoá PV không tự giải phóng |
+| PVC `ragflow-es-data` Pending 69 ngày | Tắt `elasticsearch.enabled` để dùng ES ngoài | Rác, gây nhiễu khi đọc trạng thái cluster |
 | Không có backup MySQL ❓ | chưa kiểm tra trong phiên | Kết hợp với 3 dòng trên → mất dữ liệu không khôi phục được |
 | Chưa có metrics-server / giám sát MySQL | Issue 6 | Không phát hiện được suy thoái, chỉ biết khi user kêu |
 
@@ -467,11 +541,16 @@ CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DES
 ```
 crictl rmi --prune
 ```
+- [ ] Xem thư mục nào ăn đĩa nhiều nhất trên node07:
+```
+du -sh /data/ragflow/* /var/lib/containerd
+```
 - [ ] Kiểm tra lại dung lượng sau khi dọn:
 ```
 kubectl -n ragflow exec ragflow-mysql-0 -- df -h /var/lib/mysql
 ```
 - [ ] Kiểm tra xem có backup MySQL không
+- [ ] Xác minh namespace `ragflow-custom` còn dùng không (bộ PV `pv-ragflow-custom-*` đang chiếm đĩa)
 
 ### Ngắn hạn (cần 1 lần restart pod, ~2 phút)
 
@@ -492,7 +571,9 @@ SHOW VARIABLES LIKE 'slow_query_log';
 
 ### Dài hạn
 
-- [ ] Tách MySQL sang đĩa/volume riêng, không dùng chung `/dev/vda1` với containerd
+- [ ] Dọn bộ PV `pv-ragflow-custom-*` + **thư mục dữ liệu** nếu ns `ragflow-custom` không còn dùng (`Retain` không tự xoá)
+- [ ] Xoá PVC rác `ragflow-es-data` (Pending 69 ngày)
+- [ ] Tách `/data/ragflow` sang đĩa/LVM riêng, không dùng chung `/dev/vda1` với containerd; ít nhất tách MySQL khỏi MinIO
 - [ ] Cài metrics-server
 - [ ] Thêm mysqld_exporter + dashboard Grafana (buffer pool hit ratio, slow query rate, connection, dung lượng)
 - [ ] Cảnh báo dung lượng `/dev/vda1` node07 ở ngưỡng 80%
@@ -505,7 +586,8 @@ SHOW VARIABLES LIKE 'slow_query_log';
 
 | Rủi ro | Mức độ | Giảm thiểu |
 |---|---|---|
-| Đĩa `/dev/vda1` node07 đầy (còn 25G/99G) → MySQL không ghi được → **hỏng dữ liệu** | 🔴 Cao | Dọn image ngay; cảnh báo 80%; dài hạn tách đĩa riêng |
+| Đĩa `/dev/vda1` node07 đầy (còn 25G/99G) → MySQL không ghi được → **hỏng dữ liệu** | 🔴 Cao | Dọn image + PV custom ngay; cảnh báo 80%; dài hạn tách đĩa riêng |
+| **MinIO ăn hết đĩa kéo MySQL chết theo** — cùng `/data/ragflow/`, MinIO lưu file gốc 239k document và còn tăng | 🔴 Cao | Đo `du -sh /data/ragflow/*`; ưu tiên tách MySQL khỏi MinIO |
 | Mất pod MySQL = mất toàn bộ metadata (1 replica, backup ❓) | 🔴 Cao | Kiểm tra backup ngay; đánh giá HA |
 | Pod MySQL bị evict do BestEffort khi node gặp áp lực | 🟡 TB | Đặt resources (Ngắn hạn) |
 | Restart pod làm mất cấu hình slow log đang có | 🟡 TB | Đưa vào ConfigMap **trong cùng lần restart** |
@@ -556,6 +638,17 @@ SHOW INDEX FROM rag_flow.document;
 Dung lượng đĩa thật:
 ```
 kubectl -n ragflow exec ragflow-mysql-0 -- df -h /var/lib/mysql
+```
+
+PVC / PV / StorageClass:
+```
+kubectl get pvc -n ragflow
+```
+```
+kubectl get pv -n ragflow
+```
+```
+kubectl get storageclass
 ```
 
 Resources của pod:
