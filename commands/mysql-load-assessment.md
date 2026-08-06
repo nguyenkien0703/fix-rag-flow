@@ -1,8 +1,9 @@
 # Lệnh tham khảo — MySQL load assessment
 
 File này gộp lại **mọi lệnh có giải nghĩa cờ** đã dùng trong quá trình check tải MySQL RagFlow.
-Mục đích: đọc lại khi cần, không phải lục lại chat. Xem thêm root cause/kết luận ở
-`TRACKING-mysql-load-assessment.md`.
+Mục đích: đọc lại khi cần, không phải lục lại chat.
+
+**Task chính**: `../TRACKING-mysql-load-assessment.md` — root cause, bằng chứng, kết luận.
 
 Quy ước: lệnh đơn giản không cờ (`ls`, `git status`...) không ghi vào đây.
 

@@ -3,6 +3,7 @@
 **Phiên:** 05/08/2026
 **Đối tượng:** pod `ragflow-mysql-0`, namespace `ragflow`, node `vrp-kubeengine07`
 **Trạng thái phiên:** 🔶 ĐANG DỞ — đã hoàn tất chẩn đoán, **chưa thực thi bất kỳ thay đổi nào**
+**Lệnh tham khảo (kèm giải nghĩa cờ):** `commands/mysql-load-assessment.md`
 
 ---
 
