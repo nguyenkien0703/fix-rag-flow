@@ -72,6 +72,61 @@ Lý do Cách 1 khả thi và "nhàn" như sếp nhận định:
      xảy ra nếu ai đó vô tình sinh lại secret hoặc đổi `values.yaml` env trong lúc thao tác
    - Ghi lại `SHOW GRANTS` cho user hiện dùng, để đối chiếu quyền không bị mất
 
+### Bước 0.5 — Dọn namespace test `ragflow-custom` trên node06 + so sánh node06 vs node08 (✅ ĐÃ LÀM 07/08/2026)
+
+**Lý do làm trước Bước 1**: namespace `ragflow-custom` (môi trường test cũ, deploy 31/07) đang
+chạy sống trên chính node06 — nghi ngờ từ TRACKING file Issue 3 nay đã xác nhận là rác, và pod
+của nó đang giữ chân nhiều image RagFlow cũ trong containerd, cần dọn trước khi so sánh disk
+công bằng giữa node06/node08.
+
+**Đã làm, theo thứ tự:**
+1. `kubectl -n ragflow-custom get pvc` — xác nhận 4 PVC: `es-data` (Pending, rác), `minio`,
+   `mysql`, `redis-data-*` (đều Bound, storageClass `local-minio`/`local-mysql`/`local-redis` —
+   **cùng SC với production nhưng khác PV/tên**, không xung đột)
+2. `kubectl get pv pv-ragflow-custom-{mysql,minio,redis} -o jsonpath=...` — lấy đúng hostPath:
+   `/data/ragflow-custom/{mysql,minio,redis}` trên node06
+3. `du -sh /data/ragflow-custom/*` (node06) — chỉ **2.3G** (minio 1.4G + mysql 998M + redis 9.9M)
+   → không phải nguồn gây thiếu disk
+4. `df -h /` (node06) lúc đó: 197G total, **chỉ 47G trống (76% used)** — lệch xa so với 2.3G vừa
+   đo → còn ~140G chưa rõ, đào tiếp: `du -sh /var/*` → `/var/lib` = 83G → `du -sh /var/lib/*` →
+   **`/var/lib/containerd` = 63G** (thủ phạm chính, cùng pattern với node07 hồi 31/07)
+5. Đối chiếu công bằng trước khi chọn node: `du -sh /data/ragflow/mysql` (node07) = **5.1G**
+   (tăng từ 2.5G ghi trong TRACKING chỉ trong ~2 ngày — cần lưu ý tốc độ tăng trưởng cho dài hạn);
+   `df -h /` (node08) lúc đó = 197G total, 44G trống (78% used) — **gần bằng node06, chưa đủ để
+   quyết định ngay**
+6. `crictl images` trên cả 2 node — node06 lộ ra **4 image RagFlow cũ (~13.7GB)**:
+   `ragflow:v1-latest`, `ragflow:v0.24.0-pyvi` (khớp sự cố 7.2GB hồi 31/07), `ragflow:v2-latest`,
+   `custom-ragflow:v0.26.4-pyvi` — nghi ngờ đang bị pod `ragflow-custom-*` giữ chân, không prune
+   được nếu chưa dừng pod. node08 sạch, không có image RagFlow nào.
+7. `kubectl get deploy,sts -n ragflow-custom` → `helm list -n ragflow-custom` — xác nhận release
+   Helm tên `ragflow-custom` (chart `ragflow-0.1.0`, deployed 31/07)
+8. `helm uninstall ragflow-custom -n ragflow-custom` — xoá Deployment + 3 StatefulSet (mysql/
+   minio/redis) + es (Pending). **PV/PVC được giữ lại** nhờ `resource-policy: keep` (Helm tự báo
+   rõ) — dữ liệu vẫn nguyên vẹn, chưa xoá gì vật lý
+9. `kubectl get pods -n ragflow-custom` → `No resources found` — xác nhận dừng sạch
+10. `crictl rmi --prune` trên cả 2 node — node06 gỡ được **hầu hết image rác** (kể cả
+    `ragflow:v0.24.0-pyvi`, `mysql:8.0.39` cũ, `redis`, `postgres`...); node08 không gỡ được gì
+    (toàn bộ image đang dùng, không có rác)
+11. `df -h /` đo lại sau dọn — **node06: 75G trống (61% used)**, node08: 43G trống (78% used,
+    không đổi vì không prune được gì)
+
+**Kết quả — chốt migrate MySQL sang node06:**
+
+| | node06 (sau dọn) | node08 |
+|---|---|---|
+| Disk trống | **75G (61% used)** | 43G (78% used) |
+| CPU/load (từ phiên 06/08) | rảnh | rảnh nhất |
+
+node06 thắng cả 2 tiêu chí sau khi dọn ~28G rác (image RagFlow cũ + `ragflow-custom` data), và
+namespace test đã sạch hoàn toàn nên không còn rủi ro tranh chấp resource với môi trường mới.
+
+**Còn treo — chưa xử lý trong đợt này (không chặn việc migrate MySQL production):**
+- 4 PV/PVC `pv-ragflow-custom-*` vẫn còn (`Retain`, giữ lại theo Helm resource-policy) —
+  ❓ chưa xoá, để làm sau khi migrate MySQL production ổn định, tránh gộp 2 loại rủi ro
+- PVC `ragflow-custom-es-data` (Pending) — rác thuần, dọn cùng lúc với các PV trên
+- `/var/lib/kubelet` = 21G trên node06 — chưa điều tra, không phải rác rõ ràng như containerd
+  nên chưa động vào
+
 ### Bước 1 — Đánh composite index (làm trước, độc lập với việc chuyển node)
 ```sql
 CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DESC);
