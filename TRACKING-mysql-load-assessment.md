@@ -31,8 +31,8 @@ Kiểm tra tải của pod MySQL phục vụ RagFlow, xác định xem MySQL có
 
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
-| 1 | Query list document 11.1s, quét 953,020 dòng cho `LIMIT 50` | 🔴 Cao | 🔶 OPEN | Tạo composite index `(kb_id, create_time DESC)` |
-| 1b | `duplicate_name(kb_id, name)` trong flow upload cũng thiếu composite index (cùng lớp vấn đề với #1) | 🔴 Cao | 🔶 OPEN — mới phát hiện 07/08 | Đánh giá tạo composite index `(kb_id, name)` |
+| 1 | Query list document 11.1s, quét 953,020 dòng cho `LIMIT 50` | 🔴 Cao | ✅ FIXED (07/08) | Đã tạo `idx_document_kb_create`; đo thực tế 0.02s (giảm ~500 lần). Nợ nhỏ: optimizer mặc định vẫn không tự chọn index này, xem chi tiết Issue 1 |
+| 1b | `duplicate_name(kb_id, name)` — nghi ngờ ban đầu (07/08) là thiếu index, đã `EXPLAIN` xác minh và **bác bỏ** | ⚪ Không phải issue | ✅ ĐÃ XÁC MINH KHÔNG CÓ VẤN ĐỀ (07/08) | Không cần làm gì — xem chi tiết bên dưới |
 | 2 | `innodb_buffer_pool_size`=128MB / working set 1.85GB → 6,200 lần đọc đĩa/giây | 🔴 Cao | 🔶 OPEN | Tăng lên 3G, cần restart pod |
 | 3 | PV `hostPath` khai báo 5Gi nhưng thực tế ghi vào `/dev/vda1` 99G đã dùng 74%, chung với MinIO/Redis/containerd | 🔴 Cao | 🔶 OPEN | Dọn image + PV rác; dài hạn tách đĩa riêng |
 | 4 | Pod MySQL `resources: {}` → QoS BestEffort | 🟡 TB | 🔶 OPEN | Đặt requests/limits |
@@ -220,7 +220,22 @@ Composite index giải quyết cả hai việc: nhảy thẳng vào vùng của 
    - `rows` giảm mạnh
    - `Extra` **không còn** `Using where` (lọc đã do index đảm nhận)
 
-3. ❓ **Chưa xác minh**: chi phí thời gian và dung lượng của lệnh CREATE INDEX trên bảng 1GB / 239k dòng. Ước tính vài chục giây và ~15-20MB, nhưng **chưa đo thực tế**.
+3. ✅ **Đã đo thực tế (07/08)**: `CREATE INDEX` mất **8.77 giây** trên bảng ~1GB/239k dòng — không đáng lo như ước tính ban đầu.
+
+**✅ ĐÃ THỰC HIỆN (07/08/2026, trong `PLAN-mysql-migrate-node06.md` Bước 1)**
+
+```sql
+CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DESC);
+-- Query OK, 0 rows affected (8.77 sec)
+```
+
+Xác minh bằng `EXPLAIN` + đo thời gian thật:
+- Đo thời gian thực tế của đúng query gây chậm (chỉ `SELECT t1.id` để tránh tốn công truyền dữ liệu, giữ nguyên WHERE/JOIN/ORDER BY): **50 rows in set (0.02 sec)** — so với baseline 11.1s, giảm **~500 lần**.
+- ⚠️ **Phát hiện phụ, chưa giải quyết**: `EXPLAIN` mặc định (không ép index) **vẫn chọn** `key: document_kb_id` (không phải `idx_document_kb_create`) dù đã `ANALYZE TABLE` cập nhật thống kê — optimizer đang đánh giá sai chi phí, không tự nhận ra index mới tốt hơn.
+- Dùng `FORCE INDEX (idx_document_kb_create)` để xác nhận dứt khoát index hoạt động đúng: `Extra` từ `Using temporary; Using filesort` (khi dùng key sai) chuyển thành **trống hoàn toàn** — bằng chứng rõ ràng index đã loại bỏ đúng cả filesort lẫn temporary table.
+- **Quyết định (đã hỏi ý kiến, chốt "không sửa"):** không sửa code RagFlow để thêm `FORCE INDEX` — nằm ngoài phạm vi (dự án chỉ deploy qua values.yaml/helm, không sửa code app), và 0.02s đã đủ nhanh cho mục tiêu thực tế. Giữ nguyên là **nợ kỹ thuật nhỏ**, xem mục 6.
+
+**Trạng thái cuối: ✅ FIXED** — root cause (thiếu composite index) đã xử lý, có bằng chứng đo thực tế. Không còn là 🔶 OPEN.
 
 ---
 
@@ -502,46 +517,42 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 
 ---
 
-### 🔴 Issue 1b — `duplicate_name(kb_id, name)` thiếu composite index (cùng lớp với Issue 1) — 🔶 OPEN
+### ⚪ Issue 1b — `duplicate_name(kb_id, name)` — nghi ngờ thiếu index đã bị BÁC BỎ bằng EXPLAIN — ✅ ĐÃ XÁC MINH
 
-**Triệu chứng**
-
-Đối tác tích hợp báo tốc độ upload document trung bình 55s/vb, breakdown:
-
-| Bước | Thời gian |
-|---|---|
-| Check tồn tại | 6s |
-| Gọi LLM tóm tắt | 10s |
-| Upload document | **25s** |
-| Update metadata | 8s |
-| Parse chunk | 6s |
-| **Tổng** | **55s/vb** |
-
-**Root cause (suy luận từ code, chưa `EXPLAIN` trực tiếp trên query này)**
+**Nghi ngờ ban đầu (07/08, trước khi đo)**
 
 Từ phân tích flow upload (`file_service.py:514-604`), mỗi file đi qua tuần tự:
 
 1. `get_root_folder` / `init_knowledgebase_docs` / `get_kb_folder` — mỗi cái 1 SELECT trên bảng `file`
-2. `duplicate_name(DocumentService.query, name=..., kb_id=...)` — query `document` theo `(kb_id, name)` — **cùng lớp vấn đề với Issue 1**: có index đơn `kb_id`, không có composite `(kb_id, name)`
+2. `duplicate_name(DocumentService.query, name=..., kb_id=...)` — query `document` theo `(kb_id, name)` — **nghi ngờ ban đầu**: cùng lớp vấn đề với Issue 1, có index đơn `kb_id` nhưng không có composite `(kb_id, name)`
 3. `STORAGE_IMPL.obj_exist(...)` — 1 HEAD request MinIO
 4. `STORAGE_IMPL.put(...)` — PUT file gốc lên MinIO
 5. `thumbnail_img(...)` — CPU-bound, nặng với PDF
 6. `STORAGE_IMPL.put(...)` lần 2 — PUT thumbnail
 7. `DocumentService.insert(doc)` — INSERT MySQL
 
-→ ≥4 round-trip MySQL + 3 round-trip MinIO + 1 tác vụ CPU, **không cái nào song song trong 1 request**. Ở tốc độ nhiều doc/phút với nhiều pod cùng đập vào 1 MySQL/MinIO, độ trễ cộng dồn dễ lên hàng chục giây — khớp với 25s bước Upload mà đối tác báo.
+→ Giả thuyết ban đầu: ≥4 round-trip MySQL + 3 round-trip MinIO + 1 tác vụ CPU, không cái nào song song, cộng dồn thành 25s bước Upload đối tác báo (55s/vb: check 6s, LLM tóm tắt 10s, upload 25s, update metadata 8s, parse chunk 6s).
 
-**Đã thử / cân nhắc**
+**Đã `EXPLAIN` trực tiếp (07/08, trong lúc thực thi Bước 1 của `PLAN-mysql-migrate-node06.md`) — kết quả BÁC BỎ nghi ngờ**
 
-| Phương án | Kết quả |
-|---|---|
-| Đối chiếu breakdown 55s/vb với CPU node07 80% tại cùng thời điểm | ✅ Khớp — nút thắt không phải mạng/MinIO mà là MySQL trên node07 |
-| `EXPLAIN` trực tiếp câu `duplicate_name` | ❓ **Chưa làm** — mới suy luận từ code + cùng pattern với Issue 1, chưa đo thực tế |
+```sql
+EXPLAIN SELECT * FROM document WHERE kb_id = '73932b965e5e11f192725fd51894c519' AND name = 'test.pdf';
+```
+```
+key: document_name | rows: 1 | filtered: 50.00 | Extra: Using where
+```
 
-**Hướng xử lý tiếp**
+Không có `Using temporary`, không có `Using filesort`, `rows` ước tính chỉ **1** — hoàn toàn không giống bệnh của Issue 1.
 
-1. ❓ Cần `EXPLAIN` câu `duplicate_name(kb_id, name)` để xác nhận (giống cách đã làm với Issue 1) trước khi khẳng định chắc.
-2. Nếu xác nhận đúng, tạo thêm composite index — làm **chung một lượt** với `idx_document_kb_create` (Issue 1) để đỡ tác động nhiều lần lên bảng `document`.
+**Root cause thật (khác với nghi ngờ ban đầu)**
+
+`SHOW INDEX FROM rag_flow.document WHERE Key_name = 'document_name'` cho thấy đây là index **đơn cột** trên `name` (không phải composite `(kb_id, name)` như suy luận ban đầu), nhưng `Cardinality = 347,033` trên tổng ~239k dòng — tên file gần như **duy nhất** (độ chọn lọc cực cao). Vì vậy MySQL tra `name` trước là đủ để thu hẹp gần như về 1 dòng ngay lập tức, sau đó check `kb_id` trên phần còn lại gần như miễn phí.
+
+Khác với Issue 1, nơi cột lọc chính (`kb_id`, chỉ 18 giá trị phân biệt) có độ chọn lọc **thấp** nên buộc phải kết hợp với sort mới hiệu quả — đây chính là lý do 2 query cùng dạng `WHERE kb_id = ? AND ...` lại có 2 kết cục khác hẳn nhau.
+
+**Bài học**: suy luận "cùng shape query = cùng bệnh" từ đọc code là **không đủ** — độ chọn lọc (cardinality) của từng cột quyết định index nào thật sự cần, phải `EXPLAIN` trực tiếp mới kết luận được, không suy diễn từ cấu trúc SQL.
+
+**Kết luận**: không cần tạo thêm index cho `duplicate_name`. 25s ở bước Upload trong báo cáo đối tác **không** đến từ query này — nguyên nhân thật (nếu còn tồn tại sau khi đánh index Issue 1 + migrate node) nhiều khả năng nằm ở các bước MinIO/CPU thumbnail hoặc cộng dồn độ trễ khi nhiều pod cùng lúc đập vào MySQL/MinIO trên node07 quá tải — chưa đo lại sau khi xử lý Issue 1, cần đo lại 55s/vb sau khi hoàn tất migrate để biết còn treo ở đâu.
 
 ---
 
@@ -673,6 +684,7 @@ Bối cảnh: sếp hỏi có thể tận dụng node06/node08 đang rảnh đ�
 | Bộ PV `pv-ragflow-custom-*` (8d) từ lần test, `Retain` + `Bound`, cùng node07 | Phiên 31/07 | Chiếm đĩa vô ích trên chính đĩa đang 74%; `Retain` nên xoá PV không tự giải phóng |
 | PVC `ragflow-es-data` Pending 69 ngày | Tắt `elasticsearch.enabled` để dùng ES ngoài | Rác, gây nhiễu khi đọc trạng thái cluster |
 | Không có backup MySQL ❓ | chưa kiểm tra trong phiên | Kết hợp với 3 dòng trên → mất dữ liệu không khôi phục được |
+| Optimizer không tự chọn `idx_document_kb_create` dù đã tạo + ANALYZE TABLE, chỉ dùng đúng khi `FORCE INDEX` | Issue 1 — xác nhận 07/08 sau khi tạo index | Hiện tại đủ nhanh (167k rows filtered vẫn nhanh hơn baseline nhiều) nhưng khi KB tiếp tục phình to hơn nữa, khoảng cách hiệu năng giữa 2 key sẽ ngày càng lớn — cần theo dõi, có thể phải `FORCE INDEX` trong code hoặc `ANALYZE TABLE` định kỳ về sau |
 | Chưa có metrics-server / giám sát MySQL | Issue 6 | Không phát hiện được suy thoái, chỉ biết khi user kêu |
 
 ❓ **Chưa xác minh**: có backup MySQL hay không — không kiểm tra trong phiên này. **Nên kiểm tra sớm**, vì đây là nợ nguy hiểm nhất trong bảng.
@@ -683,22 +695,22 @@ Bối cảnh: sếp hỏi có thể tận dụng node06/node08 đang rảnh đ�
 
 ### Ngay lập tức (không downtime)
 
-- [ ] Tạo composite index:
+- [x] ~~Tạo composite index~~ → ✅ **Đã làm 07/08**, mất 8.77s, xem Issue 1
 ```sql
 CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DESC);
 ```
-- [ ] Chạy lại `EXPLAIN` query cũ, xác nhận `key` = `idx_document_kb_create` và `rows` giảm mạnh
-- [ ] Đo lại thời gian query thực tế sau khi có index
-- [ ] Dọn image cũ trên node07:
+- [x] ~~Chạy lại `EXPLAIN` query cũ~~ → ✅ Đã xác minh bằng `FORCE INDEX`: `Extra` sạch, không còn filesort/temporary
+- [x] ~~Đo lại thời gian query thực tế sau khi có index~~ → ✅ **0.02s** (từ 11.1s, giảm ~500 lần)
+- [x] ~~Dọn image cũ trên node07~~ → đã làm tương đương trên **node06** (07/08, gỡ ~28G rác gồm image RagFlow cũ, xem `PLAN-mysql-migrate-node06.md` Bước 0.5). Node07 vẫn **chưa dọn**, còn trong danh sách việc tiếp theo.
 ```
 crictl rmi --prune
 ```
 - [x] ~~Xem thư mục nào ăn đĩa nhiều nhất trên node07~~ → **containerd 27G**, `/data/ragflow` chỉ 5.8G
-- [ ] Truy ~37G còn lại chưa xác định (70G `df` − 32.8G đã đếm):
+- [ ] Truy ~37G còn lại chưa xác định trên **node07** (70G `df` − 32.8G đã đếm) — lưu ý: đã làm việc tương tự trên **node06** (07/08) và tìm ra `/var/lib/containerd`=63G là thủ phạm, nên rất có thể node07 cũng cùng nguyên nhân, nhưng **chưa đo lại trên chính node07** để xác nhận:
 ```
 du -sh /var/* 2>/dev/null | sort -h | tail -10
 ```
-- [ ] Xem containerd đang giữ image gì:
+- [ ] Xem containerd đang giữ image gì trên **node07** (đã làm trên node06/node08 07/08, chưa làm trên node07):
 ```
 crictl images
 ```
@@ -707,7 +719,7 @@ crictl images
 kubectl -n ragflow exec ragflow-mysql-0 -- df -h /var/lib/mysql
 ```
 - [ ] Kiểm tra xem có backup MySQL không
-- [ ] Xác minh namespace `ragflow-custom` còn dùng không (bộ PV `pv-ragflow-custom-*` đang chiếm đĩa)
+- [x] ~~Xác minh namespace `ragflow-custom` còn dùng không~~ → ✅ Xác nhận là môi trường test cũ, không còn dùng — đã `helm uninstall` (07/08). PV/PVC vẫn còn (giữ theo resource-policy), **chưa xoá hẳn**, xem `PLAN-mysql-migrate-node06.md` Bước 0.5 mục "còn treo"
 
 ### Ngắn hạn (cần 1 lần restart pod, ~2 phút)
 

@@ -127,15 +127,27 @@ namespace test đã sạch hoàn toàn nên không còn rủi ro tranh chấp re
 - `/var/lib/kubelet` = 21G trên node06 — chưa điều tra, không phải rác rõ ràng như containerd
   nên chưa động vào
 
-### Bước 1 — Đánh composite index (làm trước, độc lập với việc chuyển node)
+### Bước 1 — Đánh composite index (✅ ĐÃ LÀM 07/08/2026)
+
 ```sql
 CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DESC);
+-- Query OK, 0 rows affected (8.77 sec)
 ```
-- Không downtime (`ALGORITHM=INPLACE`), làm trước để tách rủi ro — nếu có vấn đề gì thì biết
-  ngay là do index hay do migrate node, không lẫn lộn
-- Xác minh bằng `EXPLAIN` lại query cũ (kỳ vọng đổi key + giảm rows, theo TRACKING Issue 1)
-- Đánh giá thêm `duplicate_name(kb_id, name)` (Issue 1b) — cần `EXPLAIN` trước khi quyết có tạo
-  thêm index hay không, chưa chắc chắn 100% như Issue 1
+
+**Kết quả:**
+- Không downtime, chỉ mất 8.77s
+- Đo thời gian thực tế query gây chậm: **0.02s** (từ baseline 11.1s — giảm ~500 lần)
+- Xác minh bằng `FORCE INDEX (idx_document_kb_create)`: `Extra` sạch hoàn toàn, không còn
+  `Using temporary; Using filesort`
+- ⚠️ Nợ nhỏ ghi nhận: optimizer mặc định (không FORCE INDEX) vẫn tự chọn `document_kb_id` thay
+  vì index mới dù đã `ANALYZE TABLE` — không sửa code (ngoài phạm vi, đã hỏi ý kiến và chốt giữ
+  nguyên vì đã đủ nhanh). Theo dõi dài hạn nếu KB tiếp tục phình to. Chi tiết: TRACKING Issue 1.
+- Đánh giá `duplicate_name(kb_id, name)` (Issue 1b): đã `EXPLAIN` trực tiếp, **kết quả bác bỏ**
+  nghi ngờ ban đầu — index đơn cột `document_name` (cardinality 347,033, gần unique) đã đủ nhanh
+  (`rows: 1`, không filesort). Không cần tạo thêm index. Chi tiết: TRACKING Issue 1b.
+
+**Việc phát sinh, đã làm trước Bước 1** — xem Bước 0.5 bên dưới (dọn `ragflow-custom` + chốt
+node06 qua so sánh disk với node08, phát sinh từ câu hỏi thực tế lúc thực thi Bước 0).
 
 ### Bước 2 — Chuẩn bị hạ tầng trên node06 (chưa động vào pod đang chạy)
 1. Gắn label mới lên node06: `ragflow-mysql-target=true`
