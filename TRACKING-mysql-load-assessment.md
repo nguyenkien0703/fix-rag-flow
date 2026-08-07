@@ -2,8 +2,9 @@
 
 **Phiên:** 05/08/2026 (chẩn đoán ban đầu) + 06-07/08/2026 (bổ sung: node06/08, đối tác báo chậm, đánh giá hướng xử lý)
 **Đối tượng:** pod `ragflow-mysql-0`, namespace `ragflow`, node `vrp-kubeengine07`
-**Trạng thái phiên:** 🔶 ĐANG DỞ — đã hoàn tất chẩn đoán + đánh giá hướng xử lý, **chưa thực thi bất kỳ thay đổi nào**. Đã chốt hướng ngắn hạn (index + move node06), đang chờ lên plan chi tiết migrate.
+**Trạng thái phiên:** 🔶 ĐANG DỞ — đã hoàn tất chẩn đoán + đánh giá hướng xử lý + lên plan migrate chi tiết, **chưa thực thi bất kỳ thay đổi nào**.
 **Lệnh tham khảo (kèm giải nghĩa cờ):** `commands/mysql-load-assessment.md`
+**Plan thực thi ngắn hạn (đã duyệt, chưa chạy):** `PLAN-mysql-migrate-node06.md`
 
 ---
 
@@ -598,7 +599,7 @@ Bối cảnh: sếp hỏi có thể tận dụng node06/node08 đang rảnh đ�
 | C | Tách MySQL ra server riêng hoàn toàn | ✅ Khả thi, là việc dài hạn | Xử lý gốc: hiện MySQL đang dùng chung `/dev/vda1` với MinIO/Redis/containerd (Issue 3) |
 | D | Dùng node06/08 làm MySQL read replica | ❌ **KHÔNG khả thi ngắn hạn** | 2 rào cản cứng: (1) `mysql.yaml` dòng 31 `replicas: 1` **hardcode**, không đọc từ values — chart không hỗ trợ multi-replica; (2) dòng 82 `args: --disable-log-bin` **hardcode** — binlog là điều kiện bắt buộc để replication chạy, đang bị tắt cứng. Ngoài ra RagFlow dùng Peewee ORM với 1 connection string duy nhất (`service_conf.yaml`), chưa có cơ chế route read/write — phải sửa cả code ứng dụng. Đây là dự án riêng, không làm trong đợt này. |
 
-**Đã chốt — Ngắn hạn (đang lên plan chi tiết ở mục 10):**
+**Đã chốt — Ngắn hạn (plan chi tiết đã duyệt: `PLAN-mysql-migrate-node06.md`):**
 1. Đánh composite index `idx_document_kb_create` (Issue 1) — và đánh giá thêm cho `duplicate_name` (Issue 1b)
 2. Chuyển MySQL từ node07 sang node06, **giữ nguyên MinIO/Redis ở node07** để giảm tải node07 mà không dồn hết sang node06
 
@@ -612,7 +613,7 @@ Bối cảnh: sếp hỏi có thể tận dụng node06/node08 đang rảnh đ�
 > "nếu làm dc cách 1 thì anh nghĩ là nhàn" — ưu tiên cách 1 (copy hostPath data + mount lại PV mới) nếu khả thi, vì đỡ việc hơn cách 2 (mysqldump/restore).
 > "tránh sai sót về user/pass, các constrain,..." — lưu ý rủi ro cụ thể cần kiểm tra kỹ khi migrate.
 
-→ Plan chi tiết (mục 10, đang soạn) sẽ ưu tiên đánh giá **Cách 1 (copy hostPath + mount lại PV)** trước, chỉ rơi về Cách 2 (dump/restore) nếu Cách 1 vướng do khác node (thao tác `cp` qua node có thể cần thêm bước, ví dụ `rsync` qua SSH hoặc tạm qua một volume trung chuyển).
+→ Plan chi tiết đã soạn và duyệt tại `PLAN-mysql-migrate-node06.md`, ưu tiên **Cách 1 (copy hostPath + mount lại PV qua rsync)**, giữ Cách 2 (dump/restore) làm fallback bằng văn bản nếu Cách 1 vướng lỗi giữa chừng.
 
 ---
 
