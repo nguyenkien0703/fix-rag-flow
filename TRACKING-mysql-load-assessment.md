@@ -1,8 +1,8 @@
 # TRACKING — Đánh giá tải MySQL của RagFlow
 
-**Phiên:** 05/08/2026
+**Phiên:** 05/08/2026 (chẩn đoán ban đầu) + 06-07/08/2026 (bổ sung: node06/08, đối tác báo chậm, đánh giá hướng xử lý)
 **Đối tượng:** pod `ragflow-mysql-0`, namespace `ragflow`, node `vrp-kubeengine07`
-**Trạng thái phiên:** 🔶 ĐANG DỞ — đã hoàn tất chẩn đoán, **chưa thực thi bất kỳ thay đổi nào**
+**Trạng thái phiên:** 🔶 ĐANG DỞ — đã hoàn tất chẩn đoán + đánh giá hướng xử lý, **chưa thực thi bất kỳ thay đổi nào**. Đã chốt hướng ngắn hạn (index + move node06), đang chờ lên plan chi tiết migrate.
 **Lệnh tham khảo (kèm giải nghĩa cờ):** `commands/mysql-load-assessment.md`
 
 ---
@@ -31,13 +31,21 @@ Kiểm tra tải của pod MySQL phục vụ RagFlow, xác định xem MySQL có
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
 | 1 | Query list document 11.1s, quét 953,020 dòng cho `LIMIT 50` | 🔴 Cao | 🔶 OPEN | Tạo composite index `(kb_id, create_time DESC)` |
+| 1b | `duplicate_name(kb_id, name)` trong flow upload cũng thiếu composite index (cùng lớp vấn đề với #1) | 🔴 Cao | 🔶 OPEN — mới phát hiện 07/08 | Đánh giá tạo composite index `(kb_id, name)` |
 | 2 | `innodb_buffer_pool_size`=128MB / working set 1.85GB → 6,200 lần đọc đĩa/giây | 🔴 Cao | 🔶 OPEN | Tăng lên 3G, cần restart pod |
 | 3 | PV `hostPath` khai báo 5Gi nhưng thực tế ghi vào `/dev/vda1` 99G đã dùng 74%, chung với MinIO/Redis/containerd | 🔴 Cao | 🔶 OPEN | Dọn image + PV rác; dài hạn tách đĩa riêng |
 | 4 | Pod MySQL `resources: {}` → QoS BestEffort | 🟡 TB | 🔶 OPEN | Đặt requests/limits |
+| 4b | 18 pod bị **Evicted** trên node07 (tuổi 25h/33h) — hệ quả trực tiếp của Issue 4 đang **thực sự xảy ra**, không còn là rủi ro lý thuyết | 🔴 Cao | 🔶 OPEN — mới phát hiện 06/08 | Cùng lượt xử lý Issue 4 (đặt resources); dọn pod Evicted rác |
 | 5 | `slow_query_log` OFF + `long_query_time`=10s → mù quan sát | 🟡 TB | ⚠️ WORKAROUND | Đã bật bằng `SET GLOBAL` (mất khi restart) → cần đưa vào ConfigMap |
 | 6 | Chưa có metrics-server → `kubectl top` không dùng được | 🟡 TB | 🔶 OPEN | Cài metrics-server |
 
-**Kết luận chung:** tải thực tế **không lớn** (~93 QPS, 184/1000 connection). Nút thắt đến từ việc **toàn bộ tham số MySQL để nguyên mặc định của chart demo**, chưa tune cho dữ liệu thật 239k document.
+**Kết luận chung (phiên 05/08):** tải thực tế **không lớn** (~93 QPS, 184/1000 connection). Nút thắt đến từ việc **toàn bộ tham số MySQL để nguyên mặc định của chart demo**, chưa tune cho dữ liệu thật 239k document.
+
+**Cập nhật 06-07/08 (đối tác báo chậm 55s/vb khi upload document):**
+- node06, node08 xác nhận **gần như rảnh** (CPU 2-3% và 0.4%, load avg ~1 và ~0.2) — loại trừ khả năng cả cụm quá tải, khoanh đúng vào node07/MySQL
+- node07 tại thời điểm đo: CPU 80% user, `mysqld` chiếm 666.7% (~6.7/8 core), load avg 19.52 trên node 8 core — **CPU-bound, không phải I/O-bound** (`wa`=0.0%, xem điều chỉnh Issue 2 bên dưới)
+- Bước "Upload document" (25s trong 55s/vb đối tác báo) khớp với kiến trúc code: mỗi upload có **≥4 round-trip MySQL tuần tự + 3 round-trip MinIO tuần tự + 1 tác vụ CPU** (thumbnail), không cái nào chạy song song → một bước chậm (query thiếu index) kéo dài cả chuỗi (xem Issue 1b)
+- Đã đánh giá feasibility 4 hướng xử lý (xem mục 9) — **chốt ngắn hạn: đánh index + chuyển MySQL sang node06**, KHÔNG dùng read replica (bị chặn cứng bởi chart, xem mục 9)
 
 ---
 
@@ -490,6 +498,121 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 
 1. Cài metrics-server (lưu ý môi trường air-gapped: cần copy image trước).
 2. Dài hạn: thêm mysqld_exporter + dashboard Grafana để theo dõi buffer pool hit ratio, slow query rate, connection.
+
+---
+
+### 🔴 Issue 1b — `duplicate_name(kb_id, name)` thiếu composite index (cùng lớp với Issue 1) — 🔶 OPEN
+
+**Triệu chứng**
+
+Đối tác tích hợp báo tốc độ upload document trung bình 55s/vb, breakdown:
+
+| Bước | Thời gian |
+|---|---|
+| Check tồn tại | 6s |
+| Gọi LLM tóm tắt | 10s |
+| Upload document | **25s** |
+| Update metadata | 8s |
+| Parse chunk | 6s |
+| **Tổng** | **55s/vb** |
+
+**Root cause (suy luận từ code, chưa `EXPLAIN` trực tiếp trên query này)**
+
+Từ phân tích flow upload (`file_service.py:514-604`), mỗi file đi qua tuần tự:
+
+1. `get_root_folder` / `init_knowledgebase_docs` / `get_kb_folder` — mỗi cái 1 SELECT trên bảng `file`
+2. `duplicate_name(DocumentService.query, name=..., kb_id=...)` — query `document` theo `(kb_id, name)` — **cùng lớp vấn đề với Issue 1**: có index đơn `kb_id`, không có composite `(kb_id, name)`
+3. `STORAGE_IMPL.obj_exist(...)` — 1 HEAD request MinIO
+4. `STORAGE_IMPL.put(...)` — PUT file gốc lên MinIO
+5. `thumbnail_img(...)` — CPU-bound, nặng với PDF
+6. `STORAGE_IMPL.put(...)` lần 2 — PUT thumbnail
+7. `DocumentService.insert(doc)` — INSERT MySQL
+
+→ ≥4 round-trip MySQL + 3 round-trip MinIO + 1 tác vụ CPU, **không cái nào song song trong 1 request**. Ở tốc độ nhiều doc/phút với nhiều pod cùng đập vào 1 MySQL/MinIO, độ trễ cộng dồn dễ lên hàng chục giây — khớp với 25s bước Upload mà đối tác báo.
+
+**Đã thử / cân nhắc**
+
+| Phương án | Kết quả |
+|---|---|
+| Đối chiếu breakdown 55s/vb với CPU node07 80% tại cùng thời điểm | ✅ Khớp — nút thắt không phải mạng/MinIO mà là MySQL trên node07 |
+| `EXPLAIN` trực tiếp câu `duplicate_name` | ❓ **Chưa làm** — mới suy luận từ code + cùng pattern với Issue 1, chưa đo thực tế |
+
+**Hướng xử lý tiếp**
+
+1. ❓ Cần `EXPLAIN` câu `duplicate_name(kb_id, name)` để xác nhận (giống cách đã làm với Issue 1) trước khi khẳng định chắc.
+2. Nếu xác nhận đúng, tạo thêm composite index — làm **chung một lượt** với `idx_document_kb_create` (Issue 1) để đỡ tác động nhiều lần lên bảng `document`.
+
+---
+
+### 🟡 Issue 4b — 18 pod Evicted trên node07 (hệ quả thực tế của Issue 4) — 🔶 OPEN
+
+**Triệu chứng**
+
+`kubectl get pods -n ragflow` cho thấy 18 pod ở trạng thái **Evicted** (tuổi 25h và 33h), 2 pod `ContainerStatusUnknown`, 1 `Init:ImagePullBackOff`. `ragflow-minio-0`, `ragflow-mysql-0`, `ragflow-redis-0` vẫn `Running`.
+
+**Root cause**
+
+Chính là Issue 4 (`resources: {}` → QoS BestEffort) nhưng **đã xảy ra thật**, không còn là rủi ro lý thuyết — khi node07 gặp áp lực tài nguyên (khớp với giai đoạn CPU 80%/load 19.5), kubelet evict các pod BestEffort trước.
+
+**Bằng chứng**
+
+Lệnh tra `.status.message`/`.status.reason` của 1 pod tuổi 33h — xem `commands/mysql-load-assessment.md` mục 3.
+
+**Còn tồn đọng**
+
+18 pod Evicted vẫn tồn tại trong `kubectl get pods` cho tới khi bị xoá thủ công (Kubernetes không tự dọn) — gây nhiễu khi đọc trạng thái cluster, và là bằng chứng cho thấy node07 đã thực sự chạm ngưỡng resource pressure ít nhất 1 lần trong 25-33h qua.
+
+**Hướng xử lý tiếp**
+
+1. Dọn 18 pod Evicted rác (không ảnh hưởng dữ liệu, chỉ là pod object cũ):
+```
+kubectl get pods -n ragflow --field-selector=status.phase=Failed -o name | xargs kubectl delete -n ragflow
+```
+2. Xử lý gốc: đặt `resources` cho **toàn bộ** pod RagFlow đang BestEffort, không chỉ MySQL — cần rà lại `values.yaml` xem còn service nào bỏ trống `resources`.
+3. Việc chuyển MySQL sang node06 (mục 9) sẽ giảm áp lực trực tiếp lên node07, gián tiếp giảm khả năng evict tái diễn — nhưng không thay thế được việc đặt resources.
+
+---
+
+### 🔵 Điều chỉnh Issue 2 — cơ chế là CPU-bound, không phải I/O-bound (kết luận không đổi)
+
+**Bằng chứng mới (06/08)**
+
+`top -bn1 -o %CPU` trên node07 lúc `mysqld` chiếm 666.7% CPU: `%Cpu(s): 80.0 us, 4.0 sy, 16.0 id, 0.0 wa` — iowait = 0%, và `buff/cache` ~8.6GB dù `innodb_buffer_pool_size` chỉ 128MB.
+
+**Diễn giải**
+
+Phần lớn trong 2.6 tỷ lần "đọc đĩa" của InnoDB (Issue 2) thực chất được **OS page cache hấp thụ** — không phải chờ đĩa vật lý thật. Chi phí thật nằm ở **CPU overhead**: syscall, copy trang nhớ từ page cache vào buffer pool, decode InnoDB — không phải iowait.
+
+**Kết luận**: hướng xử lý **không đổi** (vẫn phải tăng `innodb_buffer_pool_size` lên 3G) — nhưng cơ chế lợi ích thì khác: tăng buffer pool sẽ **giảm CPU** (bớt việc copy/decode lặp lại), không phải giảm chờ I/O như suy đoán ban đầu.
+
+---
+
+## 9. Đánh giá feasibility các hướng xử lý (06-07/08/2026)
+
+Bối cảnh: sếp hỏi có thể tận dụng node06/node08 đang rảnh để tăng tốc RagFlow/MySQL không. Đã đọc trực tiếp `helm_ragflow_v0.26.4/templates/mysql.yaml` và `mysql-config.yaml` trước khi kết luận (không suy đoán).
+
+| # | Hướng | Feasibility | Bằng chứng |
+|---|---|---|---|
+| A | Đánh composite index (Issue 1, 1b) | ✅ Khả thi cao, không downtime | `ALGORITHM=INPLACE` MySQL 8.0 |
+| B | Chuyển MySQL sang node06 (đổi node chạy, giữ MinIO/Redis ở node07) | ✅ Khả thi, cần downtime ngắn để migrate data | `nodeSelector` (dòng 49-52 `mysql.yaml`) **đã templated** từ `.Values.mysql.deployment.nodeSelector` — đúng cơ chế deploy-qua-values.yaml hiện tại. **Nhưng** PV là `hostPath` + `nodeAffinity` gắn cứng vào node07 (`ragflow-target=true`, xem `local-pv.yaml` Issue 3) → đổi `nodeSelector` của pod **không tự di chuyển dữ liệu** — bắt buộc phải tạo PV mới trên node06 + copy/migrate data thủ công |
+| C | Tách MySQL ra server riêng hoàn toàn | ✅ Khả thi, là việc dài hạn | Xử lý gốc: hiện MySQL đang dùng chung `/dev/vda1` với MinIO/Redis/containerd (Issue 3) |
+| D | Dùng node06/08 làm MySQL read replica | ❌ **KHÔNG khả thi ngắn hạn** | 2 rào cản cứng: (1) `mysql.yaml` dòng 31 `replicas: 1` **hardcode**, không đọc từ values — chart không hỗ trợ multi-replica; (2) dòng 82 `args: --disable-log-bin` **hardcode** — binlog là điều kiện bắt buộc để replication chạy, đang bị tắt cứng. Ngoài ra RagFlow dùng Peewee ORM với 1 connection string duy nhất (`service_conf.yaml`), chưa có cơ chế route read/write — phải sửa cả code ứng dụng. Đây là dự án riêng, không làm trong đợt này. |
+
+**Đã chốt — Ngắn hạn (đang lên plan chi tiết ở mục 10):**
+1. Đánh composite index `idx_document_kb_create` (Issue 1) — và đánh giá thêm cho `duplicate_name` (Issue 1b)
+2. Chuyển MySQL từ node07 sang node06, **giữ nguyên MinIO/Redis ở node07** để giảm tải node07 mà không dồn hết sang node06
+
+**Dài hạn (chưa lên plan):**
+- Tách MySQL ra server/đĩa riêng hoàn toàn (Issue 3, hướng C)
+- Đánh giá MySQL HA (cần sửa chart bỏ `--disable-log-bin` + `replicas`, và sửa code app để route read/write — không làm trong đợt ngắn hạn)
+
+**Ý kiến sếp (Nguyễn Chí Đông, 07/08 08:34, qua chat) — ràng buộc bắt buộc cho plan migrate node06:**
+> "Ủa, tác động thì báo thôi" — chỉ cần báo trước khi tác động, không cần xin duyệt từng bước.
+> "thế phải lên plan chi tiết từ sáng, chuyển mysql liên quan đến migrate dữ liệu, mà migrate thì có 2 kiểu, 1 là copy data rồi mount lại, 2 là dump DB rồi restore. Tạm thế"
+> "nếu làm dc cách 1 thì anh nghĩ là nhàn" — ưu tiên cách 1 (copy hostPath data + mount lại PV mới) nếu khả thi, vì đỡ việc hơn cách 2 (mysqldump/restore).
+> "tránh sai sót về user/pass, các constrain,..." — lưu ý rủi ro cụ thể cần kiểm tra kỹ khi migrate.
+
+→ Plan chi tiết (mục 10, đang soạn) sẽ ưu tiên đánh giá **Cách 1 (copy hostPath + mount lại PV)** trước, chỉ rơi về Cách 2 (dump/restore) nếu Cách 1 vướng do khác node (thao tác `cp` qua node có thể cần thêm bước, ví dụ `rsync` qua SSH hoặc tạm qua một volume trung chuyển).
 
 ---
 
