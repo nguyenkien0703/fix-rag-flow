@@ -127,6 +127,20 @@ namespace test đã sạch hoàn toàn nên không còn rủi ro tranh chấp re
 - `/var/lib/kubelet` = 21G trên node06 — chưa điều tra, không phải rác rõ ràng như containerd
   nên chưa động vào
 
+⚠️ **Hệ quả không lường trước, lộ ra ở Bước 3.7-3.8**: `crictl rmi --prune` ở bước này đã gỡ
+luôn `docker.io/library/mysql:8.0.39` khỏi node06 (tưởng là "image rác" vì không có container
+tham chiếu tại thời điểm đó, nhưng thực ra là image **cần dùng** cho lần migrate MySQL sang
+chính node06 sau này). Hậu quả: sau `helm upgrade` (Bước 3.7), pod mới trên node06 bị
+`ImagePullBackOff` — cluster air-gapped, không tự pull được từ `registry-1.docker.io` (lỗi
+`i/o timeout`). Đã xử lý bằng cách **import image `mysql:8.0.39` từ file tar** sẵn có vào node06
+(`ctr image import`/`crictl` tương đương), sau đó `helm upgrade` lại lần 2 thì pod chạy được
+(`Running`).
+
+**Bài học cho lần dọn rác container sau này**: `crictl rmi --prune` chỉ an toàn cho image chắc
+chắn không còn cần trong **tương lai gần**, không chỉ "hiện tại không container nào dùng" — với
+môi trường air-gapped (không tự pull lại được), cần cân nhắc kỹ trước khi prune image runtime
+quan trọng (mysql, redis, minio...) trên node sắp trở thành đích migrate.
+
 ### Bước 1 — Đánh composite index (✅ ĐÃ LÀM 07/08/2026)
 
 ```sql
@@ -149,31 +163,69 @@ CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DES
 **Việc phát sinh, đã làm trước Bước 1** — xem Bước 0.5 bên dưới (dọn `ragflow-custom` + chốt
 node06 qua so sánh disk với node08, phát sinh từ câu hỏi thực tế lúc thực thi Bước 0).
 
-### Bước 2 — Chuẩn bị hạ tầng trên node06 (chưa động vào pod đang chạy)
-1. Gắn label mới lên node06: `ragflow-mysql-target=true`
-2. Tạo sẵn thư mục đích trên node06 (`/data/ragflow/mysql`, cùng path để giảm khác biệt)
-3. Soạn sẵn manifest PV mới (`pv-ragflow-mysql-node06` hoặc tên rõ ràng khác), cùng
-   `storageClassName: local-mysql`, `hostPath` trỏ thư mục trên, `nodeAffinity: ragflow-mysql-target=true`
-   — **chưa apply**, chỉ chuẩn bị
+### Bước 2 — Chuẩn bị hạ tầng trên node06 (✅ ĐÃ LÀM 07/08/2026)
+1. ✅ Gắn label `ragflow-mysql-target=true` lên node06 — xác nhận qua `--show-labels`, không đè
+   mất label cũ `ragflow-custom-target=true`
+2. ✅ Tạo thư mục `/data/ragflow/mysql` trên node06 — ban đầu tạo với owner `root:root 700`,
+   phải sửa lại `chown 999:0` + `chmod 755` để khớp đúng owner thật của datadir trên node07
+   (đã đo bằng `stat -c '%u:%g %a %n'`, không suy đoán tên user vì UID trên 2 node có thể ánh xạ
+   tên khác nhau trong `/etc/passwd`)
+3. ✅ Soạn manifest PV mới `pv-ragflow-mysql-node06.yaml` (lưu trong repo, cùng thư mục
+   `PLAN-mysql-migrate-node06.md`) — dựa trên `kubectl get pv pv-ragflow-mysql -o yaml` làm khuôn
+   mẫu, giữ nguyên `storageClassName: local-mysql`, `persistentVolumeReclaimPolicy: Retain`, chỉ
+   đổi `hostPath` sang node06 (cùng path) và `nodeAffinity` sang `ragflow-mysql-target=true`.
+   **Bỏ `claimRef`** so với PV gốc — PV gốc có `claimRef` trỏ cứng vào PVC production hiện tại,
+   không tái sử dụng được cho PV mới; để trống cho PVC mới tự bind qua `WaitForFirstConsumer`.
 
-### Bước 3 — Cửa sổ bảo trì (có downtime, cần báo trước theo yêu cầu sếp)
-1. Báo đối tác/team liên quan tạm dừng ghi dữ liệu (giống cách đã làm 31/07: "báo bên họ ngừng
-   đẩy dữ liệu")
-2. Scale MySQL StatefulSet về 0 (đảm bảo clean shutdown, không copy file đang mở/dở dang)
-3. Copy dữ liệu từ node07 sang node06:
-   - Ưu tiên `rsync` qua SSH giữa 2 node (giữ nguyên permission/ownership) thay vì `cp` thô, vì
-     MySQL rất nhạy với UID/GID của thư mục datadir — sai owner là nguyên nhân phổ biến khiến
-     mysqld không start lại được
-   - Đối chiếu dung lượng nguồn/đích bằng `du -sh` trước và sau copy — khớp mới tiếp tục
-4. Xoá PVC cũ (giữ nguyên PV cũ ở trạng thái `Retain`, **không xoá PV cũ và không xoá thư mục
-   gốc trên node07** cho tới khi xác nhận node06 chạy ổn — đây là lưới an toàn thứ hai)
-5. Apply PV mới (đã soạn ở Bước 2)
-6. Sửa `values.yaml`: chỉ đổi `mysql.deployment.nodeSelector` thành
-   `ragflow-mysql-target: "true"` — **không đụng** `minio.deployment.nodeSelector` /
-   `redis.deployment.nodeSelector`
-7. `helm upgrade` — PVC mới (cùng tên, cùng StorageClass `local-mysql`) sẽ bind vào PV mới nhờ
-   `WaitForFirstConsumer` khi pod schedule lên node06
-8. Xác nhận pod `ragflow-mysql-0` chạy trên node06: `kubectl get pod -o wide`
+### Bước 3 — Cửa sổ bảo trì (✅ ĐÃ LÀM 07/08/2026, có downtime thật)
+
+1. ✅ Đã báo trước (theo đúng "tác động thì báo thôi" của sếp)
+2. ✅ Backup an toàn trước khi động vào production:
+   `mysqldump -uroot -p rag_flow > rag_flow_backup_20260807.sql` → file **1.2G** (nhỏ hơn nhiều
+   so với datadir 5.1G vì dump là SQL text thuần, không có overhead B-tree/page của InnoDB —
+   không phải dấu hiệu thiếu dữ liệu). Xác minh hợp lệ bằng dòng cuối
+   `-- Dump completed on 2026-08-07 11:35:34`.
+   ⚠️ **Sự cố nhỏ khi backup**: `mysqldump -uroot -p` lần đầu lỗi `Access denied` vì `kubectl exec`
+   không có đủ TTY để `-p` hỏi password tương tác — phải gõ password thẳng trên dòng lệnh
+   (`-pPASSWORD`) để qua được. **Rủi ro bảo mật đã xảy ra**: password bị lộ vào shell history
+   của node04. Đã hỏi ý kiến, người phụ trách chấp nhận rủi ro này, không đổi password ngay.
+   Khuyến nghị dọn `history -d` dòng đó và cân nhắc đổi password vào đợt bảo trì kế tiếp.
+3. ✅ Scale MySQL về 0: `kubectl -n ragflow scale statefulset ragflow-mysql --replicas=0`, xác
+   nhận dừng sạch bằng `kubectl get pods -l app.kubernetes.io/component=mysql` → trống hoàn toàn
+4. ✅ Copy dữ liệu node07 → node06 bằng `rsync -avzP`:
+   - **Xác nhận trước**: SSH giữa 2 node chỉ đi qua `vt_admin` (không SSH thẳng bằng `root` —
+     `PermitRootLogin` bị chặn, xác nhận bằng thử `ssh root@vrp-kubeengine06` → `Permission denied`)
+   - **Vướng mắc**: dùng `--rsync-path="sudo rsync"` để có quyền ghi ở đích thất bại vì
+     `sudo: no tty present and no askpass program specified` — `vt_admin` cần password khi
+     `sudo` qua non-interactive SSH thì không có TTY để nhập.
+   - **Cách xử lý cuối cùng**: tạm `chown vt_admin:vt_admin` thư mục đích trên node06 để rsync
+     ghi được không cần sudo — nhưng vẫn bị `Permission denied` lần nữa vì **thư mục cha**
+     `/data` và `/data/ragflow` là `root:root 700`, chặn cả quyền "đi qua" (`x`) của `vt_admin`
+     dù thư mục con đã đúng owner. Sửa bằng `chmod o+x /data /data/ragflow` (chỉ thêm execute,
+     không thêm read, giữ tối thiểu quyền cần thiết) — rsync chạy thành công sau đó.
+   - Copy xong: `sent 713,502,689 bytes`, `total size is 4,765,593,360`, không lỗi giữa chừng.
+   - Đối chiếu dung lượng: `du -sh` cả 2 bên đều ra **4.5G** — khớp, không thiếu dữ liệu.
+   - **Chown lại đúng owner gốc**: `chown -R 999:0 /data/ragflow/mysql` trên node06 (đệ quy,
+     khác Bước 2 vì giờ có hàng trăm file `.ibd` bên trong, không chỉ thư mục rỗng) — verify bằng
+     `stat` trên 1 file cụ thể (`document.ibd`) để chắc `-R` áp dụng đúng xuống tận file con.
+5. ✅ Xoá PVC cũ: `kubectl -n ragflow delete pvc ragflow-mysql` → PV cũ chuyển `Released` (không
+   bị xoá, đúng theo `Retain`), dữ liệu vật lý trên node07 còn nguyên — lưới an toàn thứ hai vẫn
+   giữ đúng thiết kế.
+6. ✅ Apply PV mới: `kubectl apply -f pv-ragflow-mysql-node06.yaml` → `STATUS: Available`
+7. ✅ Sửa `helm_ragflow_v0.26.4/values.yaml`: chỉ đổi `mysql.deployment.nodeSelector` từ
+   `ragflow-target: "true"` sang `ragflow-mysql-target: "true"` — xác nhận diff chỉ đúng 1 chỗ
+   thay đổi (`git diff`), `minio`/`redis` giữ nguyên `ragflow-target` như cũ.
+   Trước khi `helm upgrade`, đối chiếu `helm get values ragflow -n ragflow -o yaml` (giá trị
+   đang chạy thật trên cluster) với `values.yaml` local — khớp hoàn toàn, xác nhận không có
+   drift/override nào khác ngoài file đang sửa, an toàn để upgrade bằng đúng `-f values.yaml`.
+8. ✅ `helm upgrade ragflow . -n ragflow -f values.yaml` (revision 60→61) — **lần đầu pod bị
+   `ImagePullBackOff`** vì thiếu image `mysql:8.0.39` trên node06 (đã lỡ bị `crictl rmi --prune`
+   ở Bước 0.5 gỡ mất, xem cảnh báo cuối phần Bước 0.5 phía trên). Xử lý bằng import image từ
+   file tar vào node06, sau đó `helm upgrade` lại lần 2 (revision 61→62) → pod `Running`.
+9. ✅ Xác nhận: `kubectl -n ragflow get pod ragflow-mysql-0 -o wide` → `NODE: vrp-kubeengine06`,
+   `1/1 Running`. `describe pod` xác nhận `Node-Selectors: ragflow-mysql-target=true`,
+   `ClaimName: ragflow-mysql` (PVC mới bind đúng PV mới), Events log sạch (`Pulled`, `Created`,
+   `Started`), không còn lỗi lặp lại.
 
 ### Bước 4 — Xác minh sau migrate (trước khi cho ghi dữ liệu trở lại)
 1. `SHOW GRANTS` cho user — đối chiếu với bản ghi ở Bước 0, đảm bảo không mất quyền

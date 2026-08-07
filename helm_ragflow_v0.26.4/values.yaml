@@ -328,9 +328,10 @@ mysql:
   deployment:
     strategy:
     resources:
-    # Chay tren node co label ragflow-target=true
+    # Da migrate sang node06 (07/08/2026) - xem PLAN-mysql-migrate-node06.md
+    # Chay tren node co label ragflow-mysql-target=true (rieng cho mysql, khac ragflow-target dung chung voi minio/redis)
     nodeSelector:
-      ragflow-target: "true"
+      ragflow-mysql-target: "true"
     affinity: {}
   service:
     type: ClusterIP
