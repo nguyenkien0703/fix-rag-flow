@@ -39,6 +39,7 @@ Kiểm tra tải của pod MySQL phục vụ RagFlow, xác định xem MySQL có
 | 4b | 18 pod bị **Evicted** trên node07 (tuổi 25h/33h) — hệ quả trực tiếp của Issue 4 đang **thực sự xảy ra**, không còn là rủi ro lý thuyết | 🔴 Cao | 🔶 OPEN — mới phát hiện 06/08 | Cùng lượt xử lý Issue 4 (đặt resources); dọn pod Evicted rác |
 | 5 | `slow_query_log` OFF + `long_query_time`=10s → mù quan sát | 🟡 TB | ⚠️ WORKAROUND | Đã bật bằng `SET GLOBAL` (mất khi restart) → cần đưa vào ConfigMap |
 | 6 | Chưa có metrics-server → `kubectl top` không dùng được | 🟡 TB | 🔶 OPEN | Cài metrics-server |
+| 7 | `get_filter_by_kb_id()` (API filter panel) kéo TOÀN BỘ document của KB về Python để đếm tay thay vì `GROUP BY` SQL — 39s với KB 394k doc | 🔴 Cao | 🔶 OPEN — phát hiện 07/08, root cause **là code RagFlow**, không phải DB | Ngoài phạm vi dự án (chỉ sửa qua values.yaml/helm) — cần báo đội phát triển app/team quản lý source RagFlow |
 
 **Kết luận chung (phiên 05/08):** tải thực tế **không lớn** (~93 QPS, 184/1000 connection). Nút thắt đến từ việc **toàn bộ tham số MySQL để nguyên mặc định của chart demo**, chưa tune cho dữ liệu thật 239k document.
 
@@ -514,6 +515,72 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 
 1. Cài metrics-server (lưu ý môi trường air-gapped: cần copy image trước).
 2. Dài hạn: thêm mysqld_exporter + dashboard Grafana để theo dõi buffer pool hit ratio, slow query rate, connection.
+
+---
+
+### 🔴 Issue 7 — API filter panel kéo toàn bộ document của KB về Python để đếm tay — 🔶 OPEN (root cause ở code app, không phải DB)
+
+**Triệu chứng**
+
+Phát hiện trong lúc Bước 4 (xác minh sau migrate) của `PLAN-mysql-migrate-node06.md`: test upload 1 document qua UI xong, quan sát tab Network thấy request `documents?type=filter` và `documents?page=1&page_size=...` mất **39.14s** và **39.11s** — chậm hơn nhiều so với ngưỡng chấp nhận được, dù MySQL vừa migrate xong và Issue 1 (composite index) đã fix.
+
+**Điều tra**
+
+Bật lại `slow_query_log` (giống cách đã làm ở Issue 5), trigger lại request, soi `mysql.slow_log`:
+
+```sql
+SELECT start_time, query_time, rows_examined, rows_sent, CONVERT(sql_text USING utf8) AS query
+FROM mysql.slow_log ORDER BY start_time DESC LIMIT 5;
+```
+
+Bắt được 2 dạng câu chậm, cùng KB (`kb_id='73932b965e5e11f192725fd51894c519'`, KB lớn nhất, giờ có ~153,268-394,310 document — đã tăng nhiều so với ~141k lúc chẩn đoán 05/08):
+
+| query_time | rows_examined | Query |
+|---|---|---|
+| 19.86s | 1,182,930 | `SELECT COUNT(1) FROM (SELECT 1 FROM document t1 JOIN file2document t2 ... JOIN file t3 ... WHERE t1.kb_id = ?) AS _wrapped` |
+| 9.40s | 1,182,930 | `SELECT t1.run, t1.suffix, t1.id FROM document t1 JOIN file2document t2 ... JOIN file t3 ... WHERE t1.kb_id = ?` (không LIMIT) |
+
+`EXPLAIN` câu thứ 2 cho thấy **mỗi bảng đều dùng đúng index** (`document_kb_id`, `file2document_document_id`, PRIMARY trên `file`), không có `Using temporary`/`Using filesort` — **không phải vấn đề thiếu index**. `SHOW INDEX` trên `file2document` và `file` cũng xác nhận đầy đủ index cho path JOIN này. Vấn đề nằm ở việc `t1: rows 153,268` — query đang cố JOIN và trả về **toàn bộ document của KB cùng lúc, không giới hạn**.
+
+**Root cause (xác nhận bằng đọc trực tiếp source code RagFlow, không suy đoán)**
+
+`ragflow-0.24.0/api/db/services/document_service.py`, hàm `get_filter_by_kb_id()` (dòng 187-273):
+
+```python
+query = cls.model.select(*fields).join(File2Document, ...).join(File, ...).where(cls.model.kb_id == kb_id)
+...
+rows = query.select(cls.model.run, cls.model.suffix, cls.model.id)   # dòng 229 — KHÔNG có .limit()
+total = rows.count()                                                  # dòng 230 — khớp câu COUNT(1) chậm ở trên
+...
+doc_ids = [row.id for row in rows]                                    # dòng 237 — duyệt TOÀN BỘ ORM object
+...
+for row in rows:                                                      # dòng 245 — đếm suffix/run_status THỦ CÔNG trong Python
+    suffix_counter[row.suffix] = suffix_counter.get(row.suffix, 0) + 1
+    run_status_counter[str(row.run)] = run_status_counter.get(str(row.run), 0) + 1
+    ...
+```
+
+Gọi từ `ragflow-0.24.0/api/apps/document_app.py:390`:
+```python
+filter, total = DocumentService.get_filter_by_kb_id(kb_id, keywords, run_status, types, suffix)
+return get_json_result(data={"total": total, "filter": filter})
+```
+
+→ Đây chính là API đứng sau request `documents?type=filter` — dùng để tính bộ đếm hiển thị ở filter panel (theo suffix, run_status, metadata) trên UI. Thiết kế hiện tại: **mỗi lần cần con số thống kê, code kéo hết danh sách document của cả KB về tầng ứng dụng rồi đếm tay bằng vòng lặp Python**, thay vì để MySQL `GROUP BY`/`COUNT` làm việc đó ở tầng SQL. Với KB nhỏ thì không sao, nhưng ở quy mô 394k document, đây là nghẽn cổ chai thực sự — và sẽ **ngày càng chậm hơn** khi KB tiếp tục phình to, không có ngưỡng chặn nào.
+
+⚠️ Lưu ý version: source code tra được là `ragflow-0.24.0` (có sẵn trong repo), trong khi production đang chạy chart `helm_ragflow_v0.26.4` — **chưa xác minh** hàm `get_filter_by_kb_id` có đổi giữa 2 version hay không, nhưng hành vi quan sát được qua slow log trên production hoàn toàn khớp với logic đọc được ở bản 0.24.0.
+
+**Kết luận: đây là bug/giới hạn thiết kế trong code RagFlow (backend), không phải vấn đề MySQL/database.** MySQL đã trả lời đúng và nhanh nhất có thể cho query được yêu cầu (mỗi JOIN đều dùng đúng index) — cái chậm là do query yêu cầu quá nhiều dữ liệu không cần thiết. **Đánh thêm index không giải quyết được** — không có index nào giúp giảm được việc phải đọc/truyền hết 150k-390k dòng.
+
+**Phạm vi xử lý**
+
+Ngoài phạm vi dự án hiện tại (ràng buộc: chỉ deploy/sửa qua `values.yaml` + Helm, không sửa code app — xem memory `ragflow-deploy-constraints.md`). Không xử lý trong đợt migrate MySQL này.
+
+**Hướng xử lý tiếp**
+
+1. Báo lại cho đội phát triển RagFlow / team quản lý source — đây là việc sửa code, không phải vận hành hạ tầng.
+2. Đề xuất kỹ thuật (để tham khảo khi báo, không tự làm): thay đếm thủ công trong Python bằng SQL `GROUP BY suffix`/`GROUP BY run` trực tiếp trên DB — MySQL tính aggregate nhanh hơn nhiều so với kéo hết dữ liệu về rồi đếm tay, và tránh phải truyền 150k-390k dòng qua network.
+3. Ngắn hạn (tạm thời, không sửa gốc): nếu team dev chưa xử lý kịp, có thể cân nhắc ẩn/tắt tính năng filter panel cho các KB quá lớn (ví dụ >50k document) từ phía UI, để tránh trigger query này — nhưng đây vẫn là thay đổi code, không phải việc hạ tầng.
 
 ---
 

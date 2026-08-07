@@ -227,15 +227,34 @@ node06 qua so sánh disk với node08, phát sinh từ câu hỏi thực tế l�
    `ClaimName: ragflow-mysql` (PVC mới bind đúng PV mới), Events log sạch (`Pulled`, `Created`,
    `Started`), không còn lỗi lặp lại.
 
-### Bước 4 — Xác minh sau migrate (trước khi cho ghi dữ liệu trở lại)
-1. `SHOW GRANTS` cho user — đối chiếu với bản ghi ở Bước 0, đảm bảo không mất quyền
-2. Đăng nhập bằng đúng `MYSQL_USER`/`MYSQL_PASSWORD` hiện có trong Secret — xác nhận không cần đổi
-3. `SELECT COUNT(*) FROM document` — đối chiếu với con số đã biết (239,395) để chắc dữ liệu
-   nguyên vẹn, không thiếu
-4. Kiểm tra `EXPLAIN` lại query composite index (Bước 1) vẫn hoạt động đúng sau khi đổi node
-5. Test thử 1 luồng upload document thật (không phải chỉ query) để xác nhận toàn bộ chuỗi
-   app → MySQL → MinIO hoạt động bình thường
-6. Theo dõi CPU node06/node07 qua `top`/SigNoz trong ít nhất 30-60 phút đầu
+### Bước 4 — Xác minh sau migrate (✅ mục 1-5 đã làm 07/08/2026, mục 6 đang theo dõi)
+
+1. ✅ `SHOW GRANTS FOR CURRENT_USER()` — 2 dòng, đầy đủ quyền chuẩn + admin nâng cao MySQL 8.0,
+   `WITH GRANT OPTION` — không mất quyền gì so với trước migrate.
+2. ✅ Đăng nhập bằng đúng password cũ trong Secret — thành công, tự nó là bằng chứng Secret
+   `ragflow-env-config` không bị động vào trong suốt quá trình migrate.
+3. ✅ `SELECT COUNT(*) FROM document` → **395,137** (không phải 239,395 như baseline TRACKING) —
+   ban đầu tưởng lệch, nhưng **cao hơn** chứ không thấp hơn baseline cũ, và khớp với `du -sh` đã
+   đối chiếu chính xác 4.5G ở Bước 3.3b (nếu thiếu dữ liệu, dung lượng không thể khớp đúng như
+   vậy) → kết luận: tăng trưởng tự nhiên trong ~2 ngày làm việc, không phải mất dữ liệu.
+4. ✅ `EXPLAIN` lại với `FORCE INDEX (idx_document_kb_create)` trên node06 — kết quả y hệt lúc
+   test trên node07 ở Bước 1.4 (`Extra` sạch hoàn toàn) — index copy đúng, hoạt động bình thường
+   sau khi đổi node. `SHOW INDEX` cũng xác nhận cấu trúc 2 cột `(kb_id, create_time)` nguyên vẹn.
+5. ✅ Test upload 1 document thật qua UI (`file support.txt`) — thành công, xuất hiện đúng trong
+   danh sách, `Total 394310` khớp hợp lý với `COUNT(*)`.
+   ⚠️ **Phát hiện phụ trong lúc test — Issue 7 mới**: quan sát tab Network thấy request
+   `documents?type=filter` mất **39.11s**. Điều tra bằng slow log (bật lại `slow_query_log`,
+   `long_query_time=1`, `log_output=TABLE` — vì đây là `SET GLOBAL` nên đã mất sau lần restart ở
+   Bước 3.2/3.8, phải bật lại) → bắt được 2 câu chậm cùng thuộc hàm `get_filter_by_kb_id()`
+   (JOIN 3 bảng không `LIMIT`, đọc hết ~153k-394k document của KB để đếm suffix/run_status thủ
+   công trong Python). Đã đọc trực tiếp source `ragflow-0.24.0/api/db/services/document_service.py`
+   dòng 187-273 xác nhận: **root cause là code app RagFlow, không phải MySQL/database** — mỗi
+   bảng JOIN đều dùng đúng index (`EXPLAIN` sạch), MySQL trả lời đúng những gì được yêu cầu, chỉ
+   là code yêu cầu quá nhiều dữ liệu không cần thiết. Không đánh thêm index nào giải quyết được.
+   **Ngoài phạm vi migrate DB** — ghi chi tiết đầy đủ, báo đội dev riêng. Xem TRACKING Issue 7.
+6. 🔶 Theo dõi CPU node06/node07 qua `top`/SigNoz 30-60 phút đầu — **đang làm**, chưa có kết luận
+   cuối. Lưu ý: khi theo dõi, cần phân biệt tải do MySQL bình thường vs tải do Issue 7 (query
+   không LIMIT) gây ra — 2 nguyên nhân khác nhau, đừng gộp chung khi đọc số liệu CPU.
 
 ### Bước 5 — Dọn dẹp (chỉ làm sau khi Bước 4 ổn định, có thể để riêng 24-48h quan sát)
 1. Xoá PV cũ trên node07 + thư mục dữ liệu cũ (`Retain` không tự xoá, phải làm tay)
