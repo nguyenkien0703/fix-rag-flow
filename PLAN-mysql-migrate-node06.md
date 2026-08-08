@@ -1,8 +1,24 @@
 # PLAN — Đánh index + chuyển MySQL từ node07 sang node06
 
-**Task chính**: `TRACKING-mysql-load-assessment.md` (mục 9) — root cause, bằng chứng, feasibility 4 hướng.
+**Task chính**: `TRACKING-mysql-load-assessment.md` (mục 9, Issue 1, Issue 7) — root cause, bằng chứng, feasibility 4 hướng.
 **Lệnh tham khảo (kèm giải nghĩa cờ)**: `commands/mysql-load-assessment.md`
-**Trạng thái**: 🔶 Đã duyệt plan, **chưa thực thi**. Còn 3 câu hỏi mở ở cuối file cần xác nhận trước khi vào cửa sổ bảo trì.
+**Trạng thái**: ✅ **HOÀN THÀNH** (07-08/08/2026) — đã đánh index, migrate MySQL sang node06,
+xác minh dữ liệu/quyền/CPU ổn định kể cả dưới tải thật khi đối tác đẩy dữ liệu trở lại.
+Còn 2 việc nhỏ chưa làm (không chặn kết luận thành công): (1) Bước 5 — xoá PV cũ trên node07 sau
+24-48h quan sát ổn định, (2) 1 câu hỏi phụ chưa giải quyết dứt điểm về cơ chế dung lượng (xem
+Bước 4.7, mục "Chưa giải quyết").
+
+## Mục lục nhanh (đọc lại sau này)
+
+- **Kết quả cuối cùng**: xem "✅ KẾT LUẬN BƯỚC 4" (gần cuối file, trước Bước 5)
+- **Đánh index — số liệu trước/sau**: Bước 1
+- **Vì sao chọn node06 thay vì node08**: Bước 0.5
+- **Cách migrate data (rsync) + các lỗi gặp phải khi làm**: Bước 3, đặc biệt mục 4 (owner/permission,
+  sudo, thư mục cha chặn quyền)
+- **Sự cố ImagePullBackOff sau khi upgrade**: cảnh báo cuối phần Bước 0.5
+- **Phát hiện phụ ngoài phạm vi (bug code RagFlow, không phải DB)**: Bước 4 mục 5, chi tiết đầy
+  đủ ở `TRACKING-mysql-load-assessment.md` Issue 7
+- **Tải thật khi đối tác đẩy dữ liệu sau migrate**: Bước 4.7
 
 ---
 
@@ -264,6 +280,61 @@ node06 qua so sánh disk với node08, phát sinh từ câu hỏi thực tế l�
 **✅ KẾT LUẬN BƯỚC 4: Migrate MySQL sang node06 thành công toàn diện** — dữ liệu nguyên vẹn,
 quyền không đổi, index hoạt động đúng, CPU ổn định dưới tải thật hơn 1 tiếng. Đủ điều kiện báo
 đối tác tiếp tục đẩy dữ liệu.
+
+### Bước 4.7 — Theo dõi tải thật khi đối tác đẩy dữ liệu trở lại (07-08/08/2026)
+
+Sau khi báo đối tác tiếp tục đẩy dữ liệu (dựa trên kết luận Bước 4 ở trên), đo lại tải thực tế
+lúc 15:09 cùng ngày (đối tác đang đẩy):
+
+**Chạy trên: node06**
+```
+top -bn1 -o %CPU | head -20
+```
+Kết quả: `mysqld` **293.8% CPU** (tăng từ 43.8% lúc rảnh), `load average: 7.98, 9.09, 7.69` trên
+node 8 core, `%Cpu(s) id: 74.2%`, `wa (iowait): 1.5%` (khác 0.0% lúc rảnh — bắt đầu có chờ đĩa
+nhẹ). Vẫn thấp hơn nhiều so với mức quá tải cũ ở node07 (666.7% CPU, load 19.52).
+
+**Kiểm tra ổn định kết nối dưới tải** — trong lúc đo dung lượng DB qua SQL, gặp
+`ERROR 2013 (HY000): Lost connection to MySQL server during query` (client tự reconnect thành
+công, connection id mới, kết quả sau đó nhất quán khi chạy lại). Kiểm tra thêm:
+```sql
+SHOW GLOBAL STATUS LIKE 'Aborted%';
+```
+Kết quả: `Aborted_clients: 3`, `Aborted_connects: 0` — số lần rớt kết nối tạm thời rất thấp kể từ
+lúc pod khởi động lại trên node06 (~vài tiếng), `Aborted_connects: 0` nghĩa là không có lần nào
+bị từ chối kết nối. Kết luận: 1 lần "Lost connection" gặp phải là blip tạm thời dưới tải cao
+(query timeout phía client), không phải dấu hiệu MySQL có sự cố nghiêm trọng.
+
+**Đo dung lượng DB dưới tải:**
+```sql
+SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024 / 1024, 2) AS total_size_gb
+FROM information_schema.tables WHERE table_schema = 'rag_flow';
+```
+→ **3.08 GB** (đo qua SQL, chỉ tính data+index logic của các bảng)
+
+```
+du -sh /data/ragflow/mysql
+```
+(chạy trên node06) → **4.5 GB** (đo toàn bộ datadir vật lý trên đĩa)
+
+Hai con số khác nhau (4.5G > 3.08G) là **bình thường**, không phải bất thường: `du -sh` tính cả
+InnoDB log file (`ib_logfile*`, redo log), undo log, temp file, và phần dung lượng đã cấp phát
+nhưng chưa dùng hết (fragmentation) — những thứ không nằm trong `data_length + index_length`.
+
+❓ **Chưa giải quyết — điểm cần điều tra thêm nếu có dịp**: `du -sh` đo được **4.5G** ở thời điểm
+này, khớp đúng với lần đối chiếu ngay sau rsync (Bước 3.3b, cũng 4.5G cả 2 bên) — nhưng **thấp
+hơn** con số **5.1G** đã đo trên node07 ở Bước 0.5 (06/08/2026, lúc MySQL cũ còn đang chạy sống
+trên node07, dùng để so sánh disk trống node06/node08). Nghĩa là: 5.1G (06/08, node07, đang chạy)
+→ 4.5G (07/08, sau khi scale về 0 rồi rsync) — **giảm 0.6G**, không tăng.
+
+Giả thuyết hợp lý nhất (chưa xác minh bằng cách so sánh danh sách file trước/sau): khi MySQL đang
+chạy sống, có thể tồn tại thêm các file tạm (undo log đang mở, buffer pool dump nếu bật, temp
+table trên đĩa cho query lớn...) mà quá trình clean shutdown ở Bước 3.2 đã dọn/flush sạch trước
+khi rsync — nên bản copy sang node06 nhỏ hơn bản gốc lúc đang hoạt động. **Chưa kiểm chứng trực
+tiếp**, cần liệt kê file trong `/data/ragflow/mysql` và đối chiếu với tài liệu MySQL 8.0 về các
+loại file tạm sinh ra khi server đang chạy nếu muốn có câu trả lời chắc chắn. Không ảnh hưởng tới
+kết luận migrate thành công (dữ liệu đã đối chiếu khớp bằng `COUNT(*)` và `du -sh` tại đúng thời
+điểm rsync), chỉ là một câu hỏi phụ về cơ chế chưa được trả lời dứt điểm.
 
 ### Bước 5 — Dọn dẹp (chỉ làm sau khi Bước 4 ổn định, có thể để riêng 24-48h quan sát)
 1. Xoá PV cũ trên node07 + thư mục dữ liệu cũ (`Retain` không tự xoá, phải làm tay)
