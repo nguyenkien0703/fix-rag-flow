@@ -423,6 +423,73 @@ du -sh /data/ragflow/* /var/lib/containerd
 5. **Ngắn hạn** — xoá PVC rác `ragflow-es-data`.
 6. **Dài hạn** — tách `/data/ragflow` sang đĩa/LVM riêng, hoặc ít nhất tách MySQL khỏi MinIO. Việc này **quan trọng hơn cả HA**: hiện tại một image lớn hoặc một đợt upload file bất kỳ có thể hạ gục DB.
 
+**Rủi ro này KHÔNG biến mất sau khi migrate sang node06 (07-08/08/2026)** — PV mới
+`pv-ragflow-mysql-node06.yaml` giữ nguyên y hệt cơ chế `hostPath` + `storageClassName: local-mysql`
+(no-provisioner) + `capacity: 5Gi` như PV cũ, cố ý để nhất quán với ràng buộc "chỉ deploy qua
+values.yaml/helm" của dự án. Node06 hiện có 75G trống (61% used, dư dả hơn node07 lúc chỉ còn
+25G/74% used) nên rủi ro ngắn hạn thấp hơn, nhưng bản chất vấn đề — MySQL có thể ghi vượt xa 5Gi
+tới khi hết cả đĩa node — vẫn y nguyên, chỉ là chuyển từ node07 sang node06. Xem Q&A chi tiết ngay
+bên dưới.
+
+---
+
+#### ❓ Hỏi & Đáp — `capacity: 5Gi` trong PV nghĩa là gì, tại sao MySQL lại ghi gần hết cả đĩa node?
+
+> **Kiên hỏi (08/08/2026)**: PV cho MySQL khai `capacity: 5Gi` — vậy dung lượng lưu trữ chỉ tối
+> đa 5GB, không thể hơn được à? Và tại sao trước đó khi MySQL ở node07, PV cũng khai 5GB nhưng
+> sau đó lại lưu gần hết cả đĩa?
+
+**Trả lời:**
+
+`capacity: 5Gi` trong PV này **không phải giới hạn thật** — MySQL có thể ghi vượt xa con số này,
+cho tới khi hết sạch dung lượng của **toàn bộ ổ đĩa node**, không phải 5Gi. Bằng chứng cụ thể đã
+đo được trên node07: `df -h /var/lib/mysql` bên trong pod ra `99G total, 70G used` — đó là dung
+lượng cả ổ đĩa `/dev/vda1` của node, không liên quan gì tới số `5Gi` khai trong PV.
+
+Có 2 loại PersistentVolume trong Kubernetes, khác nhau về việc `capacity` có được enforce hay không:
+
+| Loại | Ví dụ | `capacity` có phải giới hạn thật không? |
+|---|---|---|
+| Có provisioner thật | Cloud disk (EBS, PD), LVM, Ceph | **Có** — hệ thống lưu trữ tạo ra 1 volume đúng kích thước khai báo, ghi vượt sẽ bị chặn/báo lỗi |
+| `hostPath` + `no-provisioner` (trường hợp của MySQL ở đây) | `local-mysql`, `local-minio`, `local-redis` | **Không** — chỉ là con số khai báo, không có cơ chế vật lý nào chặn |
+
+Với `hostPath`, PV thực chất chỉ là **1 thư mục thường** (`/data/ragflow/mysql`) nằm trên
+filesystem gốc của node — không có "kho chứa ảo" riêng biệt như ổ đĩa cloud. MySQL ghi vào thư
+mục đó cũng giống như ghi vào bất kỳ thư mục nào khác trên node, dùng chung dung lượng với mọi
+thứ khác (containerd, log hệ thống, MinIO, Redis...). `capacity: 5Gi` chỉ tồn tại để Kubernetes
+scheduler **so khớp lúc PVC bind vào PV** (kiểm tra PV có đủ điều kiện logic cho PVC yêu cầu hay
+không) — sau bước bind đó, vai trò của con số này kết thúc, không ai theo dõi hay chặn ghi thêm.
+
+> **Kiên hỏi tiếp**: chỗ "PVC yêu cầu 5GB thì PV đã có 5GB nên khớp" — vậy sau đó ứng dụng ghi
+> nhiều hơn 5GB cũng không sao, lý do là vì PV này là loại `hostPath` + `no-provisioner`. Nhưng
+> nhìn vào file YAML của PV thì làm sao biết được `storageClassName` là `no-provisioner`? Trong
+> PV chỉ ghi `storageClassName: local-mysql`, không thấy chữ `no-provisioner` ở đâu cả.
+
+**Trả lời**: Đúng — bản thân file YAML của **PV** không ghi trực tiếp chữ `no-provisioner`.
+`storageClassName: local-mysql` trong PV chỉ là **cái tên**, giống như biến tham chiếu — nó
+**trỏ tới** một object khác trong cluster tên là `StorageClass`, và chính object `StorageClass`
+đó (không phải PV) mới là nơi khai báo `provisioner: kubernetes.io/no-provisioner`. Phải tra
+riêng object `StorageClass` mới biết được cơ chế thật:
+
+```
+kubectl get storageclass
+```
+```
+NAME                 PROVISIONER                    RECLAIMPOLICY  VOLUMEBINDINGMODE     ALLOWVOLUMEEXPANSION
+local-minio          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+local-mysql          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+local-path (default) rancher.io/local-path          Delete         WaitForFirstConsumer  false
+local-redis          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+```
+
+Cột `PROVISIONER` của dòng `local-mysql` chính là bằng chứng — `kubernetes.io/no-provisioner`.
+Đây là lệnh đã chạy thật trong phiên chẩn đoán 05/08 (ghi ở mục "Bằng chứng" của Issue 3, gần đầu
+mục này) — không phải suy đoán từ nhìn PV, mà từ việc tra thêm object `StorageClass` liên kết.
+
+**Cách nhớ ngắn gọn**: PV nói "tôi thuộc nhóm `local-mysql`" — muốn biết nhóm đó có "luật enforce
+dung lượng" hay không, phải hỏi riêng định nghĩa của nhóm (`kubectl get storageclass`), không thể
+biết chỉ từ nhìn cái tên trong PV.
+
 ---
 
 ### 🟡 Issue 4 — Pod MySQL QoS BestEffort — 🔶 OPEN
