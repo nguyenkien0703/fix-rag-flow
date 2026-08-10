@@ -1,6 +1,8 @@
 # PLAN — Áp dụng patch `get_root_folder()` (Issue U1)
 
-> **Trạng thái**: 🔶 Đã sửa chart, **chưa deploy**
+> **Trạng thái**: ✅ **ĐÃ DEPLOY THÀNH CÔNG** (10/08/2026 16:50, revision 62→63)
+> Kết quả: query `parent_id = id` 18s **biến mất khỏi slow log**; upload qua UI ~10-20s,
+> trả 200 nhanh. Chi tiết bằng chứng: Bước 6.
 > **Ngày soạn**: 10/08/2026
 > **Issue gốc**: xem `TRACKING-upload-document-25s.md` (root cause + số liệu đo)
 > **Phạm vi**: sửa **1 dòng** code RagFlow qua cơ chế `codePatch` có sẵn trong chart
@@ -480,19 +482,86 @@ kubectl -n ragflow exec -it ragflow-mysql-0 -- mysql -uroot -pfini_rag_flow_helm
 | **Không có dòng mới** sau thời điểm upload | ✅ Patch có tác dụng — không còn full-scan 631k dòng |
 | Vẫn có dòng mới `rows_examined ~631585` | 🔴 Patch không tác dụng dù grep thấy — điều tra tiếp |
 
+**Kết quả thật (10/08 18:04):**
+
+> 🗣️ **Kiên**: *"tôi upload doc trên UI của ragflow thì nó nhanh lắm, nó trả về 200 nhanh vãi ấy,
+> chắc tầm 10-20s của toàn bộ quá trình"*
+
+**a) Slow log lọc theo `rows_examined > 600000` sau mốc:**
+
+```
+| start_time                 | query_time      | rows_examined |
+| 2026-08-10 18:04:46.069960 | 00:00:08.784222 |       1938312 |
+| 2026-08-10 18:04:36.004735 | 00:00:30.587626 |       2584468 |
+| 2026-08-10 18:04:19.935846 | 00:00:20.705220 |       1938312 |
+| 2026-08-10 18:04:13.364100 | 00:00:57.140018 |       1001349 |
+| 2026-08-10 18:04:05.416126 | 00:00:19.514839 |       2584416 |
+| 2026-08-10 18:04:03.578490 | 00:00:08.198019 |        646104 |
+| 2026-08-10 18:03:59.229898 | 00:00:10.862413 |       1938312 |
+| 2026-08-10 18:03:48.307564 | 00:00:32.585830 |       2584468 |
+| 2026-08-10 18:03:42.510749 | 00:00:21.235912 |       1938312 |
+| 2026-08-10 18:03:21.274120 | 00:00:11.259748 |       1938312 |
+```
+
+**Đọc được gì — dễ nhìn nhầm là thất bại, nhưng số liệu nói ngược lại:**
+
+| Trước patch | Sau patch |
+|---|---|
+| `rows_examined = 631585` (**đúng bằng số dòng bảng `file`**) | `1938312`, `2584468`, `1001349`, `646104` |
+
+- ✅ **KHÔNG còn dòng nào ~631.585** — con số đó là **chữ ký** của `get_root_folder` full-scan
+  bảng `file`. Nó đã biến mất hoàn toàn
+- ✅ Các số mới đều **lớn hơn và khác nhau** → là query khác, trên bảng khác (JOIN nhiều bảng)
+
+**b) Gom nhóm top 8 query nặng nhất sau mốc:**
+
+| # | Query (rút gọn) | Số lần | Tổng (s) | Là gì |
+|---|---|---|---|---|
+| 1 | `SELECT ... FROM mysql.slow_log WHERE rows_examined > 600000` | 2 | 161.5 | ⚠️ **Do chính ta** — câu đo ở mục (a). Bảng slow_log quá lớn |
+| 2 | `SELECT t1.id, t1.thumbnail, t1.kb_id, t1.parser_id...` | 4 | 123.8 | Issue 7 — list document |
+| 3 | `SELECT t1.id, t1.process_begin_at... FROM document` | 7 | 108.5 | Issue 7 |
+| 4 | `SELECT t1.run, t1.suffix, t1.id FROM document INNER JOIN file2document` | 5 | 92.5 | Issue 7 |
+| 5 | `SELECT COUNT(1) FROM (... LEFT OUTER JOIN user_ca...)` | 4 | 75.3 | Issue 7 |
+| 6 | `SELECT COUNT(1) FROM (... INNER JOIN file AS t3)` | 5 | 52.4 | Issue 7 |
+| 7 | `SELECT COALESCE(SUM(t1.size), 0) FROM document WHERE kb_id = ...` | 4 | 31.1 | Tính dung lượng KB |
+| 8 | `SELECT GET_LOCK('init_database_tables', 60)` | 3 | 25.0 | Khởi động app |
+
+⭐ **`get_root_folder` KHÔNG còn trong top 8.** Trước patch nó đứng **đầu bảng** với 783.945 lần /
+838 giờ tích luỹ. Đây là bằng chứng mạnh nhất rằng patch đã có tác dụng thật.
+
+**c) Hiện tượng "gỡ nút thắt lớn nhất thì nút thắt thứ hai lộ ra"**
+
+Các query #2-#6 đều thuộc **Issue 7** (`get_filter_by_kb_id` — kéo cả KB về Python đếm thủ công).
+Chúng **không hề chậm đi** — chỉ là trước đây bị `get_root_folder` (838 giờ) át hết nên không nhìn thấy.
+
+Điểm phân biệt quan trọng:
+
+| | Đường GHI (upload) | Đường ĐỌC (mở trang, list document) |
+|---|---|---|
+| Query thủ phạm | `get_root_folder` — ✅ **đã fix** | Issue 7 — 🔶 **còn nguyên** |
+| Cảm nhận người dùng | ✅ Nhanh hẳn, trả 200 nhanh | ⚠️ Vẫn chậm |
+
+➡️ Khớp đúng cảnh báo đã ghi khi soạn báo cáo sếp: *"nhanh ở tầng DB nhưng UI không cảm nhận
+được vì API khác chặn"*. Giờ upload đã nhanh thật, nhưng **mở trang danh sách vẫn chậm** do Issue 7.
+
 ---
 
 ## 5. Kỳ vọng kết quả
 
-| Chỉ số | Trước | Sau (kỳ vọng) |
+| Chỉ số | Trước | Sau — **đo thật 10/08** |
 |---|---|---|
-| `get_root_folder` mỗi lần | 18.02s | ~0.00s |
-| Số lần chạy mỗi upload | 2 | 2 (**không đổi** — chưa làm phương án bỏ lời gọi thừa) |
-| Tổng thời gian tìm thư mục gốc | ~36s | ~0s |
-| Bước "Upload document" khách hàng báo | 25s | ❓ **chưa đo được** — cần đo lại thực tế |
+| `get_root_folder` mỗi lần | 18.02s | ✅ **Không còn xuất hiện trong slow log** (ngưỡng 0.1s) |
+| Số lần chạy mỗi upload | 2 | 2 (**không đổi** — cố ý chưa làm phương án bỏ lời gọi thừa) |
+| Tổng thời gian tìm thư mục gốc | ~36s | ✅ **~0s** |
+| Dòng `rows_examined = 631585` trong slow log | Đầu bảng, 783.945 lần | ✅ **Biến mất hoàn toàn** |
+| Toàn bộ quá trình upload (Kiên đo qua UI) | — | ✅ **~10-20s, trả 200 nhanh** |
 
-⚠️ **Không hứa trước con số cuối.** Bước upload 25s còn gồm MinIO PUT, sinh thumbnail, ghi
-`document`/`file2document`. Patch này chỉ gỡ phần MySQL full-scan. Phải đo lại rồi mới báo.
+✅ **Trạng thái: FIXED** — có bằng chứng trực tiếp (chuỗi trong code + biến mất khỏi slow log +
+cảm nhận thực tế qua UI).
+
+⚠️ **Không quy toàn bộ mức cải thiện cho patch này.** Cùng đợt còn có: index
+`idx_document_kb_create` (đánh trước đó), migrate MySQL sang node06, và `nodeAffinity` gỡ pod kẹt.
+Điều **chứng minh được chắc chắn** là: query `parent_id = id` 18s **không còn tồn tại**.
 
 ⚠️ **Tổng 55s sẽ KHÔNG giảm hết** — 4 bước còn lại (LLM tóm tắt 10s, Update metadata 8s, Parse
 chunk 6s, Check tồn tại 6s) chưa được trace, là việc riêng.

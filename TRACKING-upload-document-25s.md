@@ -259,7 +259,15 @@ SELECT name, COUNT(*) AS so_dong FROM file WHERE tenant_id = '22cdb01e486a11f1ac
 
 ## 4. Issue chi tiết
 
-### 🔴 Issue U1 — `get_root_folder()` full-scan bảng `file` do so sánh cột với cột — 🔶 OPEN
+### 🔴 Issue U1 — `get_root_folder()` full-scan bảng `file` do so sánh cột với cột — ✅ **FIXED (10/08)**
+
+> **Đã fix 10/08/2026** bằng patch `name == "/"` thay `parent_id == id`, deploy qua `codePatch`
+> (initContainer + sed), revision 62→63. **Bằng chứng**: query `rows_examined = 631585` biến mất
+> hoàn toàn khỏi slow log; upload qua UI ~10-20s trả 200 nhanh (trước đó riêng bước upload 25s).
+> Chi tiết triển khai + output thật: **`PLAN-apply-patch-get-root-folder.md`**.
+>
+> ⚠️ Đây là **fix tại chỗ trên deployment của mình** — code upstream (branch `main`) **vẫn còn
+> nguyên lỗi**. Nâng version RagFlow sẽ mất patch này nếu quên mang theo `codePatch`.
 
 **Triệu chứng**
 
