@@ -17,7 +17,7 @@
 | Cách áp dụng | `initContainer` + `sed` (cơ chế `codePatch` chart đã có sẵn, **không phải postStart**) |
 | Tác động DB | ❌ **Không** — không đổi schema, không sửa dữ liệu, không đánh index |
 | Đối tác có cần dừng đẩy dữ liệu? | ❌ **Không cần** |
-| Downtime | Restart pod ragflow, ~1-2 phút |
+| Downtime | ⚠️ Không phải "restart pod" — là **RollingUpdate** của Deployment 3 replicas. Xem mục 1b |
 | Rollback | Sửa `values.yaml` bỏ block patch → `helm upgrade`. Image gốc không bị đụng |
 
 ---
@@ -62,6 +62,67 @@ Ba điểm thiết kế đáng chú ý:
    verify thì patch trượt âm thầm. Có verify thì `Init:Error`
 3. **Dùng chính image ragflow làm initContainer** — không cần kéo thêm image nào (quan trọng vì
    cluster air-gapped, đã từng dính `ImagePullBackOff` khi migrate MySQL)
+
+---
+
+## 1b. `helm upgrade` thực chất làm gì — KHÔNG phải "restart pod"
+
+*(Kiên bắt lỗi 10/08: "helm upgrade thì bản chất nó phải tạo ra pod mới theo replica chứ, sao
+lại là restart pod? Pod mới chưa health OK thì pod cũ vẫn phục vụ request được mà, đúng không?")*
+
+**Kiên đúng.** Bản nháp trước của plan này ghi "restart pod ragflow ~1-2 phút" là **sai** — đó là
+cách diễn đạt mượn từ đợt migrate MySQL. MySQL là **StatefulSet `replicas: 1`** nên restart thật;
+còn ragflow thì khác hẳn.
+
+### Sự thật về workload ragflow (đọc từ chart)
+
+| Thuộc tính | Giá trị | Nguồn |
+|---|---|---|
+| Kind | **Deployment** (không phải StatefulSet) | `templates/ragflow.yaml:3` |
+| `replicas` | **3** | `values.yaml:130` |
+| `strategy` | Để trống → K8s mặc định **RollingUpdate** (`maxUnavailable: 25%`, `maxSurge: 25%`) | `values.yaml:132` |
+
+Nên `helm upgrade` sẽ: tạo **ReplicaSet mới** → dựng pod mới → chờ pod mới `Ready` → mới xoá pod
+cũ, **lần lượt từng pod**. Không có thời điểm nào cả 3 pod cùng chết.
+
+**Cơ chế kích hoạt rollout**: annotation `checksum/values: {{ .Values | toYaml | sha256sum }}`
+(`ragflow.yaml:25`). Sửa `values.yaml` → checksum đổi → pod template đổi → K8s buộc tạo
+ReplicaSet mới. Không có annotation này thì sửa values xong pod có thể không rollout.
+
+### ⚠️ NHƯNG: chart này KHÔNG có readinessProbe
+
+Đây là chỗ vế thứ hai của câu hỏi không đúng với thực tế chart. Đã grep toàn bộ `templates/`:
+chỉ `infinity.yaml:85` và `opensearch.yaml:106` có probe. **`ragflow.yaml` không có
+`readinessProbe` / `livenessProbe` / `startupProbe` nào.**
+
+| Có readinessProbe | Không có (thực tế chart này) |
+|---|---|
+| Pod chỉ nhận traffic khi probe pass | Pod vào `Ready` **ngay khi container start** |
+| Pod cũ giữ traffic tới khi pod mới thật sự phục vụ được | K8s tưởng pod mới OK → thêm vào Service endpoints + xoá pod cũ **trong khi Python còn đang khởi động** |
+
+RagFlow khởi động lâu (load model, kết nối ES/MinIO/Redis/MySQL). Trong khoảng đó pod đã `Ready`
+trên giấy tờ nhưng request vào sẽ **lỗi hoặc treo**.
+
+➡️ Kết luận: *"pod mới chưa health OK thì pod cũ vẫn phục vụ"* — **đúng về nguyên tắc K8s**, nhưng
+chart này **không có cơ chế biết thế nào là "health OK"**, nên không đảm bảo được.
+
+**Yếu tố giảm nhẹ**: `maxUnavailable: 25%` của 3 replicas = 0.75 → làm tròn xuống **0** → K8s luôn
+giữ đủ 3 pod cũ tới khi pod mới `Ready`. Nhưng vì `Ready` không phản ánh thực tế, nó chỉ **giảm**
+chứ không loại bỏ rủi ro.
+
+### Điểm tốt riêng của patch này
+
+`initContainer` chạy **trước** container chính. Nếu `sed` không khớp → `Init:Error` → pod mới
+**không bao giờ `Ready`** → RollingUpdate **dừng lại**, 3 pod cũ vẫn chạy nguyên.
+
+➡️ **Patch sai thì hệ thống KHÔNG bị gián đoạn** — chỉ là không có gì thay đổi. Rủi ro thật nằm ở
+hướng ngược lại: patch thành công, pod mới `Ready` sớm, request rơi vào lúc app chưa sẵn sàng.
+
+### Việc nên làm
+
+- [ ] Chọn **giờ thấp điểm** để apply (vì thiếu readinessProbe nên vẫn có khoảng chập chờn ngắn)
+- [ ] 🔶 **Nợ kỹ thuật — nên thêm `readinessProbe` cho ragflow** (việc riêng, không gộp vào patch
+      này để tách rủi ro). Có probe rồi thì mọi lần `helm upgrade` sau đều thật sự zero-downtime
 
 ---
 
@@ -165,10 +226,16 @@ kubectl -n ragflow get pod -l app=ragflow -w
 | `-l app=ragflow` | Lọc theo label, tránh liệt kê cả mysql/minio/redis |
 | `-w` | `--watch` — theo dõi realtime, Ctrl+C để thoát |
 
+Vì là Deployment 3 replicas rolling update, sẽ thấy **nhiều pod cùng lúc** — pod cũ
+(`Running`) song song pod mới đang lên:
+
 | Trạng thái thấy được | Nghĩa |
 |---|---|
-| `Init:0/1` → `PodInitializing` → `Running` | ✅ Patch thành công |
-| `Init:Error` / `Init:CrashLoopBackOff` | 🔴 **Patch trượt** — sang Bước 4b |
+| Pod mới: `Init:0/1` → `PodInitializing` → `Running`, pod cũ `Terminating` dần | ✅ Patch thành công, rolling update chạy đúng |
+| Pod mới: `Init:Error` / `Init:CrashLoopBackOff`, **pod cũ vẫn `Running` đủ 3** | 🔴 **Patch trượt** — sang Bước 4b. Điểm tốt: **hệ thống không gián đoạn**, 3 pod cũ vẫn phục vụ |
+
+⚠️ Chart **không có readinessProbe** (mục 1b) → pod mới vào `Ready` ngay khi container start, chưa
+chắc app đã sẵn sàng. Nên **đợi thêm ~1-2 phút** sau khi thấy `Running` rồi mới test, đừng test ngay.
 
 ### Bước 4b — Nếu Init:Error, đọc log initContainer (node04)
 
@@ -257,6 +324,7 @@ Sau rollback, pod restart và dùng lại code gốc trong image. **Không cần
 | Về sau xuất hiện dòng trùng `name = '/'` do race condition | Thấp | Hiện `COUNT(*)` = 1. Code v0.26.4 có logic dedup cho `.knowledgebase` (dòng 79) → chuyện trùng **có thật** với thư mục khác, cần theo dõi định kỳ |
 | Tenant mới chưa có root folder | Rất thấp | Code có sẵn nhánh tự tạo khi không tìm thấy (dòng 246-259), hành vi giữ nguyên |
 | ❓ Chưa xác minh tên index cụ thể trên `file.name` | Thấp | Suy từ `0.00 sec` trên bảng 631k dòng. Chạy `SHOW INDEX FROM file` nếu muốn chắc |
+| **Chart không có readinessProbe** → pod mới `Ready` sớm, request có thể rơi vào lúc app chưa khởi động xong | **Trung bình** | Chọn giờ thấp điểm; `maxUnavailable` làm tròn = 0 nên vẫn giữ đủ 3 pod cũ. Dài hạn: thêm probe (mục 1b) |
 | Chưa test ở non-prod | **Trung bình** | Môi trường hiện không có non-prod tương đương. Bù lại bằng: verify + rollback nhanh + đo lại sau khi apply |
 
 ---
