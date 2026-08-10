@@ -192,12 +192,26 @@ thích lại từ đầu cho dễ đọc lại sau này)*
 Cây thư mục thực tế của 1 tài khoản RagFlow:
 
 ```
-/                          ← root folder      - 1 cái duy nhất cho cả tài khoản
+/                          ← root folder      - 1 cái duy nhất cho cả tenant
 └── .knowledgebase/        ← kb_root folder   - 1 cái duy nhất, chứa mọi KB
     ├── Voffice-doc-sum/   ← kb folder        - mỗi KB một thư mục
     ├── KB-2/
     └── ... (các KB khác)
 ```
+
+✅ **Đã xác minh sơ đồ này là đúng, không phải ví dụ minh hoạ** (Kiên hỏi 10/08):
+
+| Thành phần | Bằng chứng trong code v0.26.4 |
+|---|---|
+| Tên `/` của root folder | `file_service.py:253` → `"name": "/"` — chuỗi ký tự thật ghi vào DB |
+| Tên `.knowledgebase` | `api/db/__init__.py:91` → `KNOWLEDGEBASE_FOLDER_NAME = ".knowledgebase"` |
+| kb_root nằm dưới root | `file_service.py:271` → `parent_id == root_id` |
+| Thư mục KB nằm dưới kb_root | `upload_document()` → `new_a_file_from_kb(kb.tenant_id, kb.name, kb_root_folder["id"])` |
+
+⚠️ **Một đính chính**: phạm vi là **tenant**, không hẳn là "tài khoản". Query lọc theo
+`tenant_id`, mà mặc định mỗi user là một tenant riêng — nên với trường hợp của Kiên thì hai
+khái niệm này trùng nhau. Nhưng nếu về sau bật tính năng team/chia sẻ tenant thì nhiều user
+sẽ **dùng chung một cây thư mục** và cùng chịu chung một bảng `file` phình to.
 
 Lưu trong bảng `file` thành:
 
@@ -262,6 +276,29 @@ self.init_knowledgebase_docs(pf_id, user_id)       # (không full scan — nhậ
 kb_root_folder = self.get_kb_folder(user_id)       # ← bên trong gọi lại get_root_folder = full scan lần 2
 kb_folder = self.new_a_file_from_kb(kb.tenant_id, kb.name, kb_root_folder["id"])
 ```
+
+**1b. Tìm root folder ra để LÀM GÌ?** *(Kiên hỏi 10/08)*
+
+Không phải để ghi file vào đó. Root folder chỉ được dùng làm **điểm bắt đầu để lần xuống**
+đúng thư mục KB cần ghi. Đọc lại 5 dòng code trên theo trình tự:
+
+```
+get_root_folder(user_id)        → ra id của "/"            (gọi nó là AAA)
+   ↓ dùng AAA làm mốc
+get_kb_folder(user_id)          → tìm ".knowledgebase" có parent_id = AAA   → ra BBB
+   ↓ dùng BBB làm mốc
+new_a_file_from_kb(..., BBB)    → tìm/tạo "<tên KB>" có parent_id = BBB     → ra CCC
+   ↓
+File mới được ghi vào với parent_id = CCC   ← đây mới là chỗ file thực sự nằm
+```
+
+Nói cách khác: mỗi tầng cần biết `id` của tầng cha để tìm mình, và root là tầng trên cùng
+nên phải lấy nó trước. Vấn đề nằm ở chỗ **cách lấy tầng trên cùng đó lại là cách tệ nhất** —
+quét cả bảng, trong khi 2 tầng dưới đều tra bằng giá trị cụ thể nên rất nhanh.
+
+➡️ **Đây chính là lý do vấn đề này đáng lẽ rất dễ sửa**: root folder của một tenant là **bất
+biến** — tạo một lần rồi không bao giờ đổi. Đúng ra chỉ cần cache lại `id` đó (hoặc đánh dấu
+bằng một cột riêng), thay vì đi quét 631,585 dòng lặp đi lặp lại 2 lần cho **mỗi** file upload.
 
 **2. Root folder và KB folder là 3 tầng thư mục KHÁC NHAU** (hay bị nhầm là một):
 
@@ -341,6 +378,29 @@ upload).
 → Vậy 1 lần upload gây **2 lần** full scan (~36s nếu mỗi lần 18s). Câu thứ 3 bắt được trong slow
 log lúc 12:29:08 đến từ **request khác chạy song song**, không phải từ cùng 1 lần `upload_document`.
 
+**Bằng chứng — đã có issue upstream nào chưa? (tra 10/08 theo yêu cầu của Kiên)**
+
+🔶 **Chưa tìm thấy issue nào mô tả đúng vấn đề này.** Đã tra:
+
+| Nguồn tra | Kết quả |
+|---|---|
+| GitHub issues, keyword `get_root_folder` | Không có issue nào về hiệu năng. Chỉ ra 3 issue Feature không liên quan (#14736, #15240, #12313) + 1 PR đã merge (#14345 "Refa: unify document create flows") |
+| GitHub issues, keyword `file table slow query index` | Không liên quan (#15049 onnxruntime, #14628 s3 connector, #3022 hanging at parsing) |
+| Web search "ragflow upload slow MySQL large knowledge base" | Chỉ ra các issue về **parsing chậm** (#7576, #11142, #4673) — khác hẳn: đó là tầng embedding/task executor, không phải MySQL |
+
+⚠️ **Quan trọng — đã kiểm tra branch `main` mới nhất** (không chỉ v0.26.4):
+`get_root_folder()` trên `main` **vẫn còn nguyên** `parent_id == id`, **vẫn không có cache**.
+
+→ Nghĩa là: **nâng version RagFlow sẽ KHÔNG tự khỏi.** Đây không phải bug đã fix ở bản mới mà
+mình đang chạy bản cũ — nó vẫn đang tồn tại ở bản mới nhất upstream.
+
+→ Vì sao chưa ai báo? Nhiều khả năng vì vấn đề chỉ lộ ra khi bảng `file` đủ lớn (mình có
+631,585 dòng), còn đa số người dùng chỉ có vài trăm/vài nghìn dòng — quét hết cũng chỉ mất
+vài ms nên không ai nhận ra.
+
+➡️ **Hệ quả cho hướng xử lý**: mình là bên đầu tiên chạm vào giới hạn này, nên **không có bản
+vá sẵn để chờ**. Muốn xử lý thì phải tự mở issue/PR lên upstream, hoặc tự vá tại chỗ.
+
 **Bằng chứng — quy mô tích luỹ**
 
 Từ query gom nhóm (mục 3.3): query này chạy **783,945 lần**, tổng **838 giờ 59 phút** — gấp hơn 4
@@ -396,6 +456,8 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 | **Một lời gọi hàm trong code có thể thành nhiều query.** `get_kb_folder()` gọi lại `get_root_folder()` → 1 dòng code thành 2 lần full scan | Khi thấy query lặp bất thường trong slow log, tra ngược xem hàm nào gọi hàm nào |
 | **Số lần query trong slow log ≠ số lần 1 request gọi.** Ban đầu thấy 3 câu cùng lúc → tưởng 1 lần upload gọi 3 lần. Tra code mới biết chỉ 2 lần, câu thứ 3 từ request song song khác | Đếm số lời gọi bằng cách `grep` toàn bộ codebase (`grep -rn "get_root_folder"`), đừng suy từ số dòng trong slow log |
 | **Tra code phải đúng version đang chạy production.** Repo có sẵn 0.24.0 nhưng production chạy 0.26.4 — may là code giống nhau, nhưng nếu khác thì kết luận sai hoàn toàn | `git clone --depth 1 --branch <tag>` bản đúng version rồi đối chiếu, trước khi báo dev |
+| **"Chưa có ai báo issue" không có nghĩa là mình sai** — có nghĩa là mình chạm giới hạn trước người khác. Bug này chỉ lộ ra khi bảng `file` đủ lớn; đa số user chỉ có vài nghìn dòng nên quét hết vẫn mất vài ms | Tra issue upstream mà không ra → **kiểm tra thêm branch `main`** xem code còn lỗi không, thay vì kết luận "chắc mình hiểu nhầm" |
+| **Kiểm tra `main` chứ không chỉ version đang chạy.** Nếu `main` đã fix thì hướng xử lý là nâng version; nếu `main` còn lỗi thì phải tự vá — hai hướng hoàn toàn khác nhau | `curl raw.githubusercontent.com/<repo>/main/<file>` đọc thẳng bản mới nhất, nhanh hơn clone |
 | **Bảng dùng chung nghĩa là 1 KB lớn làm chậm mọi KB.** Bảng `file` gộp chung mọi KB của tài khoản → full scan quét hết 631k dòng bất kể upload vào KB nào | Khi thấy query full scan trên bảng dùng chung, đừng chỉ nhìn KB/tenant đang thao tác — nhìn tổng số dòng cả bảng |
 
 ---
@@ -426,7 +488,13 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 
 ### Ngắn hạn
 
-- [ ] Báo đội phát triển RagFlow về Issue U1 kèm bằng chứng (mục 3-4 file này)
+- [x] ~~Tra xem upstream đã có issue nào cho vấn đề này chưa~~ → 🔶 **Xong 10/08: CHƯA CÓ.**
+      Tra GitHub issues (`get_root_folder`, `file table slow query index`) + web search đều không
+      ra issue nào đúng vấn đề. Quan trọng hơn: **branch `main` mới nhất vẫn còn nguyên lỗi**
+      (`parent_id == id`, không cache) → **nâng version sẽ không tự khỏi**
+- [ ] Báo đội phát triển RagFlow về Issue U1 kèm bằng chứng (mục 3-4 file này) — **là bên đầu
+      tiên báo**, nên cần kèm số liệu đầy đủ: 631,585 dòng, 18s/lần, 2 lần/upload, 783,945 lần
+      chạy tích luỹ 838h59m
 - [ ] Báo luôn Issue 7 (`get_filter_by_kb_id`) — vẫn còn trong top slow query, cùng nhóm nguyên
       nhân "code app query không tối ưu"
 - [ ] Trace nốt 4 bước còn lại của flow 55s (LLM tóm tắt 10s, Update metadata 8s, Parse chunk 6s,
