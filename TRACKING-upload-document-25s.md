@@ -155,6 +155,106 @@ query: SELECT `t1`.`id`, `t1`.`create_time`, `t1`.`create_date`, `t1`.`update_ti
           AND (`t1`.`parent_id` = `t1`.`id`))
 ```
 
+### 3.5 Kiểm chứng giả định của phương án fix — tìm root folder bằng `name` thay vì `parent_id = id`
+
+*(Kiên yêu cầu 10/08: "muốn dùng query để tìm root folder `/` và `.knowledgebase`, cần xác nhận
+nó có tồn tại". Thực chất câu hỏi này kiểm chứng luôn giả định nền của phương án sửa code.)*
+
+Cả 3 câu chỉ `SELECT`, không đụng dữ liệu — chạy được ngay cả khi đối tác đang đẩy dữ liệu.
+Chạy trên **node04** qua `kubectl -n ragflow exec -it ragflow-mysql-0 -- mysql -uroot -p... rag_flow`.
+
+**a) Root folder có tồn tại không, tìm bằng `name` có ra không?**
+
+```sql
+SELECT id, name, parent_id, tenant_id, type, create_date FROM file WHERE tenant_id = '22cdb01e486a11f1ac9749e86cfe939a' AND name = '/'\G
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `AND name = '/'` | Tìm theo **tên** — so cột với **hằng số**, dùng được index. Đối lập với `parent_id = id` của code hiện tại |
+| `\G` thay `;` | Hiển thị dọc, mỗi cột 1 dòng — tránh tràn màn hình VDI. `\G` **cũng là ký tự kết thúc câu** nên không cần thêm `;` |
+
+**Output:**
+
+```
+*************************** 1. row ***************************
+         id: 22cdb226486a11f1ac9749e86cfe939a
+       name: /
+  parent_id: 22cdb226486a11f1ac9749e86cfe939a
+  tenant_id: 22cdb01e486a11f1ac9749e86cfe939a
+       type: folder
+create_date: 2026-05-05 18:06:51
+1 row in set (0.00 sec)
+```
+
+**Đọc được gì:**
+- ✅ `parent_id` = `id` (cùng `22cdb226...`) — xác nhận đúng phân tích: root folder trỏ về chính nó
+- ✅ `id` (`22cdb226...`) **khác** `tenant_id` (`22cdb01e...`) — chỉ trùng 4 ký tự đầu do sinh UUID
+  cùng thời điểm. Dễ nhìn nhầm thành một nếu đọc lướt
+- 🔴 **`0.00 sec`** — con số quan trọng nhất. Cùng bảng, cùng 1 dòng kết quả, nhưng
+  `name = '/'` mất **0.00s** trong khi `parent_id = id` mất **18s** (mục 3.4). Chênh **>1000 lần**
+- ✅ Bảng `file` **có index dùng được cho cột `name`** (suy ra từ 0.00s trên bảng 631k dòng)
+
+**b) `.knowledgebase` có tồn tại và nối đúng vào root không?**
+
+```sql
+SELECT c.id, c.name, c.parent_id, p.name AS parent_name FROM file c JOIN file p ON c.parent_id = p.id WHERE c.tenant_id = '22cdb01e486a11f1ac9749e86cfe939a' AND c.name = '.knowledgebase'\G
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `file c JOIN file p` | **Self-join** — nối bảng `file` với chính nó. `c` = child, `p` = parent |
+| `ON c.parent_id = p.id` | So cột giữa **2 dòng khác nhau** → **dùng được index**. Khác hẳn `parent_id = id` so 2 cột **cùng 1 dòng** |
+| `p.name AS parent_name` | Lấy tên thư mục cha ra đối chiếu — kỳ vọng phải là `/` |
+
+**Output:**
+
+```
+*************************** 1. row ***************************
+         id: 4b2289be4a8011f1ac9749e86cfe939a
+       name: .knowledgebase
+  parent_id: 22cdb226486a11f1ac9749e86cfe939a
+parent_name: /
+1 row in set (0.00 sec)
+```
+
+**Đọc được gì:**
+- ✅ Cây thư mục nối **đúng**: `parent_id` của `.knowledgebase` = `22cdb226...` = đúng `id` của `/`
+- ✅ Sơ đồ `/` → `.knowledgebase` → `<KB>` được xác nhận bằng **dữ liệu thật**, không chỉ bằng đọc code
+- ✅ **0.00 sec** dù là self-join trên bảng 631k dòng → chứng minh trực tiếp: so cột giữa 2 dòng
+  khác nhau thì index hoạt động bình thường. Vấn đề **chỉ** nằm ở so 2 cột cùng 1 dòng
+
+**c) ⭐ Có dòng trùng không? — câu quyết định phương án fix**
+
+```sql
+SELECT name, COUNT(*) AS so_dong FROM file WHERE tenant_id = '22cdb01e486a11f1ac9749e86cfe939a' AND name IN ('/', '.knowledgebase') GROUP BY name;
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `COUNT(*) ... GROUP BY name` | Đếm số dòng theo từng tên — lộ ra ngay nếu có bản ghi trùng |
+| `IN ('/', '.knowledgebase')` | Kiểm tra cả 2 tầng trong một câu |
+| `;` (không phải `\G`) | Trả nhiều dòng ngắn → bảng ngang dễ đọc hơn. **Lần đầu chạy bị treo ở prompt `->` do soạn lệnh thiếu `;`** |
+
+**Output:**
+
+```
++----------------+---------+
+| name           | so_dong |
++----------------+---------+
+| .knowledgebase |       1 |
+| /              |       1 |
++----------------+---------+
+2 rows in set (0.00 sec)
+```
+
+**Đọc được gì:**
+- ✅ **Không có dòng trùng** — mỗi tên đúng 1 dòng
+- ✅ Loại trừ được rủi ro đã nêu trước đó: "nếu có 2 dòng cùng `name = '/'` thì sửa thành
+  `name = '/'` sẽ lấy nhầm". Giả thuyết này **sai với dữ liệu thực tế**
+- ➡️ **Kết luận**: thay `parent_id = id` bằng `name = '/'` cho **kết quả tương đương**, nhưng
+  nhanh hơn >1000 lần. Đây là căn cứ để hạ mức rủi ro của phương án vá code (xem mục 4)
+
 ---
 
 ## 4. Issue chi tiết
@@ -442,6 +542,44 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
    0.24.0 — cùng dòng `where((tenant_id == tenant_id), (parent_id == cls.model.id))`. Kết luận
    root cause áp dụng đúng cho production, không cần dè dặt vì lệch version nữa.
 
+#### ⭐ Phương án (d) — thay điều kiện tìm: `parent_id = id` → `name = '/'`
+
+**Đã kiểm chứng bằng dữ liệu thật production (mục 3.5, 10/08)** — đây là phương án gọn nhất:
+
+| Tiêu chí | Bằng chứng |
+|---|---|
+| Có tìm ra đúng root folder không? | ✅ Ra đúng 1 dòng, `id = 22cdb226...`, `parent_id = id` |
+| Có bị trùng dòng không? | ✅ `COUNT(*)` = **1** cho `/`, = **1** cho `.knowledgebase` |
+| Nhanh hơn bao nhiêu? | 🚀 **18s → 0.00s** (>1000 lần) |
+| Sửa bao nhiêu dòng code? | **1 dòng** (`file_service.py:244`) |
+
+Sửa cụ thể — chỉ đổi vế điều kiện thứ 2:
+
+```python
+# HIỆN TẠI (dòng 244) — so 2 cột cùng dòng, không dùng được index
+.where((cls.model.tenant_id == tenant_id), (cls.model.parent_id == cls.model.id))
+
+# SỬA THÀNH — so cột với hằng số, dùng được index
+.where((cls.model.tenant_id == tenant_id), (cls.model.name == "/"))
+```
+
+⚠️ **Đánh giá trước đó của tôi cần điều chỉnh.** Trước khi có mục 3.5, tôi xếp phương án vá code
+bằng `sed` vào nhóm "không khuyến nghị", lý do: *"nếu có 2 dòng cùng `name = '/'` thì kết quả sẽ
+khác bản gốc"*. Dữ liệu thật cho thấy **không có dòng trùng** → giả thuyết đó **sai**, và mức rủi
+ro của phương án (d) thấp hơn hẳn so với đánh giá ban đầu:
+
+- Đây là **thay 1 chuỗi trong 1 dòng** — đúng loại việc mà 2 patch `codePatch` hiện có đang làm
+- Không thêm dòng mới, không đụng indent Python (khác phương án (b) cache — cần thêm biến/decorator)
+- ✅ Vẫn nên **test ở non-prod trước**: rủi ro giảm ≠ rủi ro bằng 0
+
+**Rủi ro còn lại của (d)** — cần ghi rõ, không được bỏ qua:
+
+| Rủi ro | Mức | Ghi chú |
+|---|---|---|
+| Tenant **mới** chưa có root folder → `name = '/'` không ra dòng nào | Thấp | Code có sẵn nhánh tự tạo khi không tìm thấy (`file_service.py:246-259`) — hành vi giữ nguyên |
+| Về sau xuất hiện dòng trùng `name = '/'` do race condition | Thấp | Hiện `COUNT(*)` = 1. Code v0.26.4 đã có logic dedup cho `.knowledgebase` (dòng 79) → chuyện trùng là có thật với thư mục khác, nên vẫn cần theo dõi |
+| ❓ Chưa xác minh: có index cụ thể nào trên cột `file.name` | Thấp | Suy ra từ `0.00 sec` trên bảng 631k dòng. Chưa chạy `SHOW INDEX FROM file` để xem tên index |
+
 ---
 
 ## 5. Bài học
@@ -458,6 +596,9 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 | **Tra code phải đúng version đang chạy production.** Repo có sẵn 0.24.0 nhưng production chạy 0.26.4 — may là code giống nhau, nhưng nếu khác thì kết luận sai hoàn toàn | `git clone --depth 1 --branch <tag>` bản đúng version rồi đối chiếu, trước khi báo dev |
 | **"Chưa có ai báo issue" không có nghĩa là mình sai** — có nghĩa là mình chạm giới hạn trước người khác. Bug này chỉ lộ ra khi bảng `file` đủ lớn; đa số user chỉ có vài nghìn dòng nên quét hết vẫn mất vài ms | Tra issue upstream mà không ra → **kiểm tra thêm branch `main`** xem code còn lỗi không, thay vì kết luận "chắc mình hiểu nhầm" |
 | **Kiểm tra `main` chứ không chỉ version đang chạy.** Nếu `main` đã fix thì hướng xử lý là nâng version; nếu `main` còn lỗi thì phải tự vá — hai hướng hoàn toàn khác nhau | `curl raw.githubusercontent.com/<repo>/main/<file>` đọc thẳng bản mới nhất, nhanh hơn clone |
+| **Đánh giá rủi ro dựa trên giả thuyết phải đi đo, đừng để nguyên.** Đã xếp phương án vá code vào nhóm "rủi ro cao" vì lo `name = '/'` có dòng trùng — chạy `COUNT(*)` 10 giây thì thấy **không trùng**, rủi ro thấp hơn hẳn | Mỗi khi viết "nếu X xảy ra thì nguy hiểm" → hỏi ngay **"X có thật không, đo bằng câu nào?"**. Giả thuyết chưa đo mà đem đi ra quyết định thì dễ chọn sai hướng |
+| **Cùng một bảng, đổi cách hỏi thì nhanh gấp 1000 lần.** `parent_id = id` mất 18s, `name = '/'` mất 0.00s — cùng bảng 631k dòng, cùng trả 1 dòng | Nghi query chậm do "bảng to" → thử viết lại điều kiện theo hằng số rồi đo. Bảng to chỉ là điều kiện cần, cách hỏi mới quyết định |
+| **`\G` cũng là ký tự kết thúc câu, `;` thì không thay thế được nó.** Câu dùng `\G` chạy được dù không có `;`; câu dùng bảng ngang mà quên `;` sẽ treo ở prompt `->` | Thấy MySQL hiện `->` thay vì `mysql>` → câu chưa kết thúc, gõ `;` rồi Enter là xong (không cần `^C` chạy lại) |
 | **Bảng dùng chung nghĩa là 1 KB lớn làm chậm mọi KB.** Bảng `file` gộp chung mọi KB của tài khoản → full scan quét hết 631k dòng bất kể upload vào KB nào | Khi thấy query full scan trên bảng dùng chung, đừng chỉ nhìn KB/tenant đang thao tác — nhìn tổng số dòng cả bảng |
 
 ---
@@ -485,6 +626,11 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 - [ ] `TRUNCATE mysql.slow_log` sau khi debug xong để giải phóng dung lượng ❓ cân nhắc thời điểm
 - [ ] Đo `SELECT COUNT(*) FROM file` để biết chính xác kích thước bảng (hiện chỉ suy từ
       `rows_examined` = 631,585)
+- [x] ~~Xác nhận root folder `/` và `.knowledgebase` có tồn tại, có bị trùng không~~ → ✅ **Xong
+      10/08 (mục 3.5)**: cả 2 tồn tại, nối đúng cây, **mỗi cái đúng 1 dòng, không trùng**.
+      `name = '/'` chạy **0.00s** vs `parent_id = id` **18s** → chốt được phương án (d)
+- [ ] Chạy `SHOW INDEX FROM file` để biết tên index đang phục vụ cột `name` (hiện chỉ suy ra từ
+      thời gian 0.00s, chưa xem trực tiếp) ❓
 
 ### Ngắn hạn
 
