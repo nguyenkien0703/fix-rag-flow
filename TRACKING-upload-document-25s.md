@@ -572,6 +572,13 @@ ro của phương án (d) thấp hơn hẳn so với đánh giá ban đầu:
 - Không thêm dòng mới, không đụng indent Python (khác phương án (b) cache — cần thêm biến/decorator)
 - ✅ Vẫn nên **test ở non-prod trước**: rủi ro giảm ≠ rủi ro bằng 0
 
+✅ **Đã sửa vào chart 10/08** — Kiên chốt làm (d) trước, **bỏ qua (a)** vì sau patch mỗi lần chỉ
+còn ~0.00s nên gọi 2 lần cũng không đáng kể.
+
+➡️ **Chi tiết triển khai + các bước apply: xem `PLAN-apply-patch-get-root-folder.md`**
+(gồm: vì sao chọn `initContainer` thay `postStart`, cơ chế `codePatch`, 6 bước deploy có lệnh
++ giải nghĩa cờ, cách rollback). Chart đã sửa xong, **chưa deploy**.
+
 **Rủi ro còn lại của (d)** — cần ghi rõ, không được bỏ qua:
 
 | Rủi ro | Mức | Ghi chú |

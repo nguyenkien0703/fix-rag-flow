@@ -202,6 +202,36 @@ ragflow:
         expr: 's/{"original_query": original_query}/{"minimum_should_match": min_match, "original_query": original_query}/'
         verify: 'minimum_should_match'
 
+      # --- Issue U1 hotfix (10/08/2026): get_root_folder() full-scan bang `file` ---
+      # Xem chi tiet + so lieu do thuc te: TRACKING-upload-document-25s.md
+      #
+      # VAN DE: get_root_folder() tim thu muc goc bang `parent_id == id` - so 2 COT
+      # cua CUNG 1 DONG. MySQL khong dung duoc index cho kieu so sanh nay, buoc phai
+      # quet sach bang `file` (631.585 dong) => 18 giay MOI LAN CHAY.
+      # Ham nay chay 2 lan cho MOI file upload (upload_document goi 1 lan,
+      # get_kb_folder goi lai 1 lan nua) => ~36s chi rieng phan tim thu muc goc.
+      # Slow log: 783.945 lan chay, tich luy 838 gio 59 phut - nguon tai lon nhat he thong.
+      #
+      # CACH SUA: doi sang tim bang `name == "/"` - so cot voi HANG SO, dung duoc index.
+      # Da do thuc te tren production node06 (10/08, muc 3.5 file TRACKING):
+      #   parent_id = id  -> 18.02 giay
+      #   name = '/'      ->  0.00 giay   (nhanh hon >1000 lan)
+      #
+      # DA KIEM CHUNG TRUOC KHI AP DUNG:
+      #   1. `name = '/'` tra ve DUNG 1 dong (COUNT(*) = 1) - khong co ban ghi trung,
+      #      nen ket qua TUONG DUONG voi ban goc. Da chay tren production.
+      #   2. Chuoi can thay xuat hien DUNG 1 lan trong file => sed khong sua nham cho khac.
+      #   3. Chuoi verify `cls.model.name == "/"` CHUA ton tai trong file goc (grep = 0)
+      #      => neu sed truot, grep se fail that su. Neu chon chuoi da co san thi
+      #      verify luon pass va tro thanh vo dung.
+      #   4. Da chay `python3 -m ast` tren ban da patch => cu phap Python hop le.
+      #
+      # LUU Y: dung dau phan cach `|` thay vi `/` vi chuoi thay the co chua "/".
+      # Ban chat khong doi: van la "tim thu muc goc cua tenant", chi doi cach nhan dien.
+      - file: api/db/services/file_service.py
+        expr: 's|(cls.model.parent_id == cls.model.id)|(cls.model.name == "/")|'
+        verify: 'cls.model.name == "/"'
+
       # Code that la timeout="600s" (co nhay kep + chu 's'), KHONG phai timeout=600.
       # Pattern cu 's/timeout=600/timeout=30/g' KHONG BAO GIO KHOP - da verify tren
       # pod that ngay 2026-07-29.
