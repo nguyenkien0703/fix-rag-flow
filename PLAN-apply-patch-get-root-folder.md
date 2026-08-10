@@ -175,14 +175,62 @@ kể cả khi `sed` trượt → lớp an toàn thành vô dụng. Chart đã d�
 
 ## 4. Các bước triển khai
 
-### Bước 1 — Xem lại diff trước khi apply (node04)
+> 📌 **Ghi chú thực thi** (10/08): Kiên đã báo khách hàng về downtime, bắt đầu chạy từ Bước 0.
+> Release name: `ragflow`, namespace `ragflow`, revision hiện tại **62** (từ đợt migrate MySQL).
+> Mọi lệnh `kubectl`/`helm` chạy trên **node04**.
+
+### Bước 0 — Ghi lại hiện trạng để đối chiếu và để rollback (node04)
+
+⭐ Bước này **quan trọng nhất cho việc rollback** — phải biết đang ở revision nào trước khi đổi.
 
 ```
-git -C /path/to/repo diff helm_ragflow_v0.26.4/values.yaml
+helm list -n ragflow
 ```
 
-Kỳ vọng: chỉ thêm 1 block patch mới + comment, **không đụng** gì khác (đặc biệt không đụng
-`nodeSelector` của mysql/minio/redis).
+| Thành phần | Ý nghĩa |
+|---|---|
+| `helm list` | Liệt kê các release đang cài |
+| `-n ragflow` | Namespace `ragflow` |
+
+Kỳ vọng: thấy release `ragflow`, cột `REVISION` = **62** (nếu khác thì ghi lại số thật).
+
+Xem 3 pod ragflow hiện tại (để lát nữa đối chiếu pod nào là mới):
+
+```
+kubectl -n ragflow get pod -l app.kubernetes.io/component=ragflow -o wide
+```
+
+| Cờ | Ý nghĩa |
+|---|---|
+| `-l app.kubernetes.io/component=ragflow` | Lọc đúng pod ragflow (theo label chart đặt), bỏ qua mysql/minio/redis |
+| `-o wide` | Hiện thêm cột IP + NODE — biết pod đang nằm trên node nào |
+
+Kỳ vọng: **3 pod** `Running`, ghi lại tên pod và `AGE`.
+
+### Bước 1 — Xem lại diff trước khi apply (máy local, KHÔNG phải node04)
+
+⚠️ Lệnh này chạy ở **máy local** nơi có git repo, không phải node04:
+
+```
+git diff helm_ragflow_v0.26.4/values.yaml
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `git diff <file>` | Xem thay đổi **chưa commit** của file đó |
+
+✅ **Đã chạy 10/08**: diff sạch, chỉ **thêm 30 dòng** (block patch + comment), không sửa/xoá dòng
+nào, **không đụng** `nodeSelector` của mysql/minio/redis. Đã commit `ad6235d`.
+
+⚠️ **Lưu ý về đồng bộ file**: chart trên node04 phải có **đúng block patch mới** này. Nếu node04
+lấy chart từ nơi khác (không phải repo git này), cần kiểm tra trước khi upgrade:
+
+```
+grep -n "file_service.py" <đường-dẫn-chart-trên-node04>/values.yaml
+```
+
+Kỳ vọng: ra 1 dòng `- file: api/db/services/file_service.py`. **Không ra dòng nào = chart trên
+node04 chưa có patch**, upgrade sẽ không có tác dụng gì.
 
 ### Bước 2 — Ghi lại thời gian upload TRƯỚC khi patch (để đối chiếu)
 
@@ -203,15 +251,20 @@ nên setting này vẫn giữ. Nhưng nếu pod mysql restart thì phải bật 
 
 ### Bước 3 — Apply chart (node04)
 
+Chạy **từ trong thư mục chart** trên node04 (giống hệt đợt migrate MySQL đã làm):
+
 ```
-helm upgrade ragflow /path/to/helm_ragflow_v0.26.4 -n ragflow -f /path/to/helm_ragflow_v0.26.4/values.yaml
+helm upgrade ragflow . -n ragflow -f values.yaml
 ```
 
-| Cờ | Ý nghĩa |
+| Thành phần | Ý nghĩa |
 |---|---|
-| `upgrade ragflow` | Nâng cấp release tên `ragflow` (không tạo mới) |
-| `-n ragflow` | Namespace |
-| `-f <file>` | Chỉ định values.yaml dùng cho lần upgrade này |
+| `upgrade ragflow` | Nâng cấp release tên `ragflow` — **không** tạo release mới |
+| `.` | Đường dẫn chart = thư mục hiện tại (phải đang đứng trong `helm_ragflow_v0.26.4/`) |
+| `-n ragflow` | Namespace `ragflow` |
+| `-f values.yaml` | Dùng file values này. **Bắt buộc có** — thiếu thì Helm dùng values mặc định của chart, mất hết cấu hình production |
+
+Kỳ vọng output: `Release "ragflow" has been upgraded. Happy Helming!` và `REVISION: 63`.
 
 ### Bước 4 — Theo dõi initContainer chạy (node04)
 
@@ -306,8 +359,23 @@ chunk 6s, Check tồn tại 6s) chưa được trace, là việc riêng.
 
 Nhanh, không mất dữ liệu, vì image gốc không bị sửa:
 
+**Cách 0 — nhanh nhất, quay về revision cũ** (node04):
+
+```
+helm rollback ragflow 62 -n ragflow
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `rollback ragflow` | Quay release `ragflow` về một revision trước đó |
+| `62` | Số revision muốn quay về — **là revision trước khi apply patch** (ghi ở Bước 0). Nếu bỏ trống sẽ về revision liền trước |
+| `-n ragflow` | Namespace |
+
+Ưu điểm: một lệnh, không cần sửa file. Dùng khi cần gỡ gấp.
+
 **Cách 1 — bỏ đúng patch này** (giữ patch `minimum_should_match`): xoá block
 `- file: api/db/services/file_service.py` khỏi `values.yaml` → `helm upgrade` lại.
+Dùng khi muốn giữ các thay đổi khác trong values, chỉ gỡ riêng patch này.
 
 **Cách 2 — tắt toàn bộ cơ chế patch**: `codePatch.enabled: false` → `helm upgrade`.
 ⚠️ Cách này bỏ luôn patch `minimum_should_match` đang chạy — chỉ dùng khi nghi ngờ chính cơ chế.
