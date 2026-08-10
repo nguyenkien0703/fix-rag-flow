@@ -623,7 +623,7 @@ còn ~0.00s nên gọi 2 lần cũng không đáng kể.
 | Nợ | Nguồn | Rủi ro nếu bỏ quên |
 |---|---|---|
 | `slow_query_log` bật bằng `SET GLOBAL`, mất khi pod restart | Mục 3.1 phiên này (đã mất 2 lần trước đó) | Restart pod → mù quan sát trở lại, phải bật lại thủ công mỗi lần cần debug |
-| Bảng `mysql.slow_log` đang tích luỹ rất lớn (783,945 dòng chỉ riêng 1 loại query) | Hệ quả của việc bật log ngưỡng 0.1s | Chiếm dung lượng MySQL; nên `TRUNCATE mysql.slow_log` sau khi debug xong ❓ chưa làm |
+| ~~Bảng `mysql.slow_log` tích luỹ rất lớn (783,945 dòng chỉ riêng 1 loại query)~~ | ~~Hệ quả của việc bật log ngưỡng 0.1s~~ | ✅ **Đã xử lý 10/08** — `TRUNCATE mysql.slow_log` → `Query OK, 0 rows affected (0.50 sec)`. Bảng đã quá lớn tới mức chính câu query đo mất **161s cho 2 lần chạy** |
 | ~~Source code tra cứu là `0.24.0`, production chạy `0.26.4`~~ | ~~Repo chỉ có sẵn bản 0.24.0~~ | ✅ **Đã xử lý 10/08** — clone bản v0.26.4 về đối chiếu, code `get_root_folder()` giống hệt, kết luận vẫn đúng |
 | Source v0.26.4 hiện nằm ở `/Users/macboook/.claude/jobs/feb3bf0f/tmp/ragflow-0.26.4/` (thư mục tạm của job) | Clone 10/08 để đối chiếu | Thư mục tạm có thể bị dọn khi job kết thúc → lần sau cần tra lại phải clone lại. Cân nhắc copy vào repo nếu còn dùng nhiều |
 
@@ -638,7 +638,9 @@ còn ~0.00s nên gọi 2 lần cũng không đáng kể.
       chỉ gây **2** lần full scan; câu thứ 3 đến từ request khác chạy song song
 - [x] ~~Xác minh hàm `get_root_folder()` ở version 0.26.4 có giống 0.24.0 không~~ → ✅ **Xong
       10/08**: giống hệt, kết luận root cause áp dụng đúng cho production
-- [ ] `TRUNCATE mysql.slow_log` sau khi debug xong để giải phóng dung lượng ❓ cân nhắc thời điểm
+- [x] ~~`TRUNCATE mysql.slow_log` sau khi debug xong để giải phóng dung lượng~~ → ✅ **Xong 10/08**:
+      `Query OK, 0 rows affected (0.50 sec)`. Lưu ý `0 rows affected` là bình thường với
+      `TRUNCATE` (drop/recreate bảng, không đếm từng dòng), **không phải** "không xoá được gì"
 - [ ] Đo `SELECT COUNT(*) FROM file` để biết chính xác kích thước bảng (hiện chỉ suy từ
       `rows_examined` = 631,585)
 - [x] ~~Xác nhận root folder `/` và `.knowledgebase` có tồn tại, có bị trùng không~~ → ✅ **Xong
@@ -649,6 +651,18 @@ còn ~0.00s nên gọi 2 lần cũng không đáng kể.
 
 ### Ngắn hạn
 
+> 🎯 **PHẠM VI ƯU TIÊN — Kiên chốt 10/08.** Chỉ tập trung **2 API**:
+>
+> | # | API | Trạng thái |
+> |---|---|---|
+> | 1 | **Upload document vào 1 KB** | ✅ **XONG 10/08** — Issue U1 đã fix, xem `PLAN-apply-patch-get-root-folder.md` |
+> | 2 | **Retrieval** | ✅ Đã xử lý ở đợt trước, không thuộc phạm vi đợt này |
+>
+> ⚠️ **API list document (Issue 7) — CHƯA ƯU TIÊN.** Sau khi fix U1, các query của Issue 7 nổi
+> lên đầu bảng slow log (#2-#6 trong top 8). **Chúng không chậm đi** — chỉ là trước đây bị
+> `get_root_folder` (838 giờ tích luỹ) át hết nên không nhìn thấy. Đường **GHI** (upload) đã
+> nhanh; đường **ĐỌC** (list document) vẫn chậm nhưng để sau.
+
 - [x] ~~Tra xem upstream đã có issue nào cho vấn đề này chưa~~ → 🔶 **Xong 10/08: CHƯA CÓ.**
       Tra GitHub issues (`get_root_folder`, `file table slow query index`) + web search đều không
       ra issue nào đúng vấn đề. Quan trọng hơn: **branch `main` mới nhất vẫn còn nguyên lỗi**
@@ -657,7 +671,8 @@ còn ~0.00s nên gọi 2 lần cũng không đáng kể.
       tiên báo**, nên cần kèm số liệu đầy đủ: 631,585 dòng, 18s/lần, 2 lần/upload, 783,945 lần
       chạy tích luỹ 838h59m
 - [ ] Báo luôn Issue 7 (`get_filter_by_kb_id`) — vẫn còn trong top slow query, cùng nhóm nguyên
-      nhân "code app query không tối ưu"
+      nhân "code app query không tối ưu". ⚠️ **Chưa ưu tiên fix** (xem khung phạm vi ở trên),
+      nhưng vẫn nên báo upstream cùng lúc với U1 vì cùng một lần liên hệ
 - [ ] Trace nốt 4 bước còn lại của flow 55s (LLM tóm tắt 10s, Update metadata 8s, Parse chunk 6s,
       Check tồn tại 6s) — hiện mới xong đúng bước Upload document
 
