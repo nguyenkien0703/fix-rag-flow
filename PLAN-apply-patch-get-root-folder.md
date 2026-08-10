@@ -205,7 +205,38 @@ kubectl -n ragflow get pod -l app.kubernetes.io/component=ragflow -o wide
 | `-l app.kubernetes.io/component=ragflow` | Lọc đúng pod ragflow (theo label chart đặt), bỏ qua mysql/minio/redis |
 | `-o wide` | Hiện thêm cột IP + NODE — biết pod đang nằm trên node nào |
 
-Kỳ vọng: **3 pod** `Running`, ghi lại tên pod và `AGE`.
+**Output thật (10/08, node04):**
+
+```
+NAME     NAMESPACE  REVISION  UPDATED                   STATUS    CHART          APP VERSION
+ragflow  ragflow    62        2026-08-07 11:17:33 +0700 deployed  ragflow-0.1.1  dev
+
+NAME                       READY  STATUS             RESTARTS  AGE    IP              NODE
+ragflow-64745f4649-2ngtz   1/1    Running            0         9d     172.16.83.158   vrp-kubeengine06
+ragflow-6db67c44bd-2c6rm   1/1    Running            0         14h    172.16.78.239   vrp-kubeengine05
+ragflow-6db67c44bd-rvlhw   1/1    Running            0         14h    172.16.78.238   vrp-kubeengine05
+ragflow-6db67c44bd-sqvrl   0/1    Init:ErrImagePull  0         7h19m  172.16.93.54    vrp-kubeengine07
+```
+
+**Đọc được gì:**
+
+- ✅ `REVISION = 62` — đúng như dự đoán, khớp với đợt migrate MySQL
+- 🔴 **4 pod chứ không phải 3** — có **rollout DỞ DANG từ 14h trước, chưa hoàn tất**:
+
+| ReplicaSet | Số pod | Trạng thái |
+|---|---|---|
+| `64745f4649` (**cũ**) | 1 | `Running` 9 ngày — K8s **giữ lại** vì pod mới chưa đủ |
+| `6db67c44bd` (**mới**) | 3 | 2 `Running`, **1 kẹt `Init:ErrImagePull`** |
+
+- 🔴 **`Init:` — lỗi ở initContainer**, mà initContainer duy nhất là `ragflow-code-patch` (dùng
+  cùng image với container chính). Node07 **không có image ragflow**, cluster air-gapped nên
+  không kéo được → đúng kịch bản `ImagePullBackOff` đã gặp hồi migrate MySQL
+- ✅ Đây chính là bằng chứng thực tế cho cơ chế `maxUnavailable = 0` mô tả ở mục 1b: pod mới
+  không `Ready` → K8s **không dám xoá** pod cũ → hệ thống vẫn phục vụ bằng 3 pod `Running`, nên
+  **không ai nhận ra** rollout đã kẹt 14 tiếng
+
+⚠️ **Bài học**: `helm list` báo `STATUS: deployed` nhưng thực tế rollout **chưa xong**. Trạng thái
+release ≠ trạng thái pod. Phải xem `get pod` mới biết.
 
 ### Bước 1 — Xem lại diff trước khi apply (máy local, KHÔNG phải node04)
 
@@ -246,8 +277,51 @@ kubectl -n ragflow exec -it ragflow-mysql-0 -- mysql -uroot -pfini_rag_flow_helm
 | `long_query_time = 0.1` | Ngưỡng 0.1s — thấp, để bắt cả query nhỏ cộng dồn (mặc định 10s sẽ bỏ sót) |
 | `log_output = 'TABLE'` | Ghi vào bảng `mysql.slow_log` để query được bằng SQL, thay vì ghi ra file |
 
-⚠️ `SET GLOBAL` **mất khi pod restart** — mà bước 4 sẽ restart pod ragflow (không phải mysql),
-nên setting này vẫn giữ. Nhưng nếu pod mysql restart thì phải bật lại.
+⚠️ `SET GLOBAL` **mất khi pod MySQL restart**. Lần này upgrade pod **ragflow**, không phải mysql,
+nên setting giữ nguyên.
+
+**Output thật (10/08, node04):**
+
+```
+mysql> SET GLOBAL slow_query_log = 'ON'; SET GLOBAL long_query_time = 0.1; SET GLOBAL log_output = 'TABLE';
+Query OK, 0 rows affected (0.00 sec)
+Query OK, 0 rows affected (0.00 sec)
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> SELECT NOW() AS moc_truoc_khi_upgrade;
++-----------------------+
+| moc_truoc_khi_upgrade |
++-----------------------+
+| 2026-08-10 17:48:27   |
++-----------------------+
+```
+
+**Đọc được gì:**
+- ✅ Cả 3 setting nhận thành công (`Query OK` × 3)
+- ✅ MySQL version `8.0.39`, connection id `39711`
+- ⭐ **Mốc `2026-08-10 17:48:27`** — dùng để lọc slow log sau upgrade. Bảng `mysql.slow_log` đang
+  có 783.945 dòng cũ; không có mốc này thì **không phân biệt được** dòng full-scan mới với dòng cũ
+- 💡 Lấy `NOW()` **của MySQL** chứ không phải giờ máy client — tránh lệch timezone khi so với cột
+  `start_time` của slow log
+
+**Kiểm tra đồng bộ chart trên node04 (đã chạy trước Bước 2):**
+
+```
+grep -n "file_service.py" values.yaml
+grep -n "vrp-kubeengine07" values.yaml
+```
+
+```
+199:      - file: api/db/services/file_service.py
+150:                    - vrp-kubeengine07
+```
+
+**Đọc được gì:** ✅ Chart trên node04 có **cả hai** thay đổi — block patch (dòng 199) và
+`nodeAffinity` chặn node07 (dòng 150). Một lần `helm upgrade` sẽ apply cả hai.
+
+⭐ **Vì sao phải kiểm tra bước này**: values.yaml sửa ở repo git (máy local) và chart dùng để
+upgrade (node04) là **2 nơi khác nhau**. Nếu node04 thiếu block patch, upgrade xong pod vẫn
+`Running`, ta tưởng đã fix — nhưng upload vẫn 25s. Kiểm tra 10 giây rẻ hơn chẩn đoán nhầm.
 
 ### Bước 3 — Apply chart (node04)
 
@@ -265,6 +339,26 @@ helm upgrade ragflow . -n ragflow -f values.yaml
 | `-f values.yaml` | Dùng file values này. **Bắt buộc có** — thiếu thì Helm dùng values mặc định của chart, mất hết cấu hình production |
 
 Kỳ vọng output: `Release "ragflow" has been upgraded. Happy Helming!` và `REVISION: 63`.
+
+**Output thật (10/08 16:50, node04):**
+
+```
+Release "ragflow" has been upgraded. Happy Helming!
+NAME: ragflow
+LAST DEPLOYED: Mon Aug 10 16:50:45 2026
+NAMESPACE: ragflow
+STATUS: deployed
+REVISION: 63
+```
+
+**Đọc được gì:** ✅ Upgrade thành công, revision **62 → 63** đúng kỳ vọng. Không lỗi
+`spec is immutable` (rủi ro đã lường trước với `storageClassName`).
+
+⚠️ **Kiên chạy thêm** `kubectl -n ragflow rollout restart deployment/ragflow` (không có trong
+plan) → `deployment.apps/ragflow restarted`. Lệnh này thêm annotation
+`kubectl.kubernetes.io/restartedAt` vào pod template, **ép tạo thêm 1 ReplicaSet nữa**.
+Không gây hại, nhưng làm output `get pod` rối hơn vì nhiều ReplicaSet chồng nhau.
+Thực tế `helm upgrade` đã đủ để rollout (nhờ annotation `checksum/values`), không cần lệnh này.
 
 ### Bước 4 — Theo dõi initContainer chạy (node04)
 
@@ -289,6 +383,36 @@ Vì là Deployment 3 replicas rolling update, sẽ thấy **nhiều pod cùng l�
 
 ⚠️ Chart **không có readinessProbe** (mục 1b) → pod mới vào `Ready` ngay khi container start, chưa
 chắc app đã sẵn sàng. Nên **đợi thêm ~1-2 phút** sau khi thấy `Running` rồi mới test, đừng test ngay.
+
+**Output thật (10/08, node04):**
+
+```
+NAME                       READY  STATUS                       AGE    IP              NODE
+ragflow-69dcc55b47-7j7p6   0/1    Init:ContainerStatusUnknown  6m27s  172.16.116.229  vrp-kubeengine08
+ragflow-7645557fb6-2cqsl   1/1    Running                      78s    172.16.78.244   vrp-kubeengine05
+ragflow-7645557fb6-spl9c   1/1    Running                      83s    172.16.78.243   vrp-kubeengine05
+ragflow-7645557fb6-zvm5n   1/1    Running                      80s    172.16.83.133   vrp-kubeengine06
+ragflow-minio-0            1/1    Running                      9d     172.16.93.37    vrp-kubeengine07
+ragflow-mysql-0            1/1    Running                      3d5h   172.16.83.213   vrp-kubeengine06
+ragflow-redis-0            1/1    Running                      9d     172.16.93.38    vrp-kubeengine07
+```
+
+**Đọc được gì — 3 xác nhận quan trọng:**
+
+| Xác nhận | Bằng chứng |
+|---|---|
+| ✅ **`sed` khớp pattern** | 3 pod mới **qua được initContainer** → `Running`. Nếu trượt sẽ dừng ở `Init:Error` |
+| ✅ **`nodeAffinity` có tác dụng** | **Không còn pod ragflow nào trên node07**. Pod kẹt `Init:ErrImagePull` 14h đã biến mất. Node07 giờ chỉ còn minio + redis — đúng chủ ý |
+| ✅ **Rollout hoàn tất, ReplicaSet cũ đã dọn** | Cả 3 pod cùng hash `7645557fb6`; không còn `64745f4649` (9d) hay `6db67c44bd` (14h) |
+
+⚠️ **Pod lỗi `Init:ContainerStatusUnknown` trên node08** — Kiên quyết định bỏ qua. Ghi rõ để
+không hiểu nhầm về sau:
+- Đây **không phải** `Init:Error` → **không phải bằng chứng patch trượt** (patch đã được chứng
+  minh OK qua 3 pod `Running` kia)
+- Không chiếm slot replica — Deployment đã đủ 3 pod `Running`
+- Thuộc ReplicaSet `69dcc55b47` (sinh ra do lệnh `rollout restart` thừa), dọn sau bằng
+  `kubectl -n ragflow delete pod ragflow-69dcc55b47-7j7p6` — không gấp
+- ❓ Chưa điều tra nguyên nhân gốc trên node08
 
 ### Bước 4b — Nếu Init:Error, đọc log initContainer (node04)
 
@@ -322,6 +446,26 @@ kubectl -n ragflow exec -it <tên-pod> -c ragflow -- grep -c "cls.model.parent_i
 ```
 
 Kỳ vọng: **0**.
+
+**Output thật (10/08, node04, pod `ragflow-7645557fb6-2cqsl`):**
+
+```
+$ kubectl -n ragflow exec -it ragflow-7645557fb6-2cqsl -c ragflow -- grep -n 'cls.model.name == "/"' /ragflow/api/db/services/file_service.py
+244:        for file in cls.model.select().where((cls.model.tenant_id == tenant_id), (cls.model.name == "/")):
+
+$ kubectl -n ragflow exec -it ragflow-7645557fb6-2cqsl -c ragflow -- grep -c "cls.model.parent_id == cls.model.id" /ragflow/api/db/services/file_service.py
+0
+command terminated with exit code 1
+```
+
+**Đọc được gì:**
+- ✅ **Chuỗi mới có mặt tại đúng dòng 244** — khớp chính xác vị trí đã đối chiếu trên source v0.26.4
+- ✅ **Chuỗi cũ = 0** — đã biến mất hoàn toàn, `sed` thay chứ không phải thêm
+- 💡 `command terminated with exit code 1` là **hành vi bình thường của `grep`** khi không tìm
+  thấy dòng nào (grep coi "không khớp" là exit 1). Con số `0` in ra mới là kết quả — đây chính
+  là điều mong muốn, **không phải lỗi**
+
+➡️ **Patch đã thật sự vào code đang chạy**, không chỉ nằm trong values.yaml.
 
 ### Bước 6 — Đo kết quả thật: upload 1 file qua UI
 
