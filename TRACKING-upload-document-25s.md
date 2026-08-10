@@ -25,7 +25,7 @@ Tìm root cause và hướng xử lý cho bước "Upload document 25s" trong fe
 | Hạng mục | Giá trị | Nguồn |
 |---|---|---|
 | MySQL | `ragflow-mysql-0`, node06 (`vrp-kubeengine06`) | đã migrate 07/08 |
-| Source code tra cứu | `ragflow-0.24.0/` (có sẵn trong repo) | ⚠️ production chạy chart `v0.26.4` — chưa xác minh code có đổi giữa 2 version |
+| Source code tra cứu | `ragflow-0.26.4/` — ✅ **đúng version production**, đã clone và đối chiếu 10/08 | `git clone --depth 1 --branch v0.26.4 https://github.com/infiniflow/ragflow.git` |
 | Bảng `file` | ~631,585 dòng (theo `rows_examined` của full scan) | slow log 10/08 |
 | Bảng `document` | ~395,137 dòng | `COUNT(*)` đo 07/08 |
 
@@ -179,9 +179,126 @@ không so được cột với cột. Hệ quả: MySQL buộc phải đọc t�
 rồi tự kiểm tra `parent_id == id` trên mỗi dòng → full table scan, không có cách nào tránh được
 bằng đánh index.
 
+---
+
+#### 📖 Giải thích dễ hiểu — câu SQL này đang tìm cái gì?
+
+*(Ghi lại theo yêu cầu của Kiên 10/08 — phần Root cause ở trên dùng thuật ngữ, phần này giải
+thích lại từ đầu cho dễ đọc lại sau này)*
+
+**Bảng `file` lưu cây thư mục.** Mỗi dòng có 2 cột quan trọng: `id` (mã của chính nó) và
+`parent_id` (mã thư mục cha chứa nó).
+
+Cây thư mục thực tế của 1 tài khoản RagFlow:
+
+```
+/                          ← root folder      - 1 cái duy nhất cho cả tài khoản
+└── .knowledgebase/        ← kb_root folder   - 1 cái duy nhất, chứa mọi KB
+    ├── Voffice-doc-sum/   ← kb folder        - mỗi KB một thư mục
+    ├── KB-2/
+    └── ... (các KB khác)
+```
+
+Lưu trong bảng `file` thành:
+
+| id | name | parent_id | Ý nghĩa |
+|---|---|---|---|
+| `AAA` | `/` | **`AAA`** | Thư mục gốc — **cha của nó chính là nó** |
+| `BBB` | `.knowledgebase` | `AAA` | Cha là `/` |
+| `CCC` | `Voffice-doc-sum` | `BBB` | Cha là `.knowledgebase` |
+| `DDD` | `file1.txt` | `CCC` | Cha là `Voffice-doc-sum` |
+
+**Vì sao thư mục gốc có `parent_id = id`?** Vì nó không có cha (đã trên cùng rồi), nhưng cột
+`parent_id` bắt buộc phải điền gì đó — nên code cho nó **trỏ về chính nó**:
+
+```python
+file_id = get_uuid()          # sinh mã mới, ví dụ "AAA"
+file = {
+    "id": file_id,            # id        = "AAA"
+    "parent_id": file_id,     # parent_id = "AAA"  ← cùng giá trị!
+    "name": "/",
+}
+```
+
+**Vậy câu SQL đang tìm gì?**
+
+```sql
+WHERE (tenant_id = '22cdb01e...')     ← của tài khoản này
+  AND (parent_id = id)                ← dòng nào có "cha = chính nó"
+```
+
+Dịch sang tiếng Việt: **"Tìm thư mục gốc `/` của tài khoản này"** — chỉ trả về đúng **1 dòng**.
+
+**Vì sao chậm?**
+
+| Loại điều kiện | MySQL làm gì | Tốc độ |
+|---|---|---|
+| `WHERE name = '/'` (so với **giá trị cố định**) | Tra "mục lục" (index) — giống tra từ điển, lật thẳng tới vần cần tìm, không đọc cả quyển | Nhanh |
+| `WHERE parent_id = id` (so **2 cột với nhau**) | Không có "mục lục" nào sắp xếp theo "dòng có 2 cột bằng nhau" — vì giá trị cần tìm **đổi theo từng dòng** (dòng `AAA` so với `AAA`, dòng `BBB` so với `BBB`...). Buộc phải **đọc từng dòng** trong 631,585 dòng | **18 giây** |
+
+Ví von: thay vì tra mục lục, phải **lật từng trang trong 631,585 trang** để tìm đúng 1 trang có
+"số ghi ở đầu bằng số ghi ở cuối" → mất 18 giây chỉ để lấy về **1 dòng**.
+
+**Vì sao đánh index không cứu được?** Index chỉ giúp khi biết trước **giá trị cụ thể** cần tìm.
+`parent_id = id` không có giá trị cụ thể nào — nó là quan hệ giữa 2 cột, index không mô tả được
+kiểu này. Đây là khác biệt căn bản với Issue 1 của `TRACKING-mysql-load-assessment.md` — Issue 1
+fix được bằng index vì điều kiện là `kb_id = '<giá trị cụ thể>'`.
+
+---
+
+#### ❓ Giải đáp — lần nào upload cũng full scan? Root folder khác KB folder thế nào?
+
+*(Câu hỏi của Kiên 10/08, đã xác minh trực tiếp trên code v0.26.4 — đúng version production)*
+
+**1. Có, lần nào cũng chạy — và 2 lần mỗi lượt upload.**
+
+4 dòng đầu của `upload_document()` chạy mỗi lần gọi hàm, không cache, không điều kiện bỏ qua
+(`ragflow-0.26.4/api/db/services/file_service.py:515-519`):
+
+```python
+root_folder = self.get_root_folder(user_id)        # ← full scan lần 1
+pf_id = root_folder["id"]
+self.init_knowledgebase_docs(pf_id, user_id)       # (không full scan — nhận root_id truyền sẵn)
+kb_root_folder = self.get_kb_folder(user_id)       # ← bên trong gọi lại get_root_folder = full scan lần 2
+kb_folder = self.new_a_file_from_kb(kb.tenant_id, kb.name, kb_root_folder["id"])
+```
+
+**2. Root folder và KB folder là 3 tầng thư mục KHÁC NHAU** (hay bị nhầm là một):
+
+| Thư mục | Hàm lấy | Điều kiện `WHERE` | Có full scan? |
+|---|---|---|---|
+| `/` (root folder) | `get_root_folder()` | `parent_id = id` — **so 2 cột** | 🔴 **CÓ** — 18s |
+| `.knowledgebase` (kb_root folder) | `get_kb_folder()` | `parent_id = '<id của root>'` — giá trị cụ thể | ✅ Không, dùng được index |
+| `<tên KB>` (kb folder) | `new_a_file_from_kb()` | `parent_id = '<id kb_root>'` + `name = '<tên KB>'` | ✅ Không |
+
+⚠️ Nhưng `get_kb_folder()` **gọi lại `get_root_folder()` ngay dòng đầu** (dòng 269) → vẫn dính
+full scan lần 2, dù bản thân query tìm `.knowledgebase` là nhanh.
+
+**3. Số lượng KB KHÔNG ảnh hưởng — tổng số file trong tài khoản mới ảnh hưởng.**
+
+Full scan quét **toàn bộ bảng `file`** (631,585 dòng, gộp chung mọi KB), không quét riêng KB nào.
+Hệ quả thực tế trên tài khoản đang dùng (6 KB, trong đó `Voffice-doc-sum` chiếm ~394k document):
+
+- Upload vào KB **nhỏ nhất** (chỉ vài file) **vẫn mất đúng 18 giây** — vì vẫn phải lật hết 631,585 dòng
+- KB `Voffice-doc-sum` làm bảng `file` phình to → **làm chậm luôn cả 5 KB còn lại**
+- Bảng `file` càng lớn → càng chậm tuyến tính, không phụ thuộc KB đích là cái nào
+
+**4. Chỉ có 2 lần/upload, không phải 3** (đã tra hết mọi nơi gọi `get_root_folder` trong v0.26.4):
+
+| Vị trí | Có trong flow upload? |
+|---|---|
+| `file_service.py:515` — `upload_document()` gọi trực tiếp | ✅ Lần 1 |
+| `file_service.py:269` — `get_kb_folder()` gọi lại | ✅ Lần 2 |
+| `file_service.py:678` — `delete_docs()` | ❌ Không — thuộc flow xoá document |
+
+→ Câu thứ 3 bắt được trong slow log lúc 12:29:08 đến từ **request khác chạy song song** (UI đang
+mở, hoặc upload nhiều file cùng lúc), không phải từ cùng 1 lần gọi `upload_document`.
+
+---
+
 **Bằng chứng — nguồn code**
 
-`ragflow-0.24.0/api/db/services/file_service.py` dòng 222-231:
+`ragflow-0.26.4/api/db/services/file_service.py` dòng 237-246 (**đúng version production**):
 
 ```python
 @classmethod
@@ -196,7 +313,7 @@ def get_root_folder(cls, tenant_id):
     ...
 ```
 
-**Tệ hơn: chạy ≥2 lần mỗi upload.** `get_kb_folder()` (dòng 249-261) gọi lại `get_root_folder()`:
+**Tệ hơn: chạy đúng 2 lần mỗi upload.** `get_kb_folder()` (dòng 262-274) gọi lại `get_root_folder()`:
 
 ```python
 def get_kb_folder(cls, tenant_id):
@@ -205,19 +322,24 @@ def get_kb_folder(cls, tenant_id):
     ...
 ```
 
-Và `upload_document()` (dòng 431-435) gọi cả hai:
+Và `upload_document()` (dòng 513-519) gọi cả hai:
 
 ```python
-def upload_document(self, kb, file_objs, user_id, src="local", parent_path=None):
-    root_folder = self.get_root_folder(user_id)      # lần 1  (dòng 432)
+def upload_document(self, kb, file_objs, user_id, src="local", parent_path=None, parser_config_override=None):
+    root_folder = self.get_root_folder(user_id)      # lần 1  (dòng 515)
     pf_id = root_folder["id"]
-    self.init_knowledgebase_docs(pf_id, user_id)     # (cần tra thêm — có thể gọi tiếp)
-    kb_root_folder = self.get_kb_folder(user_id)     # lần 2, bên trong lại gọi get_root_folder (dòng 435)
+    self.init_knowledgebase_docs(pf_id, user_id)     # KHÔNG gọi get_root_folder (nhận root_id truyền sẵn)
+    kb_root_folder = self.get_kb_folder(user_id)     # lần 2, bên trong lại gọi get_root_folder (dòng 518)
 ```
 
-→ Khớp chính xác với việc slow log bắt được **3 câu cùng lúc 12:29:08** (không phải 1) — nghĩa là
-thực tế còn nhiều hơn 2 lần. ❓ **Chưa xác minh**: `init_knowledgebase_docs()` (dòng 294) có gọi
-tiếp `get_root_folder` hay không — chưa đọc hàm này, cần đọc để giải thích đủ 3 lần.
+✅ **Đã xác minh (10/08, trên code v0.26.4)**: `init_knowledgebase_docs()` (dòng 360) **không**
+gọi `get_root_folder` — nó nhận `root_id` truyền sẵn làm tham số, chỉ query theo giá trị cụ thể.
+Tra toàn bộ nơi gọi `get_root_folder` trong v0.26.4 cho ra đúng 3 vị trí: dòng 515
+(`upload_document`), dòng 269 (`get_kb_folder`), dòng 678 (`delete_docs` — **không** thuộc flow
+upload).
+
+→ Vậy 1 lần upload gây **2 lần** full scan (~36s nếu mỗi lần 18s). Câu thứ 3 bắt được trong slow
+log lúc 12:29:08 đến từ **request khác chạy song song**, không phải từ cùng 1 lần `upload_document`.
 
 **Bằng chứng — quy mô tích luỹ**
 
@@ -254,9 +376,11 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 2. **Cache kết quả `get_root_folder(tenant_id)`** — root folder của 1 tenant gần như không đổi,
    không cần query lại mỗi lần upload. Đây là fix rẻ nhất về mặt schema.
 3. **Bỏ lời gọi trùng lặp** — `get_kb_folder()` đã gọi `get_root_folder()` bên trong, nhưng
-   `upload_document()` vẫn gọi riêng thêm 1 lần ở dòng 432 → truyền kết quả xuống thay vì gọi lại.
-4. ❓ **Cần xác minh trước khi đề xuất**: hàm này có đổi ở version 0.26.4 (production) so với
-   0.24.0 (bản đọc được) hay không.
+   `upload_document()` vẫn gọi riêng thêm 1 lần ở dòng 515 → truyền kết quả xuống thay vì gọi lại.
+   Riêng cách này **giảm được một nửa** (2 lần → 1 lần) mà không đụng schema.
+4. ✅ **Đã xác minh (10/08)**: hàm `get_root_folder()` ở v0.26.4 (production) **giống hệt** bản
+   0.24.0 — cùng dòng `where((tenant_id == tenant_id), (parent_id == cls.model.id))`. Kết luận
+   root cause áp dụng đúng cho production, không cần dè dặt vì lệch version nữa.
 
 ---
 
@@ -270,6 +394,9 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 | **Đọc slow log phải gom nhóm, không đọc từng dòng.** `GROUP BY` + `SUM(query_time)` lộ ra thủ phạm 783,945 lần/838 giờ mà đọc 20 dòng gần nhất không thấy được quy mô | Luôn chạy query gom nhóm **trước**, rồi mới soi chi tiết dòng cụ thể |
 | **Câu SQL dài làm tràn màn hình VDI.** `DELETE ... NOT IN (nghìn id)` khiến output không đọc nổi | Dùng `LEFT(CONVERT(sql_text USING utf8), 80)` để liệt kê, `\G` khi cần đọc full 1 câu |
 | **Một lời gọi hàm trong code có thể thành nhiều query.** `get_kb_folder()` gọi lại `get_root_folder()` → 1 dòng code thành 2 lần full scan | Khi thấy query lặp bất thường trong slow log, tra ngược xem hàm nào gọi hàm nào |
+| **Số lần query trong slow log ≠ số lần 1 request gọi.** Ban đầu thấy 3 câu cùng lúc → tưởng 1 lần upload gọi 3 lần. Tra code mới biết chỉ 2 lần, câu thứ 3 từ request song song khác | Đếm số lời gọi bằng cách `grep` toàn bộ codebase (`grep -rn "get_root_folder"`), đừng suy từ số dòng trong slow log |
+| **Tra code phải đúng version đang chạy production.** Repo có sẵn 0.24.0 nhưng production chạy 0.26.4 — may là code giống nhau, nhưng nếu khác thì kết luận sai hoàn toàn | `git clone --depth 1 --branch <tag>` bản đúng version rồi đối chiếu, trước khi báo dev |
+| **Bảng dùng chung nghĩa là 1 KB lớn làm chậm mọi KB.** Bảng `file` gộp chung mọi KB của tài khoản → full scan quét hết 631k dòng bất kể upload vào KB nào | Khi thấy query full scan trên bảng dùng chung, đừng chỉ nhìn KB/tenant đang thao tác — nhìn tổng số dòng cả bảng |
 
 ---
 
@@ -279,7 +406,8 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 |---|---|---|
 | `slow_query_log` bật bằng `SET GLOBAL`, mất khi pod restart | Mục 3.1 phiên này (đã mất 2 lần trước đó) | Restart pod → mù quan sát trở lại, phải bật lại thủ công mỗi lần cần debug |
 | Bảng `mysql.slow_log` đang tích luỹ rất lớn (783,945 dòng chỉ riêng 1 loại query) | Hệ quả của việc bật log ngưỡng 0.1s | Chiếm dung lượng MySQL; nên `TRUNCATE mysql.slow_log` sau khi debug xong ❓ chưa làm |
-| Source code tra cứu là `0.24.0`, production chạy `0.26.4` | Repo chỉ có sẵn bản 0.24.0 | Kết luận có thể lệch nếu code đã đổi giữa 2 version — cần xác minh trước khi báo dev |
+| ~~Source code tra cứu là `0.24.0`, production chạy `0.26.4`~~ | ~~Repo chỉ có sẵn bản 0.24.0~~ | ✅ **Đã xử lý 10/08** — clone bản v0.26.4 về đối chiếu, code `get_root_folder()` giống hệt, kết luận vẫn đúng |
+| Source v0.26.4 hiện nằm ở `/Users/macboook/.claude/jobs/feb3bf0f/tmp/ragflow-0.26.4/` (thư mục tạm của job) | Clone 10/08 để đối chiếu | Thư mục tạm có thể bị dọn khi job kết thúc → lần sau cần tra lại phải clone lại. Cân nhắc copy vào repo nếu còn dùng nhiều |
 
 ---
 
@@ -287,9 +415,11 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 
 ### Ngay lập tức (không cần downtime)
 
-- [ ] Đọc `init_knowledgebase_docs()` (`file_service.py:294`) để giải thích đủ vì sao có **3** câu
-      full scan trong 1 lần upload, không phải 2
-- [ ] Xác minh hàm `get_root_folder()` ở version 0.26.4 (production) có giống 0.24.0 không
+- [x] ~~Đọc `init_knowledgebase_docs()` để giải thích vì sao có 3 câu full scan~~ → ✅ **Xong
+      10/08**: hàm này **không** gọi `get_root_folder` (nhận `root_id` truyền sẵn). 1 lần upload
+      chỉ gây **2** lần full scan; câu thứ 3 đến từ request khác chạy song song
+- [x] ~~Xác minh hàm `get_root_folder()` ở version 0.26.4 có giống 0.24.0 không~~ → ✅ **Xong
+      10/08**: giống hệt, kết luận root cause áp dụng đúng cho production
 - [ ] `TRUNCATE mysql.slow_log` sau khi debug xong để giải phóng dung lượng ❓ cân nhắc thời điểm
 - [ ] Đo `SELECT COUNT(*) FROM file` để biết chính xác kích thước bảng (hiện chỉ suy từ
       `rows_examined` = 631,585)
@@ -316,5 +446,5 @@ Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả t
 |---|---|---|
 | Đối tác tiếp tục đẩy dữ liệu → bảng `file` lớn thêm → full scan càng chậm tuyến tính | 🔴 Cao | Chưa có cách giảm thiểu ở tầng hạ tầng; phụ thuộc hoàn toàn vào việc đội dev sửa code |
 | Query 838 giờ tích luỹ vẫn đang chạy liên tục, chiếm CPU MySQL ảnh hưởng query khác | 🔴 Cao | Đã migrate sang node06 (CPU rảnh hơn) nên chịu tải tốt hơn, nhưng không giải quyết gốc |
-| Kết luận dựa trên code 0.24.0 có thể không đúng với 0.26.4 đang chạy | 🟡 TB | Xác minh trước khi báo dev (đã đưa vào Việc tiếp theo) |
+| ~~Kết luận dựa trên code 0.24.0 có thể không đúng với 0.26.4 đang chạy~~ | ✅ Đã loại bỏ | Đã clone v0.26.4 đối chiếu 10/08 — code giống hệt, không còn rủi ro này |
 | Bảng `mysql.slow_log` phình to do log ngưỡng 0.1s | 🟢 Thấp | Tắt slow log hoặc truncate sau khi debug xong |
