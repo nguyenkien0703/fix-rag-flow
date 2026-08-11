@@ -683,6 +683,170 @@ gọi**. Phải đo trước khi quyết định sửa.
 
 ---
 
+## 4c. Luồng XOÁ tài liệu — sếp hỏi có dính cùng lỗi không (11/08)
+
+> 🗣️ **Sếp (Nguyễn Chí Đông)**: *"Nhiều khả năng cái logic xóa 1 tài liệu nó cũng query mysql
+> giống cái logic đẩy dữ liệu vào, anh vừa xóa 1 cái lâu lắm Kiên ạ, nếu mà nó cùng như thế thì
+> tiện đợt tới sửa em sửa luôn giúp anh nhé"*
+
+### ✅ Sếp đoán ĐÚNG — nhưng patch hôm qua đã fix luôn rồi
+
+`file_service.py:677-680` — `delete_docs()` mở đầu **giống hệt** `upload_document()`:
+
+```python
+def delete_docs(cls, doc_ids, tenant_id):
+    root_folder = FileService.get_root_folder(tenant_id)      # ← CÙNG hàm đã patch
+    pf_id = root_folder["id"]
+    FileService.init_knowledgebase_docs(pf_id, tenant_id)
+```
+
+⭐ **Patch sửa BÊN TRONG hàm `get_root_folder()`, không sửa nơi gọi** → mọi luồng gọi hàm này
+đều được hưởng, kể cả xoá.
+
+| Luồng | Gọi `get_root_folder` | Trước patch | Sau patch |
+|---|---|---|---|
+| Upload document | 2 lần | ~36s | ✅ ~0s |
+| **Xoá document** | **1 lần** | **~18s** | ✅ **~0s** |
+
+➡️ Sếp nói *"vừa xoá 1 cái lâu lắm"* — nếu thao tác đó **trước 16:50 ngày 10/08** (lúc deploy)
+thì đúng là dính 18s. Sau thời điểm đó đã hết.
+
+### Bằng chứng đo — slow log 15 dòng cuối ngay sau khi xoá thử
+
+```sql
+SELECT start_time, ROUND(query_time,3) AS thoi_gian, rows_examined, LEFT(CONVERT(sql_text USING utf8), 100) AS query FROM mysql.slow_log ORDER BY start_time DESC LIMIT 15\G
+```
+
+Chỉ có **2 loại query**, lặp đi lặp lại:
+
+| Query | Số dòng | rows_examined | Thời gian |
+|---|---|---|---|
+| `SELECT COUNT(t1.id) FROM task INNER JOIN document ON t1.doc_id = t2.id` | 6 | **164.280** | **2.7 - 3.4s** |
+| `DELETE FROM pipeline_operation_log WHERE kb_id = '73932b965...'` | 9 | 2.914 | 0.11 - 0.46s |
+
+**Đọc được gì:**
+- ⭐ **KHÔNG có câu nào quét bảng `file`** — nếu chưa patch phải thấy `rows_examined ~631585`.
+  Xác nhận patch đã che luôn luồng xoá
+- ⚠️ Câu `COUNT(task INNER JOIN document)` **KHÔNG thuộc luồng xoá** — xem bên dưới
+
+### ⚠️ Phân biệt: `COUNT(task INNER JOIN document)` là task executor, không phải luồng xoá
+
+Tra ra `task_service.py:315-335`:
+
+```python
+with DB.lock("get_task", -1):          # ← KHOÁ TOÀN CỤC
+    docs = (cls.model.select(...)
+        .join(Document, on=(cls.model.doc_id == Document.id))
+        .join(File2Document, ..., join_type=JOIN.LEFT_OUTER)
+        .join(File, ..., join_type=JOIN.LEFT_OUTER)
+        .where(Document.status == VALID, Document.run == RUNNING, ...))
+```
+
+Đây là **task executor định kỳ hỏi "có document nào cần xử lý không"** — chạy nền liên tục vì
+đối tác đang đẩy 106 doc/phút. Nó lọt vào 15 dòng cuối chỉ vì **chạy song song** đúng lúc xoá.
+
+🔴 **Đáng lo riêng**: có `DB.lock("get_task", -1)` — khoá toàn cục. Query mất 2.7-3.4s mà chạy
+6 lần trong 8 giây → các lượt gọi chồng lên nhau phải chờ khoá, có thể làm chậm thao tác khác.
+Tích luỹ 12h: **34.781 lần / 115.325 giây (~32 giờ)** — nặng nhất hệ thống hiện tại.
+🔶 Ghi nhận việc riêng, chưa ưu tiên.
+
+### Xoá 1 file cũ (đã upload xong từ lâu) thì sao?
+
+*(Kiên hỏi tiếp)* — Trực giác nói "nhanh hơn vì không có task đang chạy", nhưng **ngược lại**:
+
+| Thao tác trong `remove_document()` | File đang xử lý dở | File đã xong từ lâu |
+|---|---|---|
+| `cancel_all_task_of()` — đặt cờ Redis | Có tác dụng | ⚪ Vô hại, **vốn chỉ tốn vài ms** |
+| `TaskService.filter_delete()` | Có | 🟢 Nhẹ |
+| `docStoreConn.delete({"doc_id"}, chunk_index_name, kb_id)` — xoá chunk khỏi **ES** | Ít chunk | 🔴 **Đầy đủ chunk** |
+| `delete_chunk_images()` — xoá ảnh khỏi **MinIO** | Ít | 🔴 Nhiều hơn |
+| `remove_dataset_nav_doc_sync()` — sửa file markdown điều hướng KB | Có | 🟡 **Chỗ đáng ngờ còn lại** |
+| Cleanup knowledge graph | Có thể | ✅ **KHÔNG chạy** — xem dưới |
+
+⭐ **Xoá file cũ tốn kém HƠN xoá file đang parse dở** — ngược trực giác. Lý do: file đã parse
+xong nghĩa là dữ liệu đã lan ra khắp nơi (chunk ES, ảnh MinIO). Càng "hoàn thiện" càng nhiều
+thứ phải gỡ.
+
+### Redis trong luồng xoá làm gì? *(Kiên hỏi)*
+
+`task_service.py:593-609`:
+
+```python
+def cancel_all_task_of(doc_id):
+    for t in TaskService.query(doc_id=doc_id):
+        REDIS_CONN.set(f"{t.id}-cancel", "x")      # ← đặt CỜ huỷ
+
+def has_canceled(task_id):
+    if REDIS_CONN.get(f"{task_id}-cancel"):        # ← task executor tự đọc cờ
+        return True
+```
+
+**Bối cảnh**: upload không xử lý ngay trong request — tạo **task** rồi trả về luôn, task executor
+làm nền (parse, chunk, embedding). Nếu xoá tài liệu **đang xử lý dở**, executor vẫn chạy tiếp →
+ghi chunk cho document không còn tồn tại → rác dữ liệu.
+
+**Vì sao dùng Redis mà không gọi thẳng executor?** Vì executor là **tiến trình khác**, thậm chí
+**pod khác** (3 pod ragflow trên node05/node06). Pod nhận request xoá không gọi được vào vòng lặp
+đang chạy ở pod kia. Redis đóng vai **bảng tin chung**.
+
+⭐ Đây là **cooperative cancellation** — hợp tác chứ không cưỡng chế. Redis không "giết" được
+task; chỉ treo biển, executor phải **chủ động** kiểm tra giữa các bước. Task đang kẹt ở bước dài
+(embedding) sẽ không thấy biển cho tới khi xong bước đó.
+
+⚠️ **Đính chính**: bản nháp trước liệt kê Redis vào "4 nơi phải dọn" khiến nó trông như phần đáng
+kể của thời gian xoá. **Sai** — `SET` một khoá chỉ vài ms, gần như miễn phí.
+
+### Xếp lại chi phí thực của việc xoá
+
+| Nơi | Thao tác | Chi phí |
+|---|---|---|
+| **Elasticsearch** | Xoá toàn bộ chunk + metadata của tài liệu | 🔴 **Nặng nhất** |
+| **MinIO** | Xoá file gốc + thumbnail + chunk images | 🟡 Nhiều lần gọi mạng |
+| MySQL | Xoá `document`, `task`, `file`, `file2document`, cập nhật `knowledgebase` | 🟢 **Nhẹ — đã đo, không có câu nào nặng** |
+| Redis | Đặt cờ huỷ | 🟢 Vài ms |
+
+### Đo `knowledgebase` — loại trừ knowledge graph
+
+```sql
+SELECT name, doc_num, chunk_num, LEFT(parser_config, 200) AS config FROM knowledgebase ORDER BY doc_num DESC LIMIT 3\G
+```
+
+```
+name: Voffice-doc-sum
+doc_num: 760540
+chunk_num: 740235
+config: {"layout_recognize": "DeepDOC", "chunk_token_num": 512, "delimiter": "\n",
+         "enable_children": false, "children_delimiter": "", "auto_keywords": 0,
+         "auto_questions": 0, "html4excel": false, "topn_tags"...}
+
+name: Test t?i        doc_num: 501    chunk_num: 500
+name: ?TXD Wiki       doc_num: 103    chunk_num: 1237
+```
+
+**Đọc được gì:**
+- ✅ **KHÔNG có `graphrag`/`use_graph` trong config** → nhánh cleanup knowledge graph (nghi là
+  nặng nhất) **không chạy**. Loại được một giả thuyết
+- 🔺 **`doc_num` = 760.540 — tăng gần GẤP ĐÔI** so với ghi nhận 395.137 (07/08). Do đối tác đẩy
+  106 doc/phút liên tục
+- ❓ `chunk_num` 740.235 cho 760.540 doc = **chưa tới 1 chunk/tài liệu** — bất thường vì
+  `chunk_token_num: 512`. Hoặc văn bản rất ngắn (hợp lý với "văn bản tóm tắt"), hoặc **phần lớn
+  chưa parse xong**. Khả năng thứ hai khớp với việc task executor chạy 34.781 lần
+- 💡 Dấu `?` trong tên KB là do terminal VDI không hiển thị tiếng Việt, **không phải lỗi dữ liệu**
+
+### Hệ quả của việc bảng lớn gấp đôi
+
+- Nếu **chưa** patch `get_root_folder`, giờ full-scan sẽ mất **hơn 18 giây** (bảng lớn hơn)
+  → patch càng lúc càng có giá trị
+- Query `COUNT(task INNER JOIN document)` quét 164.280 dòng sẽ **nặng dần** theo thời gian
+
+### 🔶 Còn tồn đọng (Kiên quyết định dừng, không xoá thêm file để đo)
+
+- [ ] Chưa đo được `remove_dataset_nav_doc_sync()` — nghi sửa file markdown điều hướng của KB
+      760k document, phải đọc + ghi lại toàn bộ
+- [ ] Chưa đo được thời gian thực tế phần ES/MinIO trong luồng xoá (slow log chỉ đo MySQL)
+
+---
+
 ## 5. Bài học
 
 | Bài học | Cách phát hiện sớm lần sau |
@@ -700,6 +864,9 @@ gọi**. Phải đo trước khi quyết định sửa.
 | **Đánh giá rủi ro dựa trên giả thuyết phải đi đo, đừng để nguyên.** Đã xếp phương án vá code vào nhóm "rủi ro cao" vì lo `name = '/'` có dòng trùng — chạy `COUNT(*)` 10 giây thì thấy **không trùng**, rủi ro thấp hơn hẳn | Mỗi khi viết "nếu X xảy ra thì nguy hiểm" → hỏi ngay **"X có thật không, đo bằng câu nào?"**. Giả thuyết chưa đo mà đem đi ra quyết định thì dễ chọn sai hướng |
 | **Cùng một bảng, đổi cách hỏi thì nhanh gấp 1000 lần.** `parent_id = id` mất 18s, `name = '/'` mất 0.00s — cùng bảng 631k dòng, cùng trả 1 dòng | Nghi query chậm do "bảng to" → thử viết lại điều kiện theo hằng số rồi đo. Bảng to chỉ là điều kiện cần, cách hỏi mới quyết định |
 | **`\G` cũng là ký tự kết thúc câu, `;` thì không thay thế được nó.** Câu dùng `\G` chạy được dù không có `;`; câu dùng bảng ngang mà quên `;` sẽ treo ở prompt `->` | Thấy MySQL hiện `->` thay vì `mysql>` → câu chưa kết thúc, gõ `;` rồi Enter là xong (không cần `^C` chạy lại) |
+| **Sửa bên trong hàm thì mọi nơi gọi đều được hưởng.** Patch `get_root_folder` nhắm luồng upload, nhưng fix luôn cả luồng xoá (`delete_docs` dòng 678) mà không phải làm gì thêm | Trước khi sửa, `grep -rn "<tên hàm>"` để biết **có bao nhiêu nơi gọi** — vừa lường được tác động, vừa biết được lợi ích ngoài dự tính |
+| **Xoá dữ liệu tốn kém hơn ghi dữ liệu.** Ghi chỉ thêm vào 1 chỗ; xoá phải tìm và gỡ ở MỌI nơi dữ liệu đã lan tới (MySQL, ES, MinIO, Redis). Nên file **đã parse xong** xoá CHẬM hơn file đang parse dở — ngược trực giác | Đánh giá chi phí xoá thì đếm xem dữ liệu đã lan ra bao nhiêu hệ thống, đừng chỉ nhìn 1 bảng |
+| **Slow log chỉ đo MySQL — không thấy gì ≠ không có vấn đề.** Luồng xoá không để lại câu MySQL nặng nào, nhưng vẫn chậm vì phần ES/MinIO nằm ngoài tầm đo | Khi slow log sạch mà người dùng vẫn kêu chậm → chuyển sang đo tầng khác (log ứng dụng, `curl` đo độ trễ ES), đừng kết luận "đã hết chậm" |
 | **Bảng dùng chung nghĩa là 1 KB lớn làm chậm mọi KB.** Bảng `file` gộp chung mọi KB của tài khoản → full scan quét hết 631k dòng bất kể upload vào KB nào | Khi thấy query full scan trên bảng dùng chung, đừng chỉ nhìn KB/tenant đang thao tác — nhìn tổng số dòng cả bảng |
 
 ---
