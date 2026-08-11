@@ -796,14 +796,58 @@ task; chỉ treo biển, executor phải **chủ động** kiểm tra giữa cá
 ⚠️ **Đính chính**: bản nháp trước liệt kê Redis vào "4 nơi phải dọn" khiến nó trông như phần đáng
 kể của thời gian xoá. **Sai** — `SET` một khoá chỉ vài ms, gần như miễn phí.
 
-### Xếp lại chi phí thực của việc xoá
+### ⭐ BREAKDOWN CHI TIẾT — xoá 1 file thì xoá đúng những gì, ở đâu
 
-| Nơi | Thao tác | Chi phí |
-|---|---|---|
-| **Elasticsearch** | Xoá toàn bộ chunk + metadata của tài liệu | 🔴 **Nặng nhất** |
-| **MinIO** | Xoá file gốc + thumbnail + chunk images | 🟡 Nhiều lần gọi mạng |
-| MySQL | Xoá `document`, `task`, `file`, `file2document`, cập nhật `knowledgebase` | 🟢 **Nhẹ — đã đo, không có câu nào nặng** |
-| Redis | Đặt cờ huỷ | 🟢 Vài ms |
+*(Kiên yêu cầu 11/08: "breakdown chi tiết ra là khi xóa 1 file thì nó xóa những thành phần gì,
+ở đâu nữa, cụ thể ra")*
+
+Đọc theo đúng thứ tự code chạy: `file_service.py:delete_docs()` → `document_service.py:remove_document()`
+
+| # | Xoá/sửa **cái gì** | **Ở đâu** | Hàm | Chi phí |
+|---|---|---|---|---|
+| 1 | Tìm thư mục gốc của tenant | MySQL bảng `file` | `get_root_folder()` `file_service.py:678` | 🟢 **~0s** (đã patch; trước là 18s) |
+| 2 | Đặt cờ `"{task_id}-cancel" = x` cho mỗi task | **Redis** | `cancel_all_task_of()` `task_service.py:593` | 🟢 Vài ms |
+| 3 | Xoá dòng document + trừ bộ đếm `token_num`, `chunk_num`, `doc_num` của KB | MySQL bảng `document` + `knowledgebase` | `delete_document_and_update_kb_counts()` `:696` | 🟢 Tra khoá chính, có `FOR UPDATE` |
+| 4 | Xoá các bản ghi task của tài liệu | MySQL bảng `task` | `TaskService.filter_delete()` | 🟢 Nhẹ |
+| 5 | **Xoá ảnh của từng chunk** | **MinIO** | `delete_chunk_images()` `:548` | 🔴 **Vòng lặp — xem dưới** |
+| 6 | Xoá ảnh thumbnail của tài liệu | **MinIO** | `remove_document()` `:489-491` | 🟡 1 lần gọi |
+| 7 | **Xoá toàn bộ chunk (đoạn văn bản đã tách)** | **Elasticsearch** index `ragflow_<tenant_id>` | `docStoreConn.delete({"doc_id": ...})` `:497` | 🔴 **Nặng nhất** |
+| 8 | Gỡ dòng của tài liệu khỏi file markdown điều hướng KB | **ES/lưu trữ** | `remove_dataset_nav_doc_sync()` `:507` | 🟡 ❓ chưa đo |
+| 9 | Xoá metadata của tài liệu | **Elasticsearch** index metadata riêng | `DocMetadataService.delete_document_metadata()` `:516` | 🟡 |
+| 10 | Gỡ tài liệu khỏi knowledge graph (entity, relation, graph, subgraph, community_report) | **Elasticsearch** | `remove_document()` `:521-540` | ✅ **KHÔNG chạy** — KB không bật graphrag |
+| 11 | Xoá file gốc đã upload | **MinIO** | `STORAGE_IMPL.rm(b, n)` `file_service.py:704` | 🟡 1 lần gọi |
+| 12 | Xoá liên kết file ↔ document | MySQL bảng `file`, `file2document` | `filter_delete()`, `delete_by_document_id()` `:701-702` | 🟢 Nhẹ |
+| 13 | *(chỉ với tài liệu loại TABLE)* Đếm lại số doc trong KB | MySQL bảng `document` | `count_by_kb_id()` `:326` | 🔴 `COUNT` cả KB — nhưng chỉ với `parser_id = TABLE` |
+
+**Tổng cộng: 13 bước, chạm 4 hệ thống.**
+
+### Vì sao bước 5 (xoá ảnh chunk) đáng chú ý
+
+```python
+def delete_chunk_images(cls, doc, tenant_id):
+    page, page_size = 0, 1000
+    while True:
+        chunks = settings.docStoreConn.search(["img_id"], [], {"doc_id": doc.id}, ...)  # ← query ES
+        chunk_ids = settings.docStoreConn.get_doc_ids(chunks)
+        if not chunk_ids:
+            break
+        for cid in chunk_ids:
+            if settings.STORAGE_IMPL.obj_exist(doc.kb_id, cid):   # ← gọi MinIO kiểm tra
+                settings.STORAGE_IMPL.rm(doc.kb_id, cid)          # ← gọi MinIO xoá
+        page += 1
+```
+
+⭐ **Mỗi ảnh tốn 2 lần gọi MinIO** (`obj_exist` + `rm`), cộng 1 query ES cho mỗi trang 1.000 chunk.
+Tài liệu có N ảnh → **2N lần gọi mạng tới MinIO**, chạy tuần tự không song song.
+
+### Tổng hợp theo hệ thống
+
+| Hệ thống | Số bước | Nội dung | Chi phí |
+|---|---|---|---|
+| **Elasticsearch** | 4 bước (7, 8, 9, 10) | Chunk, metadata, nav markdown, knowledge graph | 🔴 **Nặng nhất** |
+| **MinIO** | 3 bước (5, 6, 11) | Ảnh chunk (vòng lặp 2N lần gọi), thumbnail, file gốc | 🔴 Nhiều round-trip |
+| **MySQL** | 5 bước (1, 3, 4, 12, 13) | `file`, `document`, `task`, `file2document`, `knowledgebase` | 🟢 **Nhẹ — đã đo bằng slow log, không câu nào nặng** |
+| **Redis** | 1 bước (2) | Đặt cờ huỷ task | 🟢 Vài ms |
 
 ### Đo `knowledgebase` — loại trừ knowledge graph
 
