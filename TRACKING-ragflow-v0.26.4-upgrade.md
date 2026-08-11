@@ -43,6 +43,7 @@
 | 8 | Pod ragflow `Init:ImagePullBackOff` trên node07 | ✅ FIXED | Loại node07 khỏi affinity ragflow |
 | 9 | `LookupError: Instance default not found` (embedding) | ⚠️ WORKAROUND | Sửa DB thủ công — **bug upstream #17578 chưa fix** |
 | 10 | Query chậm 13-15s trên KB 141k doc (issue #4 cũ) | 🔶 OPEN | AI engineer đã custom image, cần test lại |
+| 11 | **502 ngắt quãng ở `GET /api/v1/datasets`** — nginx `proxy_pass` dùng `localhost` nên thử IPv6 `[::1]`, Flask chỉ nghe IPv4 | ✅ FIXED | Đổi `localhost` → `127.0.0.1` trong `templates/ragflow_config.yaml` |
 
 ---
 
@@ -394,6 +395,96 @@ nodeAffinity:
 
 ---
 
+### Issue 11 — 502 ngắt quãng: nginx `proxy_pass localhost` thử IPv6, Flask chỉ nghe IPv4
+
+**Triệu chứng (11/08/2026)**
+
+UI báo `Request error 502: undefined Gateway error`. Đặc điểm khiến khó chẩn đoán:
+
+| Quan sát | Con số thật |
+|---|---|
+| Chỉ **một** API lỗi | `GET /api/v1/datasets?page_size=50&page=1` → **502** |
+| Các API khác cùng lúc | `me`, `tenants`, `models`, `chats` → **200**, 31-61ms |
+| Thời gian trả 502 | **36ms** — quá nhanh để là timeout |
+| Tính chất | **Ngắt quãng** — lúc 200, lúc 502 |
+
+**Hạ tầng hoàn toàn khoẻ** — loại trừ được ngay từ đầu:
+
+```
+deployment.apps/ragflow   READY 3/3   AVAILABLE 3
+endpoints/ragflow   172.16.78.251:80, 172.16.83.133:80, 172.16.83.241:80   ← đúng 3 IP, khớp 3 pod
+```
+
+**Root cause**
+
+`/var/log/nginx/error.log` trong pod ragflow:
+
+```
+[error] connect() failed (111: Connection refused) while connecting to upstream,
+        client: 172.16.93.0, request: "GET /api/v1/datasets... HTTP/1.1",
+        upstream: "http://[::1]:9380/api/v1/datasets/..."
+[warn]  upstream server temporarily disabled while connecting to upstream
+```
+
+⭐ **`[::1]` là localhost IPv6.** Cấu hình dùng tên `localhost`, mà tên này phân giải ra **CẢ HAI**
+`::1` (IPv6) và `127.0.0.1` (IPv4). Nginx thử IPv6 trước → Flask **chỉ lắng nghe IPv4** → bị từ
+chối → nginx đánh dấu upstream `temporarily disabled` → trả 502 tức thì.
+
+Giải thích trọn vẹn cả 2 điểm lạ:
+
+| Điểm lạ | Vì sao |
+|---|---|
+| 502 sau **36ms** | Từ chối ngay ở tầng kết nối TCP, không phải chờ backend timeout |
+| Lỗi **ngắt quãng** | Thử IPv4 → 200; thử IPv6 → 502 |
+
+Log còn cho thấy **không chỉ `datasets`** — `POST .../chunks` và `PUT .../documents/...` cũng dính.
+
+**Bằng chứng cấu hình**
+
+```
+kubectl -n ragflow exec -it <pod> -c ragflow -- grep -n "proxy_pass\|upstream\|listen" /etc/nginx/conf.d/ragflow.conf
+```
+
+```
+2:     listen 80;
+14:        proxy_pass http://localhost:9381;
+19:        proxy_pass http://localhost:9380;
+```
+
+**Đã thử — gồm cả giả thuyết SAI**
+
+| Phương án | Kết quả |
+|---|---|
+| Nghi Service trỏ vào pod chết (thiếu readinessProbe) | ❌ Loại — `endpoints` đúng 3 IP khớp 3 pod `Running` |
+| **Nghi tràn buffer nginx do payload lớn** (KB 760k doc → response `datasets` khổng lồ) | ❌ **SAI** — `proxy.conf:6` có `proxy_buffering off`, nginx **không đệm** response nên giả thuyết không áp dụng được |
+| Grep log container `ragflow` tìm `502\|upstream\|too big\|buffer` | ❌ Không ra gì — vì nginx ghi lỗi vào **file riêng** `/var/log/nginx/error.log`, không phải stdout |
+| `netstat`/`ss` kiểm tra Flask nghe IPv4 hay IPv6 | ⚠️ Không chạy được — image tối giản, **không có cả 2 lệnh**. Không cần nữa vì log nginx đã đủ bằng chứng |
+| Đọc `/var/log/nginx/error.log` | ✅ **Ra root cause ngay** |
+
+**Giải pháp**
+
+`templates/ragflow_config.yaml` — đổi 2 dòng, ép dùng IPv4:
+
+```diff
+  location ~ ^/api/v1/admin {
+-     proxy_pass http://localhost:9381;
++     proxy_pass http://127.0.0.1:9381;
+  }
+  location ~ ^/(v1|api) {
+-     proxy_pass http://localhost:9380;
++     proxy_pass http://127.0.0.1:9380;
+  }
+```
+
+Rồi `helm upgrade ragflow . -n ragflow -f values.yaml`. ✅ **Đã apply, hết 502.**
+
+💡 **Vì sao sửa ConfigMap lại rollout được pod**: nhờ annotation `ragflow.yaml:27`
+`checksum/config-ragflow: {{ include ... | sha256sum }}`. Sửa ConfigMap → checksum đổi → pod
+template đổi → K8s tạo ReplicaSet mới. **Không có annotation này** thì ConfigMap được cập nhật
+nhưng nginx trong pod vẫn đọc bản đã mount từ trước — sửa xong mà không có tác dụng.
+
+---
+
 ## 4. Issue chưa xong
 
 ### Issue 9 — ⚠️ WORKAROUND: `LookupError: Instance default not found`
@@ -614,6 +705,10 @@ knowledgebase (20 KB):  embd_id=qwen3-8b-embedding___OpenAI-API@OpenAI-API-Compa
 | `serviceName`, `storageClassName` là **immutable** — phải khớp chính xác cái đang chạy | `kubectl get sts -o custom-columns='NAME:.metadata.name,SVCNAME:.spec.serviceName'` |
 | Chart và image có **hợp đồng ngầm**: file nào entrypoint tự tạo/ghi thì chart không được mount đè | Đọc `entrypoint.sh` của image mới trước khi nâng version |
 | StatefulSet không tự rollout như Deployment — pod hỏng có thể chặn cả chuỗi | `kubectl delete pod <sts>-0` để force |
+| **`localhost` trong `proxy_pass` phân giải ra CẢ IPv6 (`::1`) lẫn IPv4.** Nginx thử IPv6 trước; backend chỉ nghe IPv4 → 502 **ngắt quãng** | Trong container luôn dùng `127.0.0.1` thay `localhost` cho upstream nội bộ. Dấu hiệu: 502 trả về **rất nhanh** (~36ms) chứ không phải timeout |
+| **Log nginx KHÔNG nằm trong `kubectl logs`** — nó ghi vào `/var/log/nginx/error.log` bên trong container | Grep `kubectl logs` không ra gì ≠ không có lỗi. Phải `exec ... -- tail /var/log/nginx/error.log` |
+| **Sửa ConfigMap chỉ rollout pod nếu template có annotation `checksum/...`** | `grep -n checksum templates/*.yaml`. Không có → phải `rollout restart` thủ công, nếu không pod vẫn dùng bản mount cũ |
+| Image tối giản **không có `netstat`/`ss`/`curl`** — đừng phụ thuộc vào chúng khi chẩn đoán | Ưu tiên đọc file log và file cấu hình bằng `grep`/`tail`, luôn dùng được |
 
 ### Chẩn đoán
 
