@@ -1,8 +1,9 @@
 # PLAN — Áp dụng patch `get_root_folder()` (Issue U1)
 
 > **Trạng thái**: ✅ **ĐÃ DEPLOY THÀNH CÔNG** (10/08/2026 16:50, revision 62→63)
-> Kết quả: query `parent_id = id` 18s **biến mất khỏi slow log**; upload qua UI ~10-20s,
-> trả 200 nhanh. Chi tiết bằng chứng: Bước 6.
+> **Đã kiểm chứng sau 12 GIỜ TẢI THẬT** (11/08) — xem mục 5b:
+> query `parent_id = id` vắng mặt hoàn toàn khỏi top query; đường ghi trung bình **0.386s**;
+> load avg node06 **7.98 → 3.86**.
 > **Ngày soạn**: 10/08/2026
 > **Issue gốc**: xem `TRACKING-upload-document-25s.md` (root cause + số liệu đo)
 > **Phạm vi**: sửa **1 dòng** code RagFlow qua cơ chế `codePatch` có sẵn trong chart
@@ -565,6 +566,120 @@ cảm nhận thực tế qua UI).
 
 ⚠️ **Tổng 55s sẽ KHÔNG giảm hết** — 4 bước còn lại (LLM tóm tắt 10s, Update metadata 8s, Parse
 chunk 6s, Check tồn tại 6s) chưa được trace, là việc riêng.
+
+---
+
+## 5b. ⭐ Kiểm chứng sau 12 GIỜ TẢI THẬT (11/08 sáng)
+
+*(Kiên: "đã báo sếp và đối tác tiếp tục đẩy dữ liệu, cách đây 12 tiếng, giờ tự check xem tốc độ
+cải thiện chưa thay vì hỏi feedback đối tác")*
+
+Đây là phép đo **giá trị nhất** — hôm qua chỉ có 1 file test, giờ là tải sản xuất thật.
+`mysql.slow_log` đã `TRUNCATE` sau khi patch → mọi dòng đều là dữ liệu **sau patch**.
+
+### a) Top 6 query nặng nhất sau 12h
+
+```sql
+SELECT LEFT(CONVERT(sql_text USING utf8), 90) AS query, COUNT(*) AS so_lan, SUM(query_time) AS tong FROM mysql.slow_log GROUP BY LEFT(CONVERT(sql_text USING utf8), 90) ORDER BY SUM(query_time) DESC LIMIT 6\G
+```
+
+| # | Query | Số lần | Tổng (s) | Bảng |
+|---|---|---|---|---|
+| 1 | `SELECT COUNT(t1.id) FROM task INNER JOIN document` | 34.781 | **115.325** | task, document |
+| 2 | `DELETE FROM pipeline_operation_log WHERE kb_id = '73932b965...'` | 78.508 | 22.808 | pipeline_operation_log |
+| 3 | `SELECT t1.id, t1.process_begin_at, t1.parser_config, t1.progress_msg` | 40 | 811 | document |
+| 4 | `INSERT INTO pipeline_operation_log (id, create_time, ...)` | 3.632 | 655 | pipeline_operation_log |
+| 5 | `SELECT COUNT(1) FROM (... INNER JOIN file2document ...)` | 23 | 343 | document |
+| 6 | `SELECT t1.id, t1.thumbnail, t1.kb_id, t1.parser_id, t1.pipeline_id` | 11 | 300 | document |
+
+⭐ **KHÔNG có query nào trên bảng `file` với `parent_id = id`.** Sau 12 giờ tải thật, query từng
+đứng **đầu bảng** (783.945 lần / 838 giờ) đã **hoàn toàn biến mất**. Đây là bằng chứng mạnh nhất.
+
+### b) Đường GHI (thứ khách hàng quan tâm)
+
+```sql
+SELECT COUNT(*) AS so_query_cham, ROUND(AVG(query_time),3) AS trung_binh, MAX(query_time) AS cham_nhat FROM mysql.slow_log WHERE CONVERT(sql_text USING utf8) LIKE '%INSERT%document%' OR CONVERT(sql_text USING utf8) LIKE '%file2document%';
+```
+
+```
+| so_query_cham | trung_binh | cham_nhat       |
+|          3819 |      0.386 | 00:00:50.021119 |
+```
+
+**Đọc được gì:**
+- ✅ **3.819 câu ghi, trung bình 0.386s** — với ngưỡng slow log 0.1s thì đây là con số rất tốt
+  (phần lớn chỉ nhỉnh hơn ngưỡng một chút)
+- 📊 So sánh: **trước patch mỗi upload phải trả 36s cho `get_root_folder` TRƯỚC KHI kịp ghi gì**
+- ⚠️ `cham_nhat = 50s` là **giá trị ngoại lai**, không phải xu hướng (trung bình vẫn 0.386s).
+  ❓ Chưa điều tra nguyên nhân
+
+### c) Tải MySQL trên node06
+
+```
+top - 08:21:43  up 950 days,  load average: 3.86, 4.16, 4.04
+PID    USER     %CPU   %MEM  COMMAND
+20387  polkitd  237.5   6.5  mysqld
+11420  root      62.5  11.2  python3
+11404  root      50.0  10.0  python3
+36590  root      43.8   3.0  litellm
+```
+
+| Thời điểm | `mysqld` %CPU | load avg |
+|---|---|---|
+| node07 **trước** migrate | 666.7% | 19.52 |
+| node06 sau migrate, **rảnh** | 43.8% | 2.48 |
+| node06 dưới tải đối tác, **trước** patch | 293.8% | 7.98 |
+| **node06 sau patch, 12h tải** | **237.5%** | **3.86** |
+
+**Đọc được gì** (so 2 dòng cuối — cùng là "đối tác đang đẩy dữ liệu"):
+- CPU: 293.8% → **237.5%** (giảm ~19%)
+- ⭐ **load avg: 7.98 → 3.86 — giảm hơn MỘT NỬA**. Load average đo số tiến trình **đang chờ**,
+  phản ánh mức nghẽn. Trên máy 8 core: từ "gần bão hoà" xuống "còn dư địa thoải mái"
+
+⚠️ **Không kết luận "patch làm giảm 19% CPU"** — cường độ đẩy dữ liệu của đối tác ở 2 thời điểm
+có thể khác nhau. Đây là **chỉ dấu bổ trợ**; bằng chứng chắc chắn nằm ở mục (a) và (b).
+
+### d) ⚠️ Bài học về cách đo — bộ lọc `rows_examined` đã hết tác dụng
+
+```sql
+SELECT COUNT(*) AS so_lan_fullscan_file FROM mysql.slow_log WHERE rows_examined BETWEEN 600000 AND 700000;
+```
+
+```
+| so_lan_fullscan_file |
+|                   40 |
+```
+
+Kỳ vọng ban đầu là **0**, ra **40** → thoạt nhìn tưởng patch hỏng. Nhưng đối chiếu mục (a):
+query #3 có `so_lan = 40` — **khớp chính xác**. Đó là query trên bảng **`document`**, không phải
+bảng `file`.
+
+➡️ **Nguyên nhân**: bảng `document` đã lớn lên (395k+ dòng và đang tăng do đối tác đẩy dữ liệu),
+nên `rows_examined` của nó rơi vào đúng khoảng 600k-700k. Bộ lọc này **không còn đặc trưng** cho
+bảng `file` nữa.
+
+⭐ **Bài học**: dùng `rows_examined` làm "chữ ký" nhận diện query chỉ đúng **tại một thời điểm**.
+Bảng lớn dần thì chữ ký trùng nhau. Muốn chắc chắn phải lọc theo **nội dung câu SQL**
+(`sql_text LIKE '%parent_id%'`), không phải theo số dòng quét.
+
+### Kết luận sau 12h
+
+| Câu hỏi | Trả lời |
+|---|---|
+| Query cũ có quay lại không? | ✅ **Không** — vắng mặt hoàn toàn khỏi top query sau 12h tải thật |
+| Đường ghi có thông không? | ✅ **Có** — 3.819 lần, trung bình 0.386s |
+| Tải MySQL có giảm không? | ✅ load avg **7.98 → 3.86** (cùng điều kiện có tải) |
+| Có cần hỏi feedback đối tác không? | ❌ **Không cần** — đã có số liệu thay cho cảm nhận |
+
+### 🔴 Hai vấn đề MỚI lộ ra (trước bị che khuất)
+
+| Vấn đề | Số liệu | Nhận xét |
+|---|---|---|
+| `SELECT COUNT(t1.id) FROM task INNER JOIN document` | **34.781 lần / 115.325s (~32 giờ)** | Thủ phạm nặng nhất hiện tại. **Chưa từng xuất hiện** trong mọi lần phân tích trước |
+| `DELETE FROM pipeline_operation_log` | **78.508 lần** / 22.808s | Số lần rất lớn dù mỗi lần nhanh |
+
+Cả hai thuộc luồng **parsing/task**, **không phải** upload → không ảnh hưởng việc vừa fix.
+🔶 Ghi nhận làm việc riêng, chưa ưu tiên (theo phạm vi Kiên chốt: chỉ upload + retrieval).
 
 ---
 
