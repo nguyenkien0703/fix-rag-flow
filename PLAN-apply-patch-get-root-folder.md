@@ -636,8 +636,42 @@ PID    USER     %CPU   %MEM  COMMAND
 - ⭐ **load avg: 7.98 → 3.86 — giảm hơn MỘT NỬA**. Load average đo số tiến trình **đang chờ**,
   phản ánh mức nghẽn. Trên máy 8 core: từ "gần bão hoà" xuống "còn dư địa thoải mái"
 
-⚠️ **Không kết luận "patch làm giảm 19% CPU"** — cường độ đẩy dữ liệu của đối tác ở 2 thời điểm
-có thể khác nhau. Đây là **chỉ dấu bổ trợ**; bằng chứng chắc chắn nằm ở mục (a) và (b).
+### c2) ⭐⭐ BẰNG CHỨNG MẠNH NHẤT — tải TĂNG 77% mà tài nguyên vẫn GIẢM
+
+*(Kiên bổ sung 11/08 — thông tin quyết định)*
+
+Ở bản nháp trước tôi phải dè dặt: *"không kết luận patch giảm 19% CPU vì cường độ đẩy dữ liệu
+2 thời điểm có thể khác nhau"*. Kiên cho biết cường độ **đã tăng mạnh** → sự dè dặt đó biến
+thành lập luận **mạnh hơn hẳn**:
+
+| Chỉ số | **Trước** patch | **Sau** patch | Thay đổi |
+|---|---|---|---|
+| ⭐ **Tần suất đối tác đẩy** | 60 doc/phút | **106 doc/phút** | 🔺 **+77%** |
+| CPU node06 | 61% | **35%** | 🔻 **-43%** |
+| RAM node06 | 76% | **64%** | 🔻 -12 điểm |
+| load average | 7.98 | **3.86** | 🔻 **-52%** |
+| `mysqld` %CPU | 293.8% | 237.5% | 🔻 -19% |
+
+➡️ **Trước: làm ÍT hơn mà tốn NHIỀU hơn. Sau: làm NHIỀU hơn 77% mà tốn ÍT hơn.**
+
+**Hiệu năng trên mỗi document** (chỉ số phản ánh đúng nhất):
+
+```
+Trước: 61% CPU ÷ 60 doc/phút  = 1.02 đơn vị CPU/doc
+Sau:   35% CPU ÷ 106 doc/phút = 0.33 đơn vị CPU/doc
+                              → giảm ~68%
+```
+
+**Giải thích 2 hiện tượng đi kèm:**
+
+| Hiện tượng | Cơ chế |
+|---|---|
+| **RAM giảm dù patch chỉ sửa câu SQL** | Full-scan 631.585 dòng buộc InnoDB nạp **toàn bộ** trang dữ liệu bảng `file` vào buffer pool mỗi lần chạy (2 lần/upload). Buffer pool bị chiếm bởi dữ liệu quét-một-lần-rồi-bỏ, đẩy trang hay dùng ra ngoài. Bỏ full-scan → buffer pool dùng đúng mục đích |
+| **load avg giảm mạnh hơn CPU (52% vs 19%)** | Load average đếm cả tiến trình **chờ I/O**, không chỉ tiến trình đang tính. Full-scan sinh rất nhiều I/O đọc đĩa → hàng đợi dài. Phần lớn nghẽn trước đây là **CHỜ**, không phải **TÍNH** |
+
+⭐ **Bài học đo lường**: khi so tài nguyên trước/sau một thay đổi, **phải biết cả cường độ tải**.
+Nếu chỉ nhìn "CPU giảm 43%" mà không biết tải tăng 77%, sẽ **đánh giá thấp** mức cải thiện thật
+(68% thay vì 43%). Ngược lại, nếu tải giảm mà không biết, sẽ **thổi phồng** kết quả.
 
 ### d) ⚠️ Bài học về cách đo — bộ lọc `rows_examined` đã hết tác dụng
 
@@ -668,7 +702,9 @@ Bảng lớn dần thì chữ ký trùng nhau. Muốn chắc chắn phải lọc
 |---|---|
 | Query cũ có quay lại không? | ✅ **Không** — vắng mặt hoàn toàn khỏi top query sau 12h tải thật |
 | Đường ghi có thông không? | ✅ **Có** — 3.819 lần, trung bình 0.386s |
-| Tải MySQL có giảm không? | ✅ load avg **7.98 → 3.86** (cùng điều kiện có tải) |
+| Tải MySQL có giảm không? | ✅ load avg **7.98 → 3.86**, CPU **61% → 35%**, RAM **76% → 64%** |
+| ⭐ Trong khi tải thế nào? | 🔺 **TĂNG 77%** (60 → 106 doc/phút) |
+| Hiệu năng thực trên mỗi doc | ✅ **Cải thiện ~68%** |
 | Có cần hỏi feedback đối tác không? | ❌ **Không cần** — đã có số liệu thay cho cảm nhận |
 
 ### 🔴 Hai vấn đề MỚI lộ ra (trước bị che khuất)
