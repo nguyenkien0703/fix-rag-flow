@@ -840,6 +840,68 @@ def delete_chunk_images(cls, doc, tenant_id):
 ⭐ **Mỗi ảnh tốn 2 lần gọi MinIO** (`obj_exist` + `rm`), cộng 1 query ES cho mỗi trang 1.000 chunk.
 Tài liệu có N ảnh → **2N lần gọi mạng tới MinIO**, chạy tuần tự không song song.
 
+### 🔍 Phần MySQL — cụ thể xoá gì, bảng nào, câu SQL nào
+
+*(Kiên hỏi tiếp 11/08: "chỗ này cụ thể thì nó xoá cái gì ở mysql nhỉ?")*
+
+**5 bảng bị đụng tới. Chỉ 1 bảng là UPDATE, 4 bảng còn lại là DELETE/SELECT:**
+
+| Bảng | Thao tác | Xoá/sửa **dòng nào** | Câu SQL tương đương |
+|---|---|---|---|
+| `file` | **SELECT** (bước 1) | Tìm thư mục gốc của tenant — chỉ đọc, không xoá | `SELECT ... FROM file WHERE tenant_id = ? AND name = '/'` *(sau patch)* |
+| `document` | **DELETE** | Đúng **1 dòng** — bản ghi tài liệu | `DELETE FROM document WHERE id = '<doc_id>'` |
+| `knowledgebase` | **UPDATE** | Đúng **1 dòng** — trừ 3 bộ đếm của KB chứa tài liệu | `UPDATE knowledgebase SET token_num = token_num - ?, chunk_num = chunk_num - ?, doc_num = doc_num - 1 WHERE id = '<kb_id>'` |
+| `task` | **DELETE** | **Nhiều dòng** — mọi tác vụ xử lý của tài liệu này | `DELETE FROM task WHERE doc_id = '<doc_id>'` |
+| `file` | **DELETE** | **1 dòng** — bản ghi file (chỉ khi `source_type = KNOWLEDGEBASE`) | `DELETE FROM file WHERE source_type = 'knowledgebase' AND id = '<file_id>'` |
+| `file2document` | **DELETE** | **1 dòng** — bảng nối file ↔ document | `DELETE FROM file2document WHERE document_id = '<doc_id>'` |
+
+**Chi tiết 3 bộ đếm bị trừ ở `knowledgebase`** (`document_service.py:719-723`):
+
+```python
+Knowledgebase.update(
+    token_num=Knowledgebase.token_num - doc.token_num,   # tổng số token của KB
+    chunk_num=Knowledgebase.chunk_num - doc.chunk_num,   # tổng số chunk của KB
+    doc_num=Knowledgebase.doc_num - 1,                   # tổng số tài liệu của KB
+).where(Knowledgebase.id == doc.kb_id).execute()
+```
+
+⭐ Đây chính là 3 cột đã thấy khi query `knowledgebase` ở trên (`doc_num: 760540`,
+`chunk_num: 740235`) — chúng là **bộ đếm luỹ kế**, không phải `COUNT(*)` tính lại mỗi lần.
+Nên đọc rất nhanh, nhưng bù lại **phải trừ tay mỗi lần xoá**.
+
+**Toàn bộ bước 3 nằm trong 1 transaction có khoá** (`document_service.py:702-723`):
+
+```python
+with DB.atomic():
+    doc = cls.model.select(id, kb_id, token_num, chunk_num)
+             .where(id == doc_id).for_update().get_or_none()    # ← KHOÁ dòng document
+    if doc is None: return False                                 # đã bị xoá bởi request khác
+    deleted = cls.model.delete().where(id == doc_id).execute()
+    Knowledgebase.update(...).execute()                          # trừ bộ đếm
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `DB.atomic()` | Transaction — hoặc cả 2 thao tác cùng thành công, hoặc cùng huỷ. Tránh trường hợp xoá document rồi mà bộ đếm chưa trừ |
+| `.for_update()` | **Khoá dòng** cho tới hết transaction. Ngăn 2 request cùng xoá 1 tài liệu → trừ bộ đếm 2 lần |
+| `get_or_none()` + `if doc is None` | Idempotent — request thứ 2 thấy dòng đã mất thì trả `False`, không lỗi |
+
+⚠️ **Điểm cần theo dõi**: `FOR UPDATE` giữ khoá trên dòng `document` **và** dòng `knowledgebase`
+tương ứng. Khi đối tác đẩy 106 doc/phút, mọi upload cũng phải `UPDATE knowledgebase` (cộng bộ đếm)
+→ có thể **tranh chấp khoá trên cùng 1 dòng KB**. ❓ Chưa đo, nhưng là chỗ đáng nghi nếu sau này
+thấy xoá/upload chậm bất thường lúc tải cao.
+
+**Bước 13 — `count_by_kb_id()`** chỉ chạy khi `parser_id == TABLE`:
+
+```python
+docs = cls.model.select().where(cls.model.kb_id == kb_id)
+count = docs.count()      # ← COUNT trên TOÀN BỘ KB (760k dòng)
+```
+
+🔴 Nếu tài liệu là dạng bảng thì bước này quét cả KB. Có cache theo `kb_id` (`kb_table_num_map`)
+nên xoá nhiều file cùng KB chỉ tính 1 lần — nhưng lần đầu vẫn nặng.
+✅ Với tài liệu thường (`parser_id != TABLE`) thì **bỏ qua hoàn toàn**.
+
 ### Tổng hợp theo hệ thống
 
 | Hệ thống | Số bước | Nội dung | Chi phí |
