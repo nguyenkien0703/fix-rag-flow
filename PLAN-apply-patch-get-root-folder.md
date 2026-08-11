@@ -634,7 +634,8 @@ PID    USER     %CPU   %MEM  COMMAND
 **Đọc được gì** (so 2 dòng cuối — cùng là "đối tác đang đẩy dữ liệu"):
 - CPU: 293.8% → **237.5%** (giảm ~19%)
 - ⭐ **load avg: 7.98 → 3.86 — giảm hơn MỘT NỬA**. Load average đo số tiến trình **đang chờ**,
-  phản ánh mức nghẽn. Trên máy 8 core: từ "gần bão hoà" xuống "còn dư địa thoải mái"
+  phản ánh mức nghẽn. **node06 có 16 core** (Kiên xác nhận 11/08): load 7.98/16 = 50% → 3.86/16
+  = 24% công suất
 
 ### c2) ⭐⭐ BẰNG CHỨNG MẠNH NHẤT — tải TĂNG 77% mà tài nguyên vẫn GIẢM
 
@@ -668,6 +669,21 @@ Sau:   35% CPU ÷ 106 doc/phút = 0.33 đơn vị CPU/doc
 |---|---|
 | **RAM giảm dù patch chỉ sửa câu SQL** | Full-scan 631.585 dòng buộc InnoDB nạp **toàn bộ** trang dữ liệu bảng `file` vào buffer pool mỗi lần chạy (2 lần/upload). Buffer pool bị chiếm bởi dữ liệu quét-một-lần-rồi-bỏ, đẩy trang hay dùng ra ngoài. Bỏ full-scan → buffer pool dùng đúng mục đích |
 | **load avg giảm mạnh hơn CPU (52% vs 19%)** | Load average đếm cả tiến trình **chờ I/O**, không chỉ tiến trình đang tính. Full-scan sinh rất nhiều I/O đọc đĩa → hàng đợi dài. Phần lớn nghẽn trước đây là **CHỜ**, không phải **TÍNH** |
+
+⚠️ **ĐÍNH CHÍNH 11/08 — node06 có 16 core, không phải 8.** Kiên bắt lỗi. Con số 8 core là mang
+nhầm từ **node07** (`TRACKING-mysql-load-assessment.md:48,116` — node07 ≈ 8 core / 16GB).
+Bằng chứng node06 khác node07: output `top` node06 ghi `KiB Mem: 32778180 total` ≈ **32GB**.
+
+Quy đổi lại load average theo **16 core**:
+
+| Thời điểm | load avg | % công suất (÷16) |
+|---|---|---|
+| Trước patch (60 doc/phút) | 7.98 | **50%** |
+| Sau patch (106 doc/phút) | 3.86 | **24%** |
+
+➡️ Kết luận **không đổi về hướng** (giảm hơn một nửa), nhưng **mức độ nghiêm trọng trước đó nhẹ
+hơn** so với bản nháp sai: trước patch là **50% công suất**, không phải "99% gần bão hoà".
+Dư địa hiện tại còn nhiều hơn: **76%**, không phải 52%.
 
 ⭐ **Bài học đo lường**: khi so tài nguyên trước/sau một thay đổi, **phải biết cả cường độ tải**.
 Nếu chỉ nhìn "CPU giảm 43%" mà không biết tải tăng 77%, sẽ **đánh giá thấp** mức cải thiện thật

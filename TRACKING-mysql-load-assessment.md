@@ -115,6 +115,11 @@ kubectl -n ragflow get pod ragflow-mysql-0 -o jsonpath='{.spec.containers[0].res
 
 → Node ≈ 8 core / 16GB, còn trống ~97%. **Không thiếu tài nguyên node.**
 
+⚠️ **Lưu ý (bổ sung 11/08)**: con số **8 core / 16GB** này là của **node07** — nơi MySQL chạy tại
+thời điểm đo. **node06 (nơi MySQL chạy sau khi migrate) có 16 core / 32GB** — cấu hình khác hẳn.
+Bằng chứng: `top` trên node06 ghi `KiB Mem: 32778180 total` ≈ 32GB.
+Đừng mang số 8 core sang node06 khi tính `load average ÷ số core` (đã mắc lỗi này một lần).
+
 `kubectl -n ragflow top pod ragflow-mysql-0` → `metrics API not available` (chưa cài metrics-server).
 
 ---
