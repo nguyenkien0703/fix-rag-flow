@@ -2,8 +2,23 @@
 
 **Phiên:** 10/08/2026
 **Đối tượng:** flow `upload_document` của RagFlow, MySQL trên node06 (đã migrate 07/08)
-**Trạng thái phiên:** 🔶 ĐANG DỞ — **đã tìm ra root cause có bằng chứng đo thực tế**, chưa thực thi fix
+**Trạng thái phiên:** ✅ **ĐÃ FIX** (10/08, revision 63) — xem `PLAN-apply-patch-get-root-folder.md`
 **Task liên quan:** `TRACKING-mysql-load-assessment.md` (Issue 1, Issue 7), `PLAN-mysql-migrate-node06.md`
+
+### 📊 Kết quả cuối — đối tác đo lại 11/08
+
+| Bước | Trước | Sau | Thay đổi | Thuộc hệ thống |
+|---|---|---|---|---|
+| 1. Check tồn tại | 6s | 7s | +1s | MySQL — 🔶 chưa tối ưu |
+| 2. Gọi LLM tóm tắt | 10s | 11s | +1s | LiteLLM/model |
+| 3. **Upload document** | **25s** | **5s** | 🔻 **-20s (-80%)** | ✅ **ĐÃ FIX** |
+| 4. Update metadata | 8s | 5s | -3s | **Elasticsearch** (xem mục 4b) |
+| 5. Parse chunk | 6s | 4s | -2s | ES + task executor |
+| **Tổng** | **55s** | **32s** | 🔻 **-23s (-42%)** | |
+
+⭐ **20/23 giây tiết kiệm được đến từ đúng bước đã fix** — bằng chứng nhân quả sạch. Nếu mức
+giảm rải đều thì có thể do tải nhẹ đi; giảm tập trung một bước thì chắc chắn do patch.
+Hai bước nhích lên 1s nhiều khả năng vì đối tác đẩy nhanh hơn **77%** (60 → 106 doc/phút).
 
 ---
 
@@ -594,6 +609,77 @@ còn ~0.00s nên gọi 2 lần cũng không đáng kể.
 | Tenant **mới** chưa có root folder → `name = '/'` không ra dòng nào | Thấp | Code có sẵn nhánh tự tạo khi không tìm thấy (`file_service.py:246-259`) — hành vi giữ nguyên |
 | Về sau xuất hiện dòng trùng `name = '/'` do race condition | Thấp | Hiện `COUNT(*)` = 1. Code v0.26.4 đã có logic dedup cho `.knowledgebase` (dòng 79) → chuyện trùng là có thật với thư mục khác, nên vẫn cần theo dõi |
 | ❓ Chưa xác minh: có index cụ thể nào trên cột `file.name` | Thấp | Suy ra từ `0.00 sec` trên bảng 631k dòng. Chưa chạy `SHOW INDEX FROM file` để xem tên index |
+
+---
+
+## 4b. Breakdown bước 4 "Update metadata" (5s) — MySQL tham gia những phần nào?
+
+*(Kiên hỏi 11/08. Quan trọng vì đã lỡ báo sếp "số 1 + số 4 đều liên quan MySQL" — cần xác minh
+để đính chính nếu sai.)*
+
+**Endpoint**: `PUT /datasets/<dataset_id>/documents/<document_id>` — `api/apps/restful_apis/document_api.py`
+
+### Luồng đầy đủ, đánh dấu hệ thống nào tham gia
+
+| # | Thao tác | Hệ thống | Chi phí |
+|---|---|---|---|
+| 1 | `KnowledgebaseService.query(id=dataset_id, tenant_id=...)` — kiểm tra quyền sở hữu KB | 🟡 MySQL | Tra khoá chính, 1 dòng |
+| 2 | `KnowledgebaseService.get_by_id(dataset_id)` — lấy KB | 🟡 MySQL | Tra khoá chính, 1 dòng. **Trùng lặp với #1** |
+| 3 | `DocumentService.query(kb_id=..., id=document_id)` — kiểm tra doc thuộc KB | 🟡 MySQL | Tra khoá chính, 1 dòng |
+| 4 | `validate_document_update_fields(...)` | Python | Không query |
+| 5 | `Document.select().join(Knowledgebase).where(Document.id == doc_id)` — lấy `tenant_id` | 🟡 MySQL | JOIN 2 bảng theo khoá chính, 1 dòng. **Trùng lặp với #3** |
+| 6 | `_split_combined_values(meta_fields)` | Python | Xử lý chuỗi |
+| 7 | `index_exist(index_name, "")` | 🔴 **ES** | Round-trip mạng |
+| 8 | `get(doc_id, index_name, [kb_id])` | 🔴 **ES** | Round-trip mạng |
+| 9 | `replace_meta_fields(index_name, doc_id, processed_meta)` — **ghi metadata** | 🔴 **ES** | Round-trip + ghi index |
+| 9b | *(nếu #9 fail)* `delete_document_metadata` + `insert_document_metadata` | 🔴 **ES** | **2 vòng ES nữa** + query MySQL lại |
+
+**MySQL: 4 lần — cả 4 đều tra khoá chính, 1 dòng.**
+**ES: 3 lần — mỗi lần một round-trip mạng tới `10.211.145.107:8051` (máy NGOÀI cluster).**
+
+### Bằng chứng đo thật — 4 câu MySQL đó KHÔNG có trong slow log
+
+```sql
+SELECT LEFT(CONVERT(sql_text USING utf8), 110) AS query, COUNT(*) AS so_lan, ROUND(AVG(query_time),3) AS tb FROM mysql.slow_log WHERE CONVERT(sql_text USING utf8) LIKE '%knowledgebase%' OR CONVERT(sql_text USING utf8) LIKE '%INNER JOIN%knowledgebase%' GROUP BY LEFT(CONVERT(sql_text USING utf8), 110) ORDER BY COUNT(*) DESC LIMIT 6\G
+```
+
+| # | Query | Số lần | tb (s) | Thuộc luồng nào |
+|---|---|---|---|---|
+| 1 | `INSERT INTO file (id, create_time, ..., parent_id, tenant_id)` | 99 | 0.164 | Bước 3 — upload |
+| 2 | `SELECT DISTINCT t1.id, t1.connector_id, t1.task_type...` | 7 | 0.134 | Parsing/task |
+| 3 | `SELECT t1.id, t1.doc_id, t1.from_page, t1.to_page...` | 3 | 0.436 | Parsing/task |
+| 4 | `SELECT t1.id, t1.create_time, ..., t1.avatar` | 2 | 0.206 | Khác |
+| 5-6 | `UPDATE knowledgebase SET update_time=..., doc_num=(...)` | 1+1 | 0.124 | Cập nhật bộ đếm doc |
+
+**Đọc được gì:**
+
+- 🔴 **KHÔNG có câu nào trong 4 câu MySQL của bước 4** (#1, #2, #3, #5 ở bảng trên)
+- Slow log đang bật ngưỡng **0.1s** → mọi câu chạy quá 0.1s đều bị ghi lại
+- ➡️ Cả 4 câu đó chạy **dưới 100ms**, tổng cộng **< 0.4 giây** trong 5 giây của bước này
+
+### ✅ Kết luận: bước 4 KHÔNG phải vấn đề MySQL
+
+| Thành phần | Ước tính trong 5s |
+|---|---|
+| MySQL (4 câu tra khoá chính) | **< 0.4s** — có bằng chứng: không lọt ngưỡng slow log 0.1s |
+| Elasticsearch (3 round-trip) | **~4.6s** — phần còn lại |
+
+⚠️ **Cần đính chính với sếp**: đã báo *"số 1 + số 4 đều liên quan đến MySQL"*. Thực tế:
+- Bước **1 (Check tồn tại)**: ✅ đúng là MySQL
+- Bước **4 (Update metadata)**: ❌ **là Elasticsearch**. MySQL chỉ tra 1 dòng để lấy `tenant_id`
+  (biết ghi vào index ES nào), gần như không tốn thời gian
+
+➡️ Tối ưu MySQL sẽ **không có tác dụng** với bước 4. Muốn giảm 5s này phải xem phía ES:
+độ trễ mạng (ES ngoài cluster), tải ES, số shard, hoặc gộp 3 round-trip thành ít hơn.
+
+### 💡 Ghi nhận: có 2 cặp query MySQL trùng lặp
+
+`#1` vs `#2` và `#3` vs `#5` — cùng lấy một dữ liệu hai lần. **Cùng dạng lỗi** với
+`get_root_folder` bị gọi 2 lần, nhưng **không đáng sửa**: tra khoá chính 1 dòng thì gọi 2 lần
+cũng chỉ tốn thêm vài ms, trong khi `get_root_folder` mỗi lần mất 18 giây.
+
+⭐ **Bài học**: cùng một dạng lỗi code, mức đáng sửa phụ thuộc hoàn toàn vào **chi phí mỗi lần
+gọi**. Phải đo trước khi quyết định sửa.
 
 ---
 
