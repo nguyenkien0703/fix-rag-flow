@@ -44,6 +44,8 @@
 | 9 | `LookupError: Instance default not found` (embedding) | ⚠️ WORKAROUND | Sửa DB thủ công — **bug upstream #17578 chưa fix** |
 | 10 | Query chậm 13-15s trên KB 141k doc (issue #4 cũ) | 🔶 OPEN | AI engineer đã custom image, cần test lại |
 | 11 | **502 ngắt quãng ở `GET /api/v1/datasets`** — nginx `proxy_pass` dùng `localhost` nên thử IPv6 `[::1]`, Flask chỉ nghe IPv4 | ✅ FIXED | Đổi `localhost` → `127.0.0.1` trong `templates/ragflow_config.yaml` |
+| 11b | **Sửa xong `helm upgrade` mà pod vẫn dùng cấu hình cũ** — file `ragflow_config.yaml.bk` trong `templates/` cũng khai báo ConfigMap `nginx-config`, render sau nên ghi đè | ✅ FIXED | `mv` file `.bk` ra ngoài `templates/`. Helm render **mọi** file, kể cả `.bk` |
+| 12 | Pod ragflow bị `Evicted` trên node08 — `The node was low on resource: ephemeral-storage` | ✅ FIXED | Node08 hết đĩa sau khi nạp image ragflow 7-8GB. Đã xử lý disk-pressure |
 
 ---
 
@@ -476,7 +478,216 @@ kubectl -n ragflow exec -it <pod> -c ragflow -- grep -n "proxy_pass\|upstream\|l
   }
 ```
 
-Rồi `helm upgrade ragflow . -n ragflow -f values.yaml`. ✅ **Đã apply, hết 502.**
+Rồi `helm upgrade ragflow . -n ragflow -f values.yaml`.
+
+---
+
+### 🔴 Issue 11b — Sửa xong `helm upgrade` mà pod VẪN dùng cấu hình cũ
+
+> 📖 **Giải thích đầy đủ chuỗi chart → helm upgrade → ConfigMap → pod, và cách truy ra tên
+> ConfigMap**: xem [`docs/chart-configmap-pod-giai-thich.md`](docs/chart-configmap-pod-giai-thich.md)
+
+**Triệu chứng**: đã sửa `templates/ragflow_config.yaml` thành `127.0.0.1`, đã chạy `helm upgrade`,
+pod đã tạo lại (hash mới) — nhưng file trong pod **vẫn là `localhost`**.
+
+**Chuỗi 4 chặng cần kiểm tra** (đứt chặng nào thì cách sửa khác hẳn):
+
+```
+file chart  →  helm upgrade  →  ConfigMap trên cluster  →  file trong pod
+    ↑              ↑                    ↑                        ↑
+  grep      helm get manifest    kubectl get cm          kubectl exec grep
+```
+
+#### Lệnh + output thật (11-12/08/2026, node04)
+
+**① Chặng 4 — file trong pod:**
+
+```
+kubectl -n ragflow exec -it ragflow-65485c74b5-fdkg2 -c ragflow -- grep -n "proxy_pass" /etc/nginx/conf.d/ragflow.conf
+```
+
+```
+14:        proxy_pass http://localhost:9381;
+19:        proxy_pass http://localhost:9380;
+```
+
+🔴 Vẫn cũ. **Chú ý số dòng 14/19** — khác với chart (35/40).
+
+**② Chặng 1 — file chart trên node04:**
+
+```
+grep -n "proxy_pass\|kind: ConfigMap\|name:" templates/ragflow_config.yaml
+```
+
+```
+3:kind: ConfigMap
+5:  name: ragflow-service-config
+17:kind: ConfigMap
+19:  name: nginx-config
+35:            proxy_pass http://127.0.0.1:9381;
+40:            proxy_pass http://127.0.0.1:9380;
+```
+
+✅ Chart **đã sửa đúng**. Ghi nhận thêm: 1 file chứa **2 ConfigMap**.
+
+**③ Chặng 3 — ConfigMap trên cluster:**
+
+```
+kubectl -n ragflow get configmap nginx-config -o yaml | grep -n "proxy_pass"
+```
+
+```
+57:            proxy_pass http://localhost:9381;
+62:            proxy_pass http://localhost:9380;
+```
+
+🔴 ConfigMap trên cluster **vẫn cũ** → chặng đứt nằm giữa ① và ③.
+
+**④ ⭐ Chặng 2 — Helm đã gửi gì (lệnh phát hiện thủ phạm):**
+
+```
+helm get manifest ragflow -n ragflow | grep -n "proxy_pass"
+```
+
+```
+ 93:            proxy_pass http://127.0.0.1:9381;   ← bản ĐÃ SỬA
+ 98:            proxy_pass http://127.0.0.1:9380;
+186:            proxy_pass http://localhost:9381;   ← bản CŨ VẪN CÒN
+191:            proxy_pass http://localhost:9380;
+```
+
+🔴 **CẢ HAI cùng tồn tại** → có **2 nơi** cùng khai báo ConfigMap `nginx-config`.
+
+**⑤ Xem manifest quanh dòng 186 để biết nguồn:**
+
+```
+helm get manifest ragflow -n ragflow | sed -n '150,195p'
+```
+
+```
+---
+# Source: ragflow/templates/ragflow_config.yaml.bk      ← ⭐⭐ ĐUÔI .bk
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config                                    ← TRÙNG TÊN
+data:
+  ragflow.conf.python: |
+    ...
+            proxy_pass http://localhost:9381;
+```
+
+**⑥ Xác nhận `helm upgrade` đã chạy thật (loại trừ nghi ngờ chưa apply):**
+
+```
+pwd && ls -la templates/ragflow_config.yaml && helm history ragflow -n ragflow | tail -5
+```
+
+```
+/home/app/app/helm_ragflow_v0.26.4
+-rw-r--r-- 1 app app 2415 Aug 11 15:35 templates/ragflow_config.yaml
+
+65  Tue Aug 11 15:36:01 2026  superseded  ragflow-0.1.1  dev  Upgrade complete
+66  Tue Aug 11 15:41:30 2026  superseded  ragflow-0.1.1  dev  Upgrade complete
+67  Tue Aug 11 15:41:33 2026  superseded  ragflow-0.1.1  dev  Upgrade complete
+68  Wed Aug 12 12:06:02 2026  superseded  ragflow-0.1.1  dev  Upgrade complete
+69  Wed Aug 12 12:10:30 2026  deployed    ragflow-0.1.1  dev  Upgrade complete
+```
+
+✅ File sửa lúc 15:35, revision 65 lúc 15:36 → **Helm ĐÃ apply**. Vấn đề không phải "quên upgrade".
+
+#### 🔴 Root cause: Helm render MỌI file trong `templates/`, kể cả đuôi `.bk`
+
+| File | Nội dung | Thứ tự render | Kết quả |
+|---|---|---|---|
+| `ragflow_config.yaml` | ✅ `127.0.0.1` | Trước | Bị ghi đè |
+| `ragflow_config.yaml.bk` | 🔴 `localhost` | **Sau** | ⭐ **THẮNG** |
+
+Hai file cùng khai báo ConfigMap tên `nginx-config` → cái apply sau đè lên cái trước.
+
+⚠️ **Helm KHÔNG có khái niệm "file sao lưu"** và **không cảnh báo gì**. `helm upgrade` báo
+`Upgrade complete`, pod tạo lại bình thường — chỉ có nội dung là sai.
+
+⭐ **Vì sao thiết kế thế**: Helm không thể đoán đuôi nào là rác (`.bk`, `.old`, `.orig`, `.save`...).
+Quy tắc đơn giản: đọc hết, trừ file bắt đầu bằng `_`.
+
+#### Cách sửa
+
+```
+mv templates/ragflow_config.yaml.bk /home/app/app/ragflow_config.yaml.bk.backup
+```
+
+Dùng `mv` chứ không `rm` — file tồn tại **89 ngày**, nghĩa là mọi thay đổi cho
+`ragflow_config.yaml` suốt thời gian đó đều bị nó ghi đè. Cần `diff` để xem còn gì bị vô hiệu hoá.
+
+Kiểm tra còn file lạ khác:
+
+```
+ls -la templates/ | grep -v "\.yaml$"
+```
+
+| Cờ | Ý nghĩa |
+|---|---|
+| `-v` | invert — **loại bỏ** dòng khớp |
+| `\.yaml$` | `\.` = dấu chấm thật; `$` = kết thúc dòng |
+
+**3 cách "tắt" file template đúng:**
+
+| Cách | Đánh giá |
+|---|---|
+| `mv` ra ngoài `templates/` | ✅ Tốt nhất — giữ file để tra lại |
+| Đổi tên bắt đầu bằng `_` | ✅ Helm bỏ qua file `_*` |
+| `rm` xoá hẳn | ⚠️ Mất luôn |
+
+#### ⭐ Cách truy ra TÊN ConfigMap (câu hỏi của Kiên)
+
+**Cách 1 — từ pod (khi không có chart):**
+
+```
+kubectl -n ragflow describe pod ragflow-65485c74b5-fdkg2 | grep -A6 "Volumes:"
+```
+
+```
+Volumes:
+  nginx-config-volume:
+    Type:      ConfigMap (a volume populated by a ConfigMap)
+    Name:      nginx-config           ← Kubernetes TỰ KHAI BÁO
+    Optional:  false
+```
+
+**Cách 2 — từ chart:**
+
+```
+grep -rn "kind: ConfigMap" -A4 templates/
+```
+
+**Cách 3 — đối chiếu Helm đã gửi (mạnh nhất khi debug):**
+
+```
+helm get manifest ragflow -n ragflow
+```
+
+| Lệnh | Nguồn | Trả lời |
+|---|---|---|
+| `helm template .` | File **trên đĩa** | "Nếu apply thì YAML sẽ ra sao?" |
+| `helm get manifest` | ⭐ Bản **ĐÃ apply lên cluster** | "Helm thực sự gửi gì?" |
+
+#### Vì sao sửa ConfigMap lại rollout được pod
+
+`templates/ragflow.yaml:24-27`:
+
+```yaml
+      annotations:
+        checksum/values: {{ .Values | toYaml | sha256sum }}
+        checksum/config-ragflow: {{ include (print $.Template.BasePath "/ragflow_config.yaml") . | sha256sum }}
+```
+
+Nội dung ConfigMap đổi → `sha256sum` đổi → annotation đổi → pod template đổi → K8s tạo ReplicaSet mới.
+
+⚠️ **Không có annotation này** thì ConfigMap được cập nhật nhưng pod vẫn dùng bản đã mount →
+phải `kubectl -n ragflow rollout restart deployment/ragflow` thủ công.
+
+✅ **Đã apply, hết 502.**
 
 💡 **Vì sao sửa ConfigMap lại rollout được pod**: nhờ annotation `ragflow.yaml:27`
 `checksum/config-ragflow: {{ include ... | sha256sum }}`. Sửa ConfigMap → checksum đổi → pod
@@ -706,6 +917,11 @@ knowledgebase (20 KB):  embd_id=qwen3-8b-embedding___OpenAI-API@OpenAI-API-Compa
 | Chart và image có **hợp đồng ngầm**: file nào entrypoint tự tạo/ghi thì chart không được mount đè | Đọc `entrypoint.sh` của image mới trước khi nâng version |
 | StatefulSet không tự rollout như Deployment — pod hỏng có thể chặn cả chuỗi | `kubectl delete pod <sts>-0` để force |
 | **`localhost` trong `proxy_pass` phân giải ra CẢ IPv6 (`::1`) lẫn IPv4.** Nginx thử IPv6 trước; backend chỉ nghe IPv4 → 502 **ngắt quãng** | Trong container luôn dùng `127.0.0.1` thay `localhost` cho upstream nội bộ. Dấu hiệu: 502 trả về **rất nhanh** (~36ms) chứ không phải timeout |
+| ⭐⭐ **Helm render MỌI file trong `templates/`, kể cả `.bk`/`.old`/`.orig`.** Đổi tên file để "tắt" nó **không có tác dụng** — còn tệ hơn: tạo tài nguyên trùng tên ghi đè lẫn nhau, **im lặng, không cảnh báo** | `ls -la templates/ \| grep -v "\.yaml$"` sau mỗi lần sửa chart. Muốn tắt file: `mv` ra ngoài `templates/` hoặc đổi tên bắt đầu bằng `_` |
+| ⭐⭐ **Sửa chart mà không ăn → kiểm tra theo 4 CHẶNG, đừng đoán mò**: file chart → `helm get manifest` → ConfigMap trên cluster → file trong pod | Mỗi chặng 1 lệnh. Chặng đầu đúng mà chặng sau sai → biết ngay đứt ở đâu. Xem `docs/chart-configmap-pod-giai-thich.md` |
+| **`helm get manifest` ≠ `helm template`.** `template` render từ file **trên đĩa** (dự đoán); `get manifest` cho thấy Helm **THẬT SỰ đã gửi gì** lên cluster | Khi debug "sửa rồi mà không ăn", luôn tin `get manifest` |
+| **Muốn biết pod dùng ConfigMap nào: `describe pod \| grep -A6 "Volumes:"`** — Kubernetes tự khai báo `Type: ConfigMap` + `Name:` | Không cần mở chart, không cần đoán tên |
+| **Nạp image lên node để gỡ `ImagePullBackOff` có thể gây `Evicted` do hết `ephemeral-storage`** — image ragflow 7-8GB | Trước khi nạp image lên node mới: `df -h /var/lib/containerd`. Sau đó theo dõi `kubectl describe node <node> \| grep -A8 Conditions:` |
 | **Log nginx KHÔNG nằm trong `kubectl logs`** — nó ghi vào `/var/log/nginx/error.log` bên trong container | Grep `kubectl logs` không ra gì ≠ không có lỗi. Phải `exec ... -- tail /var/log/nginx/error.log` |
 | **Sửa ConfigMap chỉ rollout pod nếu template có annotation `checksum/...`** | `grep -n checksum templates/*.yaml`. Không có → phải `rollout restart` thủ công, nếu không pod vẫn dùng bản mount cũ |
 | Image tối giản **không có `netstat`/`ss`/`curl`** — đừng phụ thuộc vào chúng khi chẩn đoán | Ưu tiên đọc file log và file cấu hình bằng `grep`/`tail`, luôn dùng được |
