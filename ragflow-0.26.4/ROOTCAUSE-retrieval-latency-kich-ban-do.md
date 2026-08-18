@@ -84,3 +84,66 @@ kubectl -n ragflow logs -l app.kubernetes.io/component=ragflow -c ragflow -f --t
 grep -icE "Deadlock found" /tmp/db.log     # kỳ vọng: 0
 ```
 Tiêu chí đạt: **0 dòng deadlock** và latency retrieval ổn định quanh 2-3s (thay vì 2-22s).
+
+---
+
+# 11. ⚠️ CAN THIỆP THỰC TẾ — deadlock KHÔNG phải root cause chính
+
+**Ngày 2026-08-18, sau khi rollout mitigation.**
+
+## 11.1. Can thiệp
+
+```bash
+kubectl -n ragflow set env deployment/ragflow PIPELINE_OPERATION_LOG_LIMIT=100000000
+kubectl -n ragflow rollout status deployment/ragflow
+```
+Rollout thành công, 3 pod mới. Xác nhận env đã vào pod:
+```
+kubectl -n ragflow exec $POD -c ragflow -- printenv PIPELINE_OPERATION_LOG_LIMIT
+100000000
+```
+
+## 11.2. Kết quả đo sau can thiệp (10 request)
+
+```
+Deadlock found:       0        <-- nguyên nhân đã tắt HOÀN TOÀN
+Cleaned ... old logs: 0        <-- trim không còn chạy
+DB execution failure: (không dòng nào)
+
+10 request: 9.526 8.118 9.974 8.130 11.391 7.887 8.236 5.828 4.989 3.170
+```
+
+## 11.3. So sánh trước/sau
+
+| | Trước (10 mẫu, §7) | Sau (10 mẫu) |
+|---|---|---|
+| min | 3.328 | 3.170 |
+| max | **22.290** | **11.391** |
+| trung bình | ~10.0 | 7.7 |
+| biên độ | **6.7×** | **3.6×** |
+
+## 11.4. 🔴 Kết luận phải sửa
+
+**Deadlock là bug thật, đã fix đúng — nhưng KHÔNG phải root cause chính.**
+
+- Deadlock **có** đóng góp: nó tạo ra các cực trị 20s+. Gỡ đi → đuôi dài bị cắt 22s → 11s,
+  biên độ giảm gần một nửa.
+- Nhưng **nền ~8s vẫn nguyên vẹn** ⟹ bên dưới còn một nguồn chậm khác,
+  **ổn định hơn và lớn hơn**.
+
+> 💡 Giá trị phương pháp: suốt 6 phiên, deadlock đã **làm nhiễu mọi phép đo** — các cực trị
+> 20s ngẫu nhiên chen vào khiến không thể nhìn thấy nền 8s ổn định bên dưới. Giờ đo trong
+> môi trường đã **bớt một biến nhiễu**, tín hiệu sẽ sạch hơn nhiều.
+
+> ⚠️ **Bài học 0g — "khớp mọi dấu vân tay" KHÔNG đồng nghĩa "là nguyên nhân duy nhất".**
+> Ở §9.6 tôi lập bảng cho thấy deadlock khớp cả 7 dấu vân tay đã đo, và kết luận đã tìm ra
+> root cause. Bảng đó **không sai** — deadlock thật sự khớp cả 7. Nhưng một nguyên nhân thứ hai
+> **cùng bản chất** (chờ I/O, không tốn CPU, không sinh log HTTP) sẽ khớp **y hệt** bộ dấu vân tay đó.
+> Dấu vân tay chỉ thu hẹp được **loại** nguyên nhân, không đếm được **số lượng** nguyên nhân.
+> Chỉ có **can thiệp** (tắt nguyên nhân, đo lại) mới phân biệt được.
+
+## 11.5. Trạng thái mitigation
+
+**GIỮ NGUYÊN** `PIPELINE_OPERATION_LOG_LIMIT=100000000` để tiếp tục điều tra
+trong môi trường không nhiễu. Patch §10 vẫn đúng và vẫn cần build — nhưng
+**không được bàn giao như "fix xong issue"**, mà là "fix một trong các nguyên nhân".
