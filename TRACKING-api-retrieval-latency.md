@@ -12,31 +12,24 @@ query, lúc trả về **~2s**, lúc **>20s**.
 **Đây KHÔNG phải issue mới** — là Issue #4 / Issue 10 đã điều tra trước đó, nhưng bối cảnh
 đã thay đổi đáng kể (xem mục 2). File này bám tiếp đúng issue đó ở scale mới.
 
-> ## ✅ ROOT CAUSE ĐÃ CHỐT (2026-08-18) — đọc mục 4 và 4.5
+> ## 🔴 TRẠNG THÁI: CHƯA TÌM RA ROOT CAUSE — mọi tầng đo được đều đã bị loại trừ
 >
-> **Bottleneck KHÔNG nằm ở Elasticsearch.** Số đo: ES trung bình **<1ms/query**, chiếm **1.7s
-> trong 3.6s**; network chỉ **6ms**. Toàn bộ phần chậm và **toàn bộ phần dao động** nằm ở
-> **Python trong `ragflow_server`** (1.9s → 8.4s giữa 2 lần đo cùng query).
+> **Số học không khớp, đây là điều cần giải thích:**
+> ES **1.7s** + embedding **0.15s** + network **6ms** ≈ **1.9s**. Tổng thực tế **3.6s → 28.2s**.
+> ⟹ **Còn 1.7s đến 26.3s không thuộc bất kỳ tầng nào đã đo.** Xem bảng 3.16.
 >
-> Ba nguyên nhân, tất cả ở tầng Python:
-> - **A. Embedding query xếp hàng sau ingest** → gây **BẤT ỔN ĐỊNH**. Retrieval phải embed câu hỏi
->   qua `qwen3-8b-embedding`, cùng endpoint mà `task_executor` đang bơm liên tục (≥8 doc/23s,
->   0.59–1.43s mỗi batch), **cùng pod, cùng KB**.
-> - ~~**B. `topk=1024`**~~ và ~~**C. rerank/re-tokenize CPU-bound**~~ → ❌ **ĐÃ BỊ PHỦ ĐỊNH (3.11–3.13).**
->   A/B xen kẽ 8 cặp: `topk=256` **không nhanh hơn** (mean 13.9s vs 15.8s, thắng/thua 4–4, và `topk=1024`
->   cho 2 lần nhanh nhất toàn phép đo: 2.15s/2.96s). Kết quả trả về **y hệt** (cùng 10 chunk, cùng
->   thứ tự). **CPU pod chỉ 10–20%** (Kiên quan sát) ⟹ không có tầng nào CPU-bound.
+> **Đã loại trừ hết (đừng điều tra lại — mỗi cái đều có số đo):**
+> Elasticsearch (<1ms/query) · network client (6ms) · payload (270KB/6ms) · **CPU pod (10–20%)** ·
+> **embedding LiteLLM (~150ms, biên độ 2×, đo ĐÚNG LÚC ingest chạy, không có hàng đợi FIFO)** ·
+> `topk` 1024 vs 256 (A/B 4–4, kết quả y hệt) · `metadata_condition` (bỏ đi còn chậm hơn) ·
+> `minimum_should_match` · load-balance 3 pod · tokenizer/stopword tiếng Việt.
 >
-> **⟹ CPU 10–20% là mấu chốt: 15 giây đó là thời gian CHỜ (I/O wait), không phải thời gian TÍNH.**
-> Đã loại trừ hết: ES (<1ms), network client (6ms), payload (270KB), CPU nội bộ (10–20%).
-> **Chỉ còn MỘT ứng viên: lời gọi `qwen3-8b-embedding` qua API ngoài.**
+> **CPU 10–20% ⟹ latency là I/O WAIT.** Nhưng cả hai đích I/O đã biết (ES, embedding) đều nhanh và
+> ổn định. ⟹ Đang chờ **một thứ chưa được nhìn tới**.
 >
-> **Vì sao mọi fix trước thất bại:** `minimum_should_match` giảm số doc ES match — nhưng ES vốn
-> không phải bottleneck. **Nhắm sai tầng suốt 3 phiên.**
->
-> **Fix (mục 4.5):** **Fix 3 tách/scale endpoint embedding là fix CHÍNH** (contention ở embedding
-> service, không ở CPU pod) + Fix 1 tách `task_executor` + Fix 4 giảm cường độ ingest.
-> ❓ **Còn phải verify:** đo trực tiếp latency `qwen3-8b-embedding` khi ingest chạy vs khi nghỉ.
+> **⚠️ Bài học của phiên (mục 5, điểm 0–0d):** đã suy luận sai **3 lần** (topk, rerank CPU-bound,
+> embedding) — **cả 3 đều vì đoán từ source code thay vì đo.** Bước tiếp: **profile trực tiếp trong
+> process** (`py-spy dump --pid 48`) hoặc bisect bằng biến thể request. **Không đoán tiếp.**
 
 ### Bối cảnh hệ thống
 
@@ -64,6 +57,9 @@ query, lúc trả về **~2s**, lúc **>20s**.
 | 7 | ~~ROOT CAUSE C — re-tokenize/rerank CPU-bound~~ | — | ❌ **PHỦ ĐỊNH (3.13)** — **CPU pod chỉ 10–20%** (Kiên quan sát trực tiếp). Nếu tokenize/rerank 1024 candidate thì CPU phải cao. Khớp với 3.11/3.12 | Đóng hướng. `pyvi` không phải vấn đề hiệu năng |
 | 9 | 🔴 **HỆ QUẢ TỪ CPU 10–20%: latency là I/O WAIT, không phải CPU.** Sau khi loại ES (<1ms), network client (6ms), payload (270KB), CPU (10–20%) ⟹ chỉ còn lời gọi **`qwen3-8b-embedding` qua API ngoài** | Cao | 🔴 **ỨNG VIÊN DUY NHẤT CÒN LẠI** — logic loại trừ đã đóng kín, nhưng ❓ **chưa đo trực tiếp** embedding service | Đo latency embedding trực tiếp khi ingest chạy vs nghỉ (việc tiếp theo) |
 | 8 | Giả thuyết `metadata_condition contains` gây N+1 / filter-in-Python | Cao | ❌ **PHỦ ĐỊNH (3.9)** — bỏ hẳn `metadata_condition` KHÔNG nhanh hơn, còn **chậm hơn** (14.2s/19.2s vs 3.6-10.2s) | Đóng hướng này. Ghi vào Bài học |
+
+| 10 | ~~ROOT CAUSE A — embedding xếp hàng sau ingest~~ | — | ❌ **PHỦ ĐỊNH (3.15)** — đo trực tiếp LiteLLM `10.208.137.53:8992` **đúng lúc ingest chạy**: **~150ms**, min 0.116 max 0.238 (**biên độ 2×**); 5 request song song về cùng lúc ⟹ **không có hàng đợi FIFO**. Chiếm 4% tổng, không đóng góp vào dao động | Đóng hướng. `EMBEDDING_BATCH_SIZE=16` cũng vô can |
+| 11 | 🔴 **VẤN ĐỀ CÒN LẠI: 1.7s–26.3s không thuộc tầng nào đã đo.** ES 1.7s + embedding 0.15s + network 0.006s ≈ 1.9s, thực tế 3.6–28.2s | Cao | 🔴 **OPEN — chưa có nghi phạm nào có bằng chứng.** CPU 10–20% ⟹ I/O wait, nhưng cả 2 đích I/O đã biết đều nhanh | **Profile trực tiếp trong process** (`py-spy dump --pid 48`) khi request đang chậm, hoặc bisect bằng `vector_similarity_weight` 1.0/0.0/0.6. KHÔNG suy luận từ source nữa |
 
 ## 3. Lệnh đã chạy
 
@@ -1029,14 +1025,14 @@ select * from tenant_model_instance;
 
 ```
 | id                               | create_date         | instance_name      | provider_id                      | api_key                  | status | extra                                                        |
-| 05e030d29a2a11f1b5b2fba64e6ce34f | 2026-08-17 18:54:30 | LiteLLM            | 8af1a5e69a2811f1b5b2fba64e6ce34f | sk-dqwMDlF1pCG_xxPF228_Vw | active | {"base_url": "http://10.208.137.53:8992/", "region": "default"} |
-| 5d3e78d28cd511f18d5d67e68cb92881 | 2026-07-31 19:45:44 | qwen3-8b-embedding | 909c21f68cbd11f1aa37635d6e0f142c | sk-dqwMDlF1pCG_xxPF228_Vw | active | {"base_url": "http://10.208.137.53:8992/", "region": "default"} |
+| 05e030d29a2a11f1b5b2fba64e6ce34f | 2026-08-17 18:54:30 | LiteLLM            | 8af1a5e69a2811f1b5b2fba64e6ce34f | <REDACTED> | active | {"base_url": "http://10.208.137.53:8992/", "region": "default"} |
+| 5d3e78d28cd511f18d5d67e68cb92881 | 2026-07-31 19:45:44 | qwen3-8b-embedding | 909c21f68cbd11f1aa37635d6e0f142c | <REDACTED> | active | {"base_url": "http://10.208.137.53:8992/", "region": "default"} |
 2 rows in set (0.01 sec)
 ```
 
 **Đọc được gì:**
 
-1. 🎯 **ENDPOINT TÌM ĐƯỢC: `http://10.208.137.53:8992/`** — API key `sk-dqwMDlF1pCG_xxPF228_Vw`.
+1. 🎯 **ENDPOINT TÌM ĐƯỢC: `http://10.208.137.53:8992/`** — API key `<REDACTED>`.
 2. 🔴 **CẢ HAI instance (`LiteLLM` và `qwen3-8b-embedding`) dùng CÙNG MỘT `base_url`** ⟹ đây là
    **LiteLLM gateway**, và embedding đi qua chính gateway đó. **Không có đường riêng cho retrieval.**
 3. **`10.208.137.53` là IP NODE, không phải ClusterIP** (ClusterIP là dải `172.16.x.x`, ví dụ MySQL
@@ -1062,7 +1058,89 @@ của ingest ngắn hơn ⟹ retrieval chờ ít hơn (cơ chế "nhường đư
 
 ---
 
-## 4. Issue chi tiết — 1 ứng viên còn lại (embedding), 5 giả thuyết đã bị phủ định
+### 3.15 🔴 BƯỚC 0 — Đo trực tiếp embedding service: EMBEDDING VÔ CAN (giả thuyết thứ 3 bị phủ định)
+
+Chạy trên `vrp-kubeengine04`, **đúng lúc ingest đang hoạt động**.
+
+```
+curl -s -X GET 'http://10.208.137.53:8992/v1/models' -H 'Authorization: Bearer <REDACTED>' | python3 -m json.tool | head -40
+```
+
+**Output (trích):** `qwen3-8b-embedding`, `qwen3.5-397b-a17b-fp8`, `qwen3-embedding`, `bge-m3`,
+`dall-e-3`, `qwen3-32b`, `qwen3.5-35b-a3b` — tất cả `owned_by: openai` (LiteLLM chuẩn hoá).
+⟹ Gateway sống, tên model `qwen3-8b-embedding` đúng.
+
+**Đo tuần tự 10 lần:**
+
+```
+for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null -w "embed run=$i total=%{time_total}\n" -X POST 'http://10.208.137.53:8992/v1/embeddings' -H 'Authorization: Bearer <REDACTED>' -H 'Content-Type: application/json' -d '{"model":"qwen3-8b-embedding","input":"quy tắc quy trình quy định về điều lệnh"}'; done
+```
+
+```
+embed run=1 total=0.218    embed run=6  total=0.161
+embed run=2 total=0.148    embed run=7  total=0.144
+embed run=3 total=0.116    embed run=8  total=0.154
+embed run=4 total=0.117    embed run=9  total=0.119
+embed run=5 total=0.148    embed run=10 total=0.165
+```
+
+**Đo 5 request SONG SONG** (kiểm tra hàng đợi FIFO):
+
+```
+for i in 1 2 3 4 5; do (curl -s -o /dev/null -w "parallel$i total=%{time_total}\n" -X POST 'http://10.208.137.53:8992/v1/embeddings' -H 'Authorization: Bearer <REDACTED>' -H 'Content-Type: application/json' -d '{"model":"qwen3-8b-embedding","input":"quy tắc quy trình quy định về điều lệnh"}' &) ; done; sleep 30
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `( ... &)` | subshell nền ⟹ 5 request bay đi **CÙNG LÚC**, không đợi nhau. Nếu viết `curl; curl; ...` thì thành tuần tự, không kiểm được hàng đợi |
+| `sleep 30` | giữ shell sống để output từ các subshell kịp in ra (không có thì shell thoát, mất output) |
+| **Vì sao cần phép đo này** | Nếu thời gian **tăng dần** (1s,2s,3s...) ⟹ xử lý tuần tự/FIFO ⟹ xác nhận cơ chế "retrieval đợi sau batch ingest". Nếu **về cùng lúc** ⟹ song song tốt, cơ chế đó sai |
+
+```
+parallel3 total=0.124
+parallel4 total=0.176
+parallel5 total=0.183
+parallel2 total=0.218
+parallel1 total=0.238
+```
+
+**Đọc được gì:**
+
+1. 🔴 **EMBEDDING KHÔNG PHẢI NGUYÊN NHÂN — Root cause A BỊ PHỦ ĐỊNH.** Latency **~150ms**
+   (min 0.116, max 0.238) ⟹ **biên độ chỉ 2×**, cực kỳ ổn định. So với retrieval 3.6–28.2s
+   (biên độ 14×): embedding chiếm **~0.15s / 3.6s = 4%**, và **không đóng góp gì vào phần dao động**.
+2. 🔴 **KHÔNG có hàng đợi FIFO.** 5 request song song về trong 0.124–0.238s, **không tăng dần**
+   ⟹ LiteLLM xử lý đồng thời tốt. ⟹ **Giả thuyết `EMBEDDING_BATCH_SIZE=16` gây nghẽn hàng đợi: SAI.**
+3. ⭐ **Quan trọng nhất: phép đo này chạy ĐÚNG LÚC INGEST ĐANG HOẠT ĐỘNG.** Nghĩa là ngay cả khi
+   `task_executor` bơm batch 16-chunk liên tục, embedding **vẫn** trả về trong 150ms
+   ⟹ **không có contention ở embedding service.** Toàn bộ Root cause A sụp đổ.
+4. 🔴 **SỐ HỌC KHÔNG KHỚP — đây là điều cần giải thích tiếp:**
+   ES 1.7s + embedding 0.15s + network 0.006s ≈ **1.9s**, nhưng tổng thực tế **3.6s → 28.2s**.
+   ⟹ **Còn 1.7s đến 26.3s KHÔNG THUỘC bất kỳ tầng nào đã đo.**
+
+---
+
+### 3.16 Bảng tổng kết loại trừ — mọi tầng đã đo đều KHÔNG phải nguyên nhân
+
+| Tầng | Chi phí đo được | Biên độ | Lệnh | Trạng thái |
+|---|---|---|---|---|
+| Elasticsearch | 1.7s tổng, **<1ms/query** | ổn định | 3.6, 3.8 | ❌ loại |
+| Network → client | **6ms** | — | 3.7 | ❌ loại |
+| Payload/serialize | 270KB, trong 6ms | — | 3.7 | ❌ loại |
+| CPU pod | **10–20%** | — | 3.13 | ❌ loại |
+| **Embedding (LiteLLM)** | **~150ms** | **2×** | **3.15** | ❌ **loại** |
+| `topk` 1024 vs 256 | không khác | 4–4 | 3.11, 3.12 | ❌ loại |
+| `metadata_condition` | bỏ đi CHẬM HƠN | — | 3.9 | ❌ loại |
+| **TỔNG đã giải thích** | **~1.9s** | | | |
+| **THỰC TẾ** | **3.6s → 28.2s** | **14×** | 3.2 | 🔴 **thiếu 1.7–26.3s** |
+
+**Đọc được gì:** phần chậm VÀ phần dao động **không nằm ở tầng nào đã đo**. Phải profile trực tiếp
+trong process (`py-spy dump`) hoặc bisect bằng biến thể request — **không suy luận từ source nữa**
+(xem Bài học 0d).
+
+---
+
+## 4. Issue chi tiết — 3 root cause từng chốt ĐỀU BỊ PHỦ ĐỊNH, chưa tìm ra nguyên nhân
 
 ### 4.0 Bảng tách tầng thời gian (số liệu thật, không suy đoán)
 
@@ -1080,8 +1158,21 @@ Cùng MỘT query, đo 4 lần trong ~40 phút:
 - **ES: 1.7s, query trung bình <1ms/query** ⟹ **KHÔNG phải bottleneck** (3.6 + 3.8).
 - **Python trong `ragflow_server`: 1.9s → 8.4s, dao động 4.5×** ⟹ **ĐÂY LÀ TOÀN BỘ VẤN ĐỀ.**
 
-### 4.1 🔴 ROOT CAUSE A — Embedding query xếp hàng sau luồng ingest (nguyên nhân chính của **BẤT ỔN ĐỊNH**)
+### 4.1 ❌ ~~ROOT CAUSE A — Embedding xếp hàng sau ingest~~ — ĐÃ BỊ PHỦ ĐỊNH (3.15)
 
+> **KẾT LUẬN NÀY ĐÃ SAI — đây là lần sai thứ 3 của phiên.** Đo trực tiếp LiteLLM
+> `http://10.208.137.53:8992/v1/embeddings` **đúng lúc ingest đang chạy**: **~150ms**, min 0.116,
+> max 0.238 ⟹ **biên độ chỉ 2×**. 5 request song song về cùng lúc ⟹ **không có hàng đợi FIFO**.
+> Embedding chiếm ~4% tổng thời gian và **không đóng góp gì vào phần dao động**.
+>
+> **Vì sao lập luận cũ sai:** tôi lấy log ingest `Embedding chunks (0.59s–1.43s)` làm bằng chứng
+> rằng embedding chậm. Nhưng đó là thời gian ingest xử lý **16 chunk một lượt** (`EMBEDDING_BATCH_SIZE=16`),
+> **không nói gì** về latency mà một request 1-câu của retrieval phải chờ. Phải tự gọi thẳng vào
+> service mà đo — và khi đo thì nó nhanh.
+>
+> Giữ lại phần dưới để ghi nhận lập luận đã dùng.
+
+**Lập luận cũ (đã bị phủ định):**
 **Cơ chế:**
 1. Mỗi request retrieval **bắt buộc** embed câu hỏi: `search.py:56` `emb_mdl.encode_queries`,
    `search.py:199` `get_vector(qst, emb_mdl, topk, ...)` → gọi `qwen3-8b-embedding` qua **API ngoài**.
@@ -1153,79 +1244,101 @@ Chi phí tỷ lệ với **số candidate Python phải xử lý**, không tỷ 
 
 ---
 
-## 4.5 ⭐ HƯỚNG FIX (cập nhật sau 3.11–3.13 — Fix 2 đã bị loại, Fix 3 thành fix CHÍNH)
+## 4.5 🔴 HƯỚNG ĐIỀU TRA TIẾP — CHƯA CÓ FIX NÀO ĐƯỢC XÁC NHẬN
 
-> **Đổi hướng quan trọng:** CPU pod chỉ 10–20% ⟹ latency là **I/O wait**, không phải CPU-bound.
-> Contention **không** ở CPU pod ⟹ chỉ tách process (Fix 1) là **KHÔNG ĐỦ**. Phải xử lý ở
-> **embedding service dùng chung** (Fix 3).
+> **Trạng thái thật:** cả 3 root cause từng "chốt" (A/B/C) đều đã bị phủ định bằng số đo.
+> **Không có fix nào sẵn sàng để deploy.** Mọi đề xuất fix trước đó trong file này đã bị gạch.
 
-### ⏸️ BƯỚC 0 (BẮT BUỘC LÀM TRƯỚC) — Đo trực tiếp `qwen3-8b-embedding`
+### Vấn đề cần giải thích
 
-Toàn bộ hướng fix dưới đây dựa trên **suy luận loại trừ** (đã đóng kín: không phải ES, network,
-payload, CPU ⟹ chỉ còn embedding). Nhưng **chưa đo trực tiếp embedding service**. Không được deploy
-fix nào trước khi có số này — bài học của phiên này là **suy luận từ code mà không đo ⟹ sai 2 lần**
-(Root cause B và C).
+| | |
+|---|---|
+| ES | 1.7s |
+| Embedding | 0.15s |
+| Network + serialize | 0.006s |
+| **Tổng giải thích được** | **~1.9s** |
+| **Thực tế** | **3.6s → 28.2s** |
+| **🔴 KHÔNG GIẢI THÍCH ĐƯỢC** | **1.7s → 26.3s** |
 
-**Cần lấy:**
-1. Endpoint thật của `qwen3-8b-embedding` (đang serve bởi LiteLLM? vLLM? service riêng?).
-2. Latency **một** lời gọi embedding khi **ingest đang chạy** (kỳ vọng: nhiều giây).
-3. Latency **một** lời gọi embedding khi **ingest tạm nghỉ/pause** (kỳ vọng: <0.5s).
+CPU pod chỉ **10–20%** ⟹ đây là **I/O wait**, không phải tính toán. Nhưng cả hai đích I/O đã biết
+(ES, LiteLLM) đều nhanh và ổn định. ⟹ **Đang chờ một thứ chưa được nhìn tới.**
 
-**Nếu (2) ≫ (3) ⟹ root cause chốt dứt điểm, Fix 3 là đúng.**
-**Nếu (2) ≈ (3) ≈ nhanh ⟹ embedding vô can, phải mở lại điều tra** — lúc đó nghi phạm còn lại là
-tầng nào chờ khác trong Python (connection pool, lock, async event loop bị block).
+### BƯỚC TIẾP — profile trực tiếp, KHÔNG suy luận từ source
 
-### FIX 3 ⭐⭐⭐ — Tách/scale endpoint embedding (FIX CHÍNH sau khi đổi hướng)
+**Vì sao bắt buộc profile:** đã sai 3 lần vì đoán từ code (Bài học 0d). Cần biết process **đứng ở
+dòng nào** khi request chậm, không phải đoán dòng nào *trông* nặng.
 
-**Vấn đề nó giải:** Root cause A — retrieval chờ embedding đang bị ingest bơm liên tục.
+**❌ Cách 1 — `py-spy dump`: ĐÃ THỬ, KHÔNG DÙNG ĐƯỢC.**
 
-**Bằng chứng:** 3.6 (ingest gọi `Embedding chunks` 0.59–1.43s/batch, ≥8 doc/23s, không nghỉ),
-3.4 (tỷ lệ traffic 320 ingest : 9 retrieval), 3.13 (CPU thấp ⟹ đang chờ I/O).
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'pip install py-spy 2>/dev/null | tail -1; ls /ragflow/.venv/bin/py-spy 2>/dev/null || which py-spy'
+```
+```
+command terminated with exit code 1
+```
 
-**Ba lựa chọn, theo mức độ triệt để:**
-- **3a — Tăng replica embedding service.** Đơn giản nhất nếu nó là deployment tự quản trong cụm.
-  Nhưng nếu bottleneck là GPU thì tăng replica không giúp (cần thêm GPU).
-- **3b — Tách endpoint riêng cho retrieval vs ingest** (triệt để nhất). Retrieval dùng endpoint
-  riêng, không bao giờ bị tải ingest chen. ❓ Cần kiểm tra RAGFlow v0.26 có cho cấu hình embedding
-  model **khác nhau** cho luồng query vs luồng index không.
-- **3c — Rate-limit / priority queue ở tầng embedding gateway.** Nếu đang qua LiteLLM: đặt ưu tiên
-  cho request retrieval, hoặc giới hạn concurrency của ingest.
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'py-spy dump --pid 48'
+```
+```
+sh: 1: py-spy: not found
+command terminated with exit code 127
+```
 
-### FIX 1 ⭐⭐ — Tách `task_executor` ra khỏi pod API (vẫn nên làm, nhưng không đủ một mình)
+**Đọc được gì:** `pip install` thất bại (exit 1) — image tối giản, **không có network ra ngoài** để
+tải package. `py-spy` không có sẵn (exit 127). ⟹ **Không profile được trong container.**
+Khớp bài học cũ đã ghi: *"Image tối giản không có netstat/ss/curl"*.
 
-**Vấn đề nó giải:** tranh CPU/memory pod + cô lập lỗi. **Không** giải quyết được contention
-embedding (đó là Fix 3).
+⟹ Phải dùng cách đo **từ ngoài** (Cách 2) hoặc bật log có sẵn (Cách 3).
 
-Hiện 1 container chạy 3 process: `ragflow_server.py` (API, PID 48), `task_executor.py` (ingest,
-PID 445), `sync_data_source.py`. An toàn khi tách vì `task_executor` dùng **Redis Stream Consumer
-Group** ⟹ mỗi task chỉ giao đúng 1 consumer.
+**Cách 2 — bisect bằng `vector_similarity_weight`** (không cần cài gì):
 
-**Giá trị thật sau khi đổi hướng:** CPU hiện 10–20% nên tách CPU không cải thiện latency ngay. Nhưng
-đáng làm vì: (a) khi ingest tăng tải sẽ không kéo API xuống; (b) scale API và worker độc lập;
-(c) `task_executor` crash không làm chết API.
+```
+for i in 1 2 3; do curl -s -o /dev/null -w "ca_hai      run=$i total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6}'; curl -s -o /dev/null -w "vector_only run=$i total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":1.0}'; curl -s -o /dev/null -w "text_only   run=$i total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.0}'; done
+```
 
-### FIX 4 ⭐⭐ — Giảm cường độ ingest / tắt RAPTOR + GraphRAG (đòn bẩy lớn, không cần code)
+| Biến thể | Nghĩa | Nếu nhanh/chậm thì suy ra gì |
+|---|---|---|
+| `vector_similarity_weight: 1.0` | **chỉ kNN/vector**, bỏ luồng full-text + tokenize | nhanh ⟹ chi phí ở luồng full-text |
+| `vector_similarity_weight: 0.0` | **chỉ full-text/BM25**, bỏ kNN | nhanh ⟹ chi phí ở luồng vector/kNN |
+| `vector_similarity_weight: 0.6` | cả hai (mặc định đang dùng) | — |
+| **cả ba đều chậm như nhau** | ⟹ chi phí ở phần **DÙNG CHUNG** sau khi có kết quả (fetch field, build response) hoặc thứ chưa nhìn tới | |
 
-**Vấn đề nó giải:** cùng Root cause A, từ phía nguồn tải.
+Ba biến thể chạy **xen kẽ trong cùng vòng lặp** — bắt buộc, vì nền dao động 14× (bài học 0c).
 
-- Đề nghị bên đẩy tài liệu **giới hạn concurrency** hoặc chuyển ingest sang **giờ thấp điểm**.
-- 🔴 **Xem lại `use_raptor: true` + `use_graphrag: true`** (3.6). Hai tính năng này khiến mỗi document
-  tốn thêm **nhiều lời gọi LLM `qwen3-32b`** (RAPTOR summarize, GraphRAG extract entity) — đây là
-  phần tải nặng nhất. **Nếu nghiệp vụ không thực sự dùng ⟹ tắt đi sẽ giảm mạnh tải embedding/LLM
-  toàn hệ thống**, và đây có thể là fix hiệu quả nhất trên mỗi đơn vị công sức.
+**Cách 3 — bật debug log của RAGFlow.** `search.py:590` có `logging.debug(f"[Search] global_offset=...
+rerank_limit=... page_size=... page=...")` và `:606` `"[Search] retrieval weights: trace_id=%s ..."`
+⟹ code **CÓ** instrument sẵn ở DEBUG level, chỉ chưa bật. Nếu bật được `LOG_LEVEL=DEBUG` sẽ có
+timing/trace từ chính RAGFlow.
 
-### ❌ FIX 2 — Giảm `topk` 1024 → 256: ĐÃ LOẠI BỎ
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- env | grep -iE "log_level|debug"
+```
 
-Xem 3.11/3.12. `topk=256` **không nhanh hơn** (mean 13.91s vs 15.75s, thắng/thua 4–4) và cho kết quả
-**y hệt**. Không cần sửa `topk`. Ghi lại để người sau không thử lại.
+### Nghi phạm chưa được kiểm tra (liệt kê để không quên, KHÔNG phải kết luận)
 
-### Thứ tự thực hiện (cập nhật)
+Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — không được xây fix lên bất kỳ cái nào trước khi đo:
 
-1. ⏸️ **BƯỚC 0 — đo trực tiếp embedding service.** Không deploy gì trước bước này.
-2. **Fix 4 phần "tắt RAPTOR/GraphRAG nếu không dùng"** — hỏi nghiệp vụ, rẻ nhất, đòn bẩy lớn.
-3. **Fix 3** — theo kết quả bước 0, chọn 3a/3b/3c.
-4. **Fix 1** — làm sau, vì lợi ích là kiến trúc/cô lập lỗi chứ không phải latency ngay.
-5. Đo lại 30 mẫu như 3.2 sau mỗi bước, đối chiếu **tiêu chí biên độ < 3×** dưới đây.
+| Nghi phạm | Vì sao đáng nghi | Cách kiểm |
+|---|---|---|
+| **Async event loop bị block** | RAGFlow là Quart/ASGI, chạy `app.run()` = **single process**. Một coroutine gọi hàm sync nặng sẽ block **toàn bộ** event loop ⟹ mọi request khác đứng chờ. Khớp hoàn hảo với: CPU thấp, I/O wait, dao động theo thời điểm, và việc ingest API (`/documents`, `/chunks`) cùng process | `py-spy dump` khi chậm; hoặc đo latency 1 request **khi không có ingest** |
+| **Rerank model** (khác embedding) | `search.py:515` `rerank_mdl.similarity(query, docs)`, `:615` `if rerank_mdl and sres.total > 0`. **Chưa kiểm** rerank model có được cấu hình không, và nếu có thì gọi tới đâu | `select * from tenant_model;` xem có rerank model; đo endpoint đó |
+| **MySQL** | `document_keyword`/`docnm_kwd` có thể query MySQL cho từng chunk. **Chưa đo MySQL** | `SHOW PROCESSLIST` khi request chậm; hoặc bật slow query log |
+| **MinIO** | Chưa đo. Retrieval có thể fetch gì từ object storage | log/metrics MinIO |
+| **Connection pool cạn** | Nếu pool tới ES/MySQL nhỏ và ingest chiếm hết ⟹ retrieval chờ **lấy connection**, không phải chờ query. ES query nhanh nhưng **chờ pool** thì không hiện trong ES stats | đếm connection trong `/proc/net/tcp`; tìm config pool size |
+
+⭐ **Nghi phạm số 1 theo mức độ khớp bằng chứng: async event loop bị block.** Nó giải thích được
+**đồng thời** cả 4 dữ kiện: CPU thấp, I/O wait, dao động theo thời điểm chứ không theo query, và
+tất cả traffic (retrieval + ingest API) dùng **cùng 1 process PID 48** (3.4). Nhưng **vẫn chỉ là
+giả thuyết** — phải `py-spy dump` mới biết.
+
+### Phép đo rẻ nên làm ngay: đo khi ingest NGHỈ
+
+Nếu tạm dừng được luồng ingest (hoặc chờ lúc bên đẩy tài liệu nghỉ), đo lại 10 mẫu retrieval.
+Đây là phép thử **một biến** rẻ nhất và mạnh nhất còn lại:
+- **Nhanh + ổn định khi ingest nghỉ** ⟹ contention với ingest là thật, nhưng ở tầng **chưa xác định**
+  (event loop / pool / MySQL) — thu hẹp được rất nhiều.
+- **Vẫn chậm + vẫn dao động** ⟹ ingest vô can hoàn toàn, vấn đề nội tại của retrieval ở scale này.
 
 ### Tiêu chí "fix dứt điểm" (định lượng, để biết khi nào xong)
 
@@ -1265,6 +1378,21 @@ median mà biên độ vẫn 14× thì **chưa fix xong**.
    5 lần cấu hình B ở thời điểm khác ⟹ kết quả bị tải nền chi phối hoàn toàn. Đặt **2 request trong
    CÙNG vòng lặp** (3.11) mới so được từng cặp. Nếu 3.11 đo rời, rất có thể tôi đã kết luận sai
    "topk=256 nhanh hơn 12%" và đi deploy một fix vô nghĩa.
+
+0d. ⭐⭐ **ĐÃ SAI 3 LẦN LIÊN TIẾP, CÙNG MỘT KIỂU SAI.** Ba root cause tôi từng "chốt":
+   | # | Giả thuyết | Suy từ đâu | Bị phủ định bởi |
+   |---|---|---|---|
+   | B | `topk=1024` nặng | source `search.py:142` + 287 ES query | A/B xen kẽ 8 cặp (3.11): 4–4, kết quả y hệt |
+   | C | rerank/tokenize CPU-bound | source `search.py:299/434/461` | **CPU chỉ 10–20%** (3.13, Kiên quan sát) |
+   | A | embedding xếp hàng sau ingest | log ingest `Embedding chunks 0.59-1.43s` + `EMBEDDING_BATCH_SIZE=16` | **đo trực tiếp: 150ms, biên độ 2×, song song tốt** (3.15) |
+
+   **Mẫu sai giống nhau cả 3 lần:** thấy một đoạn code/log *trông có vẻ* tốn kém ⟹ kết luận nó là
+   bottleneck ⟹ xây cả hướng fix lên đó. Mỗi lần đều **hợp lý về mặt cơ chế** nhưng **sai về mặt số**.
+
+   ⟹ **Quy tắc bắt buộc từ giờ trong issue này: KHÔNG kết luận tầng nào là bottleneck trước khi có
+   số đo TRỰC TIẾP của chính tầng đó.** Log "mất 1.43s" của ingest không nói gì về latency mà
+   retrieval phải chờ — phải tự gọi thẳng vào service đó mà đo (3.15). Một phép đo 30 giây đã phủ
+   định thứ tôi mất cả buổi xây lập luận.
 
 1. **Đo tách tầng trước khi tối ưu tầng nào.** Suốt 3 phiên hướng điều tra nhắm vào ES (tokenizer,
    stopword, `minimum_should_match`, scale 1.9M doc). Số đo thật: **ES <1ms/query, chiếm 1.7/3.6s;
@@ -1321,29 +1449,32 @@ median mà biên độ vẫn 14× thì **chưa fix xong**.
 
 ## 7. Việc tiếp theo
 
-### ⏸️ BƯỚC 0 — BẮT BUỘC trước khi deploy bất cứ gì
-- [x] ~~Fix 2: thêm `topk:256`~~ — ❌ **ĐÃ THỬ, KHÔNG HIỆU QUẢ** (3.11), loại bỏ
-- [x] ~~Verify recall topk 1024 vs 256~~ — ✅ đã làm (3.12), kết quả y hệt
-- [ ] 🔴 **Xác định endpoint thật của `qwen3-8b-embedding`** — serve bởi LiteLLM / vLLM / service riêng?
-- [ ] 🔴 **Đo latency 1 lời gọi embedding khi ingest ĐANG CHẠY** (kỳ vọng: nhiều giây)
-- [ ] 🔴 **Đo latency 1 lời gọi embedding khi ingest NGHỈ/pause** (kỳ vọng: <0.5s)
-- [ ] Nếu (đang chạy) ≫ (nghỉ) ⟹ root cause chốt. Nếu ≈ nhau và đều nhanh ⟹ **mở lại điều tra**,
-      nghi phạm còn lại: connection pool / lock / async event loop bị block trong Python
+> **Không có fix nào sẵn sàng deploy.** Cả 3 root cause từng chốt đều đã bị phủ định. Việc tiếp theo
+> là **điều tra**, không phải fix.
 
-### Ngắn hạn (theo kết quả bước 0)
-- [ ] **Fix 4** — hỏi nghiệp vụ: có thực sự dùng `use_raptor` + `use_graphrag`? Nếu không ⟹ tắt
-      (đòn bẩy lớn nhất trên mỗi đơn vị công sức, giảm mạnh tải LLM/embedding)
-- [ ] **Fix 3** — chọn 3a (scale replica) / 3b (tách endpoint retrieval vs ingest) / 3c (priority queue)
-- [ ] Hỏi bên đẩy tài liệu: ingest chạy 24/7 hay theo lịch? Có giới hạn concurrency được không?
-- [ ] Đo lại 30 mẫu, đối chiếu **tiêu chí biên độ < 3×** ở mục 4.5
+### 🔴 Ngay lập tức — tìm 1.7–26.3s còn thiếu
+- [ ] **Thử `py-spy dump --pid 48`** khi request đang chậm — cho biết process đứng ở dòng nào.
+      Nếu không cài được (image tối giản/không có network) thì bỏ qua sang mục dưới
+- [ ] **Bisect bằng `vector_similarity_weight` 1.0 / 0.0 / 0.6** xen kẽ cùng vòng lặp (mục 4.5 Cách 2)
+- [ ] **Kiểm `LOG_LEVEL`** — `search.py:590/606` có `logging.debug("[Search] ...")` sẵn, bật DEBUG
+      sẽ có trace từ chính RAGFlow
+- [ ] ⭐ **Đo 10 mẫu retrieval khi ingest NGHỈ** — phép thử một biến rẻ nhất và mạnh nhất còn lại
+- [ ] `select * from tenant_model;` — kiểm có **rerank model** được cấu hình không (chưa từng kiểm)
+
+### Ngắn hạn — kiểm các nghi phạm chưa đo (mục 4.5)
+- [ ] MySQL: `SHOW PROCESSLIST` khi request chậm / bật slow query log
+- [ ] Connection pool: đếm connection trong `/proc/net/tcp`, tìm config pool size ES/MySQL
+- [ ] MinIO: có nằm trong đường retrieval không
+- [ ] Lấy log/số liệu từ **2 pod còn lại** (`pljxz`, `q9kz2`) — hiện chỉ đo 1/3 pod
 
 ### Dài hạn
-- [ ] **Fix 1** — tách `task_executor` ra deployment riêng (lợi ích kiến trúc/cô lập lỗi, không phải
-      latency ngay vì CPU hiện chỉ 10–20%). Verify Redis Consumer Group không xử lý trùng task
-- [ ] **Fix 4** — đánh giá lại có thực sự cần `use_raptor` + `use_graphrag` trên KB này
-- [ ] Thêm instrumentation latency cho tầng retrieval (RAGFlow không log) — để lần sau không phải đo
-      tách tầng thủ công như phiên này
-- [ ] Đóng `investigate_issue_4/scratch/vi_stopwords_TODO.py`, ghi rõ hướng stopword đã bị loại trừ
+- [ ] **Thêm instrumentation latency cho tầng retrieval** — cả phiên này phải đo tách tầng thủ công
+      vì RAGFlow không log duration. Đây là nợ kỹ thuật gốc làm chậm mọi lần debug
+- [ ] **Fix 4 (vẫn đáng làm bất kể root cause):** hỏi nghiệp vụ có thực sự dùng `use_raptor` +
+      `use_graphrag`? Nếu không ⟹ tắt, giảm mạnh tải LLM/embedding toàn hệ thống
+- [ ] **Fix 1 (kiến trúc, không phải latency):** tách `task_executor` ra deployment riêng — lợi ích
+      là cô lập lỗi + scale độc lập, KHÔNG phải cải thiện latency (CPU chỉ 10–20%)
+- [ ] Đóng `investigate_issue_4/scratch/vi_stopwords_TODO.py` — hướng stopword đã bị loại trừ
 
 ## 8. Rủi ro còn lại
 
