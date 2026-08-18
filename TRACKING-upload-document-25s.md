@@ -1,0 +1,1053 @@
+# TRACKING — Fix issue upload document 25s (flow 55s/văn bản của đối tác)
+
+**Phiên:** 10/08/2026
+**Đối tượng:** flow `upload_document` của RagFlow, MySQL trên node06 (đã migrate 07/08)
+**Trạng thái phiên:** ✅ **ĐÃ FIX** (10/08, revision 63) — xem `PLAN-apply-patch-get-root-folder.md`
+**Task liên quan:** `TRACKING-mysql-load-assessment.md` (Issue 1, Issue 7), `PLAN-mysql-migrate-node06.md`
+
+### 📊 Kết quả cuối — đối tác đo lại 11/08
+
+| Bước | Trước | Sau | Thay đổi | Thuộc hệ thống |
+|---|---|---|---|---|
+| 1. Check tồn tại | 6s | 7s | +1s | MySQL — 🔶 chưa tối ưu |
+| 2. Gọi LLM tóm tắt | 10s | 11s | +1s | LiteLLM/model |
+| 3. **Upload document** | **25s** | **5s** | 🔻 **-20s (-80%)** | ✅ **ĐÃ FIX** |
+| 4. Update metadata | 8s | 5s | -3s | **Elasticsearch** (xem mục 4b) |
+| 5. Parse chunk | 6s | 4s | -2s | ES + task executor |
+| **Tổng** | **55s** | **32s** | 🔻 **-23s (-42%)** | |
+
+⭐ **20/23 giây tiết kiệm được đến từ đúng bước đã fix** — bằng chứng nhân quả sạch. Nếu mức
+giảm rải đều thì có thể do tải nhẹ đi; giảm tập trung một bước thì chắc chắn do patch.
+Hai bước nhích lên 1s nhiều khả năng vì đối tác đẩy nhanh hơn **77%** (60 → 106 doc/phút).
+
+---
+
+## 1. Mục tiêu
+
+Tìm root cause và hướng xử lý cho bước "Upload document 25s" trong feedback của đối tác:
+
+| Bước | Thời gian đối tác đo |
+|---|---|
+| 1. Check tồn tại | 6s |
+| 2. Gọi LLM tóm tắt | 10s |
+| 3. **Upload document** | **25s** ← mục tiêu phiên này |
+| 4. Update metadata | 8s |
+| 5. Parse chunk | 6s |
+| **Tổng** | **55s/vb** |
+
+### Bối cảnh
+
+| Hạng mục | Giá trị | Nguồn |
+|---|---|---|
+| MySQL | `ragflow-mysql-0`, node06 (`vrp-kubeengine06`) | đã migrate 07/08 |
+| Source code tra cứu | `ragflow-0.26.4/` — ✅ **đúng version production**, đã clone và đối chiếu 10/08 | `git clone --depth 1 --branch v0.26.4 https://github.com/infiniflow/ragflow.git` |
+| Bảng `file` | ~631,585 dòng (theo `rows_examined` của full scan) | slow log 10/08 |
+| Bảng `document` | ~395,137 dòng | `COUNT(*)` đo 07/08 |
+
+---
+
+## 2. Tổng quan issue
+
+| # | Issue | Mức độ | Trạng thái | Hướng xử lý |
+|---|---|---|---|---|
+| U1 | `get_root_folder()` dùng `WHERE parent_id = id` (so cột với cột) → MySQL **không dùng được index** → full scan 631,585 dòng, **18s/lần**, chạy **≥2 lần mỗi upload** | 🔴 Rất cao | 🔶 OPEN — root cause đã xác nhận | Root cause ở **code app**, ngoài phạm vi (chỉ sửa qua values.yaml/helm) → báo đội dev. Xem mục 4 để biết các hướng khả dĩ |
+| U2 | Query này đã chạy **783,945 lần**, tích luỹ **838 giờ 59 phút** CPU MySQL | 🔴 Rất cao | 🔶 OPEN | Hệ quả trực tiếp của U1 |
+
+**Kết luận chung:** 25s của bước "Upload document" **không phải** do MinIO/thumbnail/INSERT như suy
+luận ban đầu, mà do **1 câu SELECT full-scan bảng `file` chạy lặp lại**. Đây là bug thiết kế query
+trong code RagFlow, không phải vấn đề cấu hình MySQL hay hạ tầng.
+
+---
+
+## 3. Lệnh đã chạy + output (bằng chứng)
+
+### 3.1 Bật slow log ngưỡng thấp để bắt cả query nhỏ
+
+```sql
+SET GLOBAL slow_query_log = 'ON';
+```
+```sql
+SET GLOBAL long_query_time = 0.1;
+```
+```sql
+SET GLOBAL log_output = 'TABLE';
+```
+
+| Tham số | Ý nghĩa |
+|---|---|
+| `long_query_time = 0.1` | Ngưỡng 0.1s thay vì 1s như các phiên trước — vì flow upload có 13 bước tuần tự, mỗi bước có thể chỉ vài trăm ms nhưng **cộng dồn** mới thành 25s. Ngưỡng cao sẽ bỏ sót |
+| `log_output = 'TABLE'` | Ghi vào bảng `mysql.slow_log` để query được bằng SQL |
+
+⚠️ **Đây là `SET GLOBAL` → mất khi pod restart** (đã bị mất 2 lần trước: sau scale về 0 ở migrate,
+và sau `helm upgrade`). Cùng nợ kỹ thuật với Issue 5 của `TRACKING-mysql-load-assessment.md`.
+
+### 3.2 Xem 20 query gần nhất (cắt ngắn để không tràn màn hình)
+
+```sql
+SELECT start_time, query_time, rows_examined, LEFT(CONVERT(sql_text USING utf8), 80) AS query_short FROM mysql.slow_log ORDER BY start_time DESC LIMIT 20;
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `LEFT(..., 80)` | Chỉ lấy 80 ký tự đầu — **bắt buộc**, vì có câu `DELETE ... NOT IN (hàng nghìn id)` dài hàng chục nghìn ký tự làm tràn màn hình (đã gặp ở lần chạy đầu) |
+| `CONVERT(sql_text USING utf8)` | `sql_text` lưu dạng hex blob, không convert thì không đọc được |
+
+**Output (trích, lúc 12:29 ngày 10/08 — đúng thời điểm upload file test):**
+
+```
+| start_time          | query_time | rows_examined | query_short                                    |
+| 2026-08-10 12:29:08 | 00:00:17.083502 |    630,774 | SELECT t1.id, t1.create_time, t1.create_date... |
+| 2026-08-10 12:29:08 | 00:00:19.414252 |    630,769 | SELECT t1.id, t1.create_time, t1.create_date... |
+| 2026-08-10 12:29:08 | 00:00:19.138855 |    630,773 | SELECT t1.id, t1.create_time, t1.create_date... |
+| 2026-08-10 12:29:09 | 00:00:00.118184 |          1 | UPDATE document SET update_time = ...           |
+| 2026-08-10 12:29:08 | 00:00:00.172380 |          1 | SELECT GET_LOCK('update_progress', -1)          |
+| 2026-08-10 12:29:07 | 00:00:00.529593 |      2,001 | SELECT t1.id FROM pipeline_operation_log ...     |
+| 2026-08-10 12:29:06 | 00:00:00.102054 |          0 | INSERT INTO file2document ...                    |
+| 2026-08-10 12:29:06 | 00:00:00.170363 |          0 | INSERT INTO file ...                             |
+```
+
+**Đọc được gì:** 3 câu 17-19s với `rows_examined` ~630,770 xuất hiện **cùng lúc** (12:29:08) — đây
+là thủ phạm. Các câu còn lại (INSERT `file`, INSERT `file2document`, UPDATE `document`) đều **rất
+nhanh** (0.1-0.2s, `rows_examined` 0-1) → loại trừ khả năng INSERT/UPDATE là nút thắt.
+
+### 3.3 Gom nhóm để thấy quy mô tích luỹ
+
+```sql
+SELECT COUNT(*) AS so_lan, SEC_TO_TIME(SUM(TIME_TO_SEC(query_time))) AS tong_thoi_gian, MAX(query_time) AS lau_nhat, LEFT(CONVERT(sql_text USING utf8), 60) AS query_short FROM mysql.slow_log GROUP BY query_short ORDER BY SUM(TIME_TO_SEC(query_time)) DESC LIMIT 15;
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `GROUP BY query_short` | Gom câu giống nhau thành 1 dòng — thay vì đọc hàng trăm nghìn dòng riêng lẻ |
+| `SUM(TIME_TO_SEC(query_time))` | **Tổng** thời gian tích luỹ — quan trọng hơn thời gian 1 lần: query 0.5s chạy 100 lần (50s) tệ hơn query 5s chạy 1 lần |
+| `SEC_TO_TIME(...)` | Đổi tổng số giây về dạng `HH:MM:SS` cho dễ đọc |
+| `ORDER BY SUM(...) DESC` | Thủ phạm ngốn nhiều thời gian nhất nằm đầu |
+
+**Output (trích 8 dòng đầu):**
+
+```
+| so_lan  | tong_thoi_gian | lau_nhat        | query_short                                      |
+| 783,945 | 838:59:59      | 00:01:25.264007 | SELECT t1.id, t1.create_time, t1.create_date, t  |
+| 106,995 | 196:05:16      | 00:01:48.664407 | SELECT COUNT(t1.id) FROM task AS t1 INNER JOIN   |
+|  77,747 | 60:59:09       | 00:01:21.137074 | DELETE FROM pipeline_operation_log WHERE ((pipe  |
+|  14,192 | 09:46:39       | 00:00:43.817487 | INSERT INTO pipeline_operation_log (id, create_  |
+|     311 | 01:27:16       | 00:01:08.671231 | SELECT t1.id, t1.process_begin_at, t1.parser_conf|
+|     159 | 00:37:47       | 00:05:36.502796 | SELECT COUNT(1) FROM (SELECT 1 FROM document ... |
+|      82 | 00:29:00       | 00:02:10.624483 | SELECT t1.id, t1.thumbnail, t1.kb_id, t1.pars    |
+|      67 | 00:15:12       | 00:01:07.389314 | SELECT t1.run, t1.suffix, t1.id FROM document    |
+```
+
+**Đọc được gì:**
+- Dòng 1 (**783,945 lần / 838 giờ**) là cùng câu với 3 dòng 17-19s ở mục 3.2 → đây là query ngốn
+  nhiều thời gian nhất toàn hệ thống, bỏ xa mọi thứ khác
+- `lau_nhat: 1 phút 25 giây` — có lần chạy lên tới 85 giây
+- Dòng 6 (`SELECT COUNT(1) FROM (SELECT 1 FROM document...`) chính là **Issue 7** đã ghi ở
+  `TRACKING-mysql-load-assessment.md` (`get_filter_by_kb_id`) — vẫn còn đó, chưa fix
+- Dòng 7 (`SELECT t1.id, t1.thumbnail, t1.kb_id, t1.pars...`) là query list document đã fix bằng
+  index ở Issue 1 — giờ chỉ còn 82 lần/29 phút, không còn nằm top
+
+### 3.4 Lấy full text câu SQL thủ phạm
+
+```sql
+SELECT query_time, rows_examined, CONVERT(sql_text USING utf8) AS query FROM mysql.slow_log WHERE rows_examined > 600000 ORDER BY start_time DESC LIMIT 1\G
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `WHERE rows_examined > 600000` | Lọc đúng nhóm query 630k dòng, bỏ qua query nhỏ |
+| `\G` thay `;` | Hiển thị **dọc** (mỗi cột 1 dòng) thay vì bảng ngang — cách duy nhất đọc được câu SQL dài mà không bị cắt |
+
+**Output:**
+
+```
+query_time: 00:00:18.028771
+rows_examined: 631585
+query: SELECT `t1`.`id`, `t1`.`create_time`, `t1`.`create_date`, `t1`.`update_time`,
+       `t1`.`update_date`, `t1`.`parent_id`, `t1`.`tenant_id`, `t1`.`created_by`,
+       `t1`.`name`, `t1`.`location`, `t1`.`size`, `t1`.`type`, `t1`.`source_type`
+       FROM `file` AS `t1`
+       WHERE ((`t1`.`tenant_id` = '22cdb01e486a11flac9749e86cfe939a')
+          AND (`t1`.`parent_id` = `t1`.`id`))
+```
+
+### 3.5 Kiểm chứng giả định của phương án fix — tìm root folder bằng `name` thay vì `parent_id = id`
+
+*(Kiên yêu cầu 10/08: "muốn dùng query để tìm root folder `/` và `.knowledgebase`, cần xác nhận
+nó có tồn tại". Thực chất câu hỏi này kiểm chứng luôn giả định nền của phương án sửa code.)*
+
+Cả 3 câu chỉ `SELECT`, không đụng dữ liệu — chạy được ngay cả khi đối tác đang đẩy dữ liệu.
+Chạy trên **node04** qua `kubectl -n ragflow exec -it ragflow-mysql-0 -- mysql -uroot -p... rag_flow`.
+
+**a) Root folder có tồn tại không, tìm bằng `name` có ra không?**
+
+```sql
+SELECT id, name, parent_id, tenant_id, type, create_date FROM file WHERE tenant_id = '22cdb01e486a11f1ac9749e86cfe939a' AND name = '/'\G
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `AND name = '/'` | Tìm theo **tên** — so cột với **hằng số**, dùng được index. Đối lập với `parent_id = id` của code hiện tại |
+| `\G` thay `;` | Hiển thị dọc, mỗi cột 1 dòng — tránh tràn màn hình VDI. `\G` **cũng là ký tự kết thúc câu** nên không cần thêm `;` |
+
+**Output:**
+
+```
+*************************** 1. row ***************************
+         id: 22cdb226486a11f1ac9749e86cfe939a
+       name: /
+  parent_id: 22cdb226486a11f1ac9749e86cfe939a
+  tenant_id: 22cdb01e486a11f1ac9749e86cfe939a
+       type: folder
+create_date: 2026-05-05 18:06:51
+1 row in set (0.00 sec)
+```
+
+**Đọc được gì:**
+- ✅ `parent_id` = `id` (cùng `22cdb226...`) — xác nhận đúng phân tích: root folder trỏ về chính nó
+- ✅ `id` (`22cdb226...`) **khác** `tenant_id` (`22cdb01e...`) — chỉ trùng 4 ký tự đầu do sinh UUID
+  cùng thời điểm. Dễ nhìn nhầm thành một nếu đọc lướt
+- 🔴 **`0.00 sec`** — con số quan trọng nhất. Cùng bảng, cùng 1 dòng kết quả, nhưng
+  `name = '/'` mất **0.00s** trong khi `parent_id = id` mất **18s** (mục 3.4). Chênh **>1000 lần**
+- ✅ Bảng `file` **có index dùng được cho cột `name`** (suy ra từ 0.00s trên bảng 631k dòng)
+
+**b) `.knowledgebase` có tồn tại và nối đúng vào root không?**
+
+```sql
+SELECT c.id, c.name, c.parent_id, p.name AS parent_name FROM file c JOIN file p ON c.parent_id = p.id WHERE c.tenant_id = '22cdb01e486a11f1ac9749e86cfe939a' AND c.name = '.knowledgebase'\G
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `file c JOIN file p` | **Self-join** — nối bảng `file` với chính nó. `c` = child, `p` = parent |
+| `ON c.parent_id = p.id` | So cột giữa **2 dòng khác nhau** → **dùng được index**. Khác hẳn `parent_id = id` so 2 cột **cùng 1 dòng** |
+| `p.name AS parent_name` | Lấy tên thư mục cha ra đối chiếu — kỳ vọng phải là `/` |
+
+**Output:**
+
+```
+*************************** 1. row ***************************
+         id: 4b2289be4a8011f1ac9749e86cfe939a
+       name: .knowledgebase
+  parent_id: 22cdb226486a11f1ac9749e86cfe939a
+parent_name: /
+1 row in set (0.00 sec)
+```
+
+**Đọc được gì:**
+- ✅ Cây thư mục nối **đúng**: `parent_id` của `.knowledgebase` = `22cdb226...` = đúng `id` của `/`
+- ✅ Sơ đồ `/` → `.knowledgebase` → `<KB>` được xác nhận bằng **dữ liệu thật**, không chỉ bằng đọc code
+- ✅ **0.00 sec** dù là self-join trên bảng 631k dòng → chứng minh trực tiếp: so cột giữa 2 dòng
+  khác nhau thì index hoạt động bình thường. Vấn đề **chỉ** nằm ở so 2 cột cùng 1 dòng
+
+**c) ⭐ Có dòng trùng không? — câu quyết định phương án fix**
+
+```sql
+SELECT name, COUNT(*) AS so_dong FROM file WHERE tenant_id = '22cdb01e486a11f1ac9749e86cfe939a' AND name IN ('/', '.knowledgebase') GROUP BY name;
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `COUNT(*) ... GROUP BY name` | Đếm số dòng theo từng tên — lộ ra ngay nếu có bản ghi trùng |
+| `IN ('/', '.knowledgebase')` | Kiểm tra cả 2 tầng trong một câu |
+| `;` (không phải `\G`) | Trả nhiều dòng ngắn → bảng ngang dễ đọc hơn. **Lần đầu chạy bị treo ở prompt `->` do soạn lệnh thiếu `;`** |
+
+**Output:**
+
+```
++----------------+---------+
+| name           | so_dong |
++----------------+---------+
+| .knowledgebase |       1 |
+| /              |       1 |
++----------------+---------+
+2 rows in set (0.00 sec)
+```
+
+**Đọc được gì:**
+- ✅ **Không có dòng trùng** — mỗi tên đúng 1 dòng
+- ✅ Loại trừ được rủi ro đã nêu trước đó: "nếu có 2 dòng cùng `name = '/'` thì sửa thành
+  `name = '/'` sẽ lấy nhầm". Giả thuyết này **sai với dữ liệu thực tế**
+- ➡️ **Kết luận**: thay `parent_id = id` bằng `name = '/'` cho **kết quả tương đương**, nhưng
+  nhanh hơn >1000 lần. Đây là căn cứ để hạ mức rủi ro của phương án vá code (xem mục 4)
+
+---
+
+## 4. Issue chi tiết
+
+### 🔴 Issue U1 — `get_root_folder()` full-scan bảng `file` do so sánh cột với cột — ✅ **FIXED (10/08)**
+
+> **Đã fix 10/08/2026** bằng patch `name == "/"` thay `parent_id == id`, deploy qua `codePatch`
+> (initContainer + sed), revision 62→63. **Bằng chứng**: query `rows_examined = 631585` biến mất
+> hoàn toàn khỏi slow log; upload qua UI ~10-20s trả 200 nhanh (trước đó riêng bước upload 25s).
+> Chi tiết triển khai + output thật: **`PLAN-apply-patch-get-root-folder.md`**.
+>
+> ⚠️ Đây là **fix tại chỗ trên deployment của mình** — code upstream (branch `main`) **vẫn còn
+> nguyên lỗi**. Nâng version RagFlow sẽ mất patch này nếu quên mang theo `codePatch`.
+
+**Triệu chứng**
+
+Bước "Upload document" mất 25s (đối tác báo). Slow log bắt được 3 câu SELECT trên bảng `file`,
+mỗi câu **17-19 giây**, `rows_examined` ~630,770, xảy ra cùng thời điểm upload.
+
+**Root cause (đã xác nhận bằng cả slow log lẫn đọc source code)**
+
+Câu SQL có điều kiện:
+```sql
+WHERE (t1.tenant_id = '22cdb01e...') AND (t1.parent_id = t1.id)
+```
+
+`t1.parent_id = t1.id` là **so sánh 2 cột của cùng một dòng**. MySQL **không thể dùng index** cho
+kiểu so sánh này — index B-tree chỉ tra được khi so cột với **giá trị hằng** (`WHERE col = 'abc'`),
+không so được cột với cột. Hệ quả: MySQL buộc phải đọc từng dòng của bảng `file` (631,585 dòng)
+rồi tự kiểm tra `parent_id == id` trên mỗi dòng → full table scan, không có cách nào tránh được
+bằng đánh index.
+
+---
+
+#### 📖 Giải thích dễ hiểu — câu SQL này đang tìm cái gì?
+
+*(Ghi lại theo yêu cầu của Kiên 10/08 — phần Root cause ở trên dùng thuật ngữ, phần này giải
+thích lại từ đầu cho dễ đọc lại sau này)*
+
+**Bảng `file` lưu cây thư mục.** Mỗi dòng có 2 cột quan trọng: `id` (mã của chính nó) và
+`parent_id` (mã thư mục cha chứa nó).
+
+Cây thư mục thực tế của 1 tài khoản RagFlow:
+
+```
+/                          ← root folder      - 1 cái duy nhất cho cả tenant
+└── .knowledgebase/        ← kb_root folder   - 1 cái duy nhất, chứa mọi KB
+    ├── Voffice-doc-sum/   ← kb folder        - mỗi KB một thư mục
+    ├── KB-2/
+    └── ... (các KB khác)
+```
+
+✅ **Đã xác minh sơ đồ này là đúng, không phải ví dụ minh hoạ** (Kiên hỏi 10/08):
+
+| Thành phần | Bằng chứng trong code v0.26.4 |
+|---|---|
+| Tên `/` của root folder | `file_service.py:253` → `"name": "/"` — chuỗi ký tự thật ghi vào DB |
+| Tên `.knowledgebase` | `api/db/__init__.py:91` → `KNOWLEDGEBASE_FOLDER_NAME = ".knowledgebase"` |
+| kb_root nằm dưới root | `file_service.py:271` → `parent_id == root_id` |
+| Thư mục KB nằm dưới kb_root | `upload_document()` → `new_a_file_from_kb(kb.tenant_id, kb.name, kb_root_folder["id"])` |
+
+⚠️ **Một đính chính**: phạm vi là **tenant**, không hẳn là "tài khoản". Query lọc theo
+`tenant_id`, mà mặc định mỗi user là một tenant riêng — nên với trường hợp của Kiên thì hai
+khái niệm này trùng nhau. Nhưng nếu về sau bật tính năng team/chia sẻ tenant thì nhiều user
+sẽ **dùng chung một cây thư mục** và cùng chịu chung một bảng `file` phình to.
+
+Lưu trong bảng `file` thành:
+
+| id | name | parent_id | Ý nghĩa |
+|---|---|---|---|
+| `AAA` | `/` | **`AAA`** | Thư mục gốc — **cha của nó chính là nó** |
+| `BBB` | `.knowledgebase` | `AAA` | Cha là `/` |
+| `CCC` | `Voffice-doc-sum` | `BBB` | Cha là `.knowledgebase` |
+| `DDD` | `file1.txt` | `CCC` | Cha là `Voffice-doc-sum` |
+
+**Vì sao thư mục gốc có `parent_id = id`?** Vì nó không có cha (đã trên cùng rồi), nhưng cột
+`parent_id` bắt buộc phải điền gì đó — nên code cho nó **trỏ về chính nó**:
+
+```python
+file_id = get_uuid()          # sinh mã mới, ví dụ "AAA"
+file = {
+    "id": file_id,            # id        = "AAA"
+    "parent_id": file_id,     # parent_id = "AAA"  ← cùng giá trị!
+    "name": "/",
+}
+```
+
+**Vậy câu SQL đang tìm gì?**
+
+```sql
+WHERE (tenant_id = '22cdb01e...')     ← của tài khoản này
+  AND (parent_id = id)                ← dòng nào có "cha = chính nó"
+```
+
+Dịch sang tiếng Việt: **"Tìm thư mục gốc `/` của tài khoản này"** — chỉ trả về đúng **1 dòng**.
+
+**Vì sao chậm?**
+
+| Loại điều kiện | MySQL làm gì | Tốc độ |
+|---|---|---|
+| `WHERE name = '/'` (so với **giá trị cố định**) | Tra "mục lục" (index) — giống tra từ điển, lật thẳng tới vần cần tìm, không đọc cả quyển | Nhanh |
+| `WHERE parent_id = id` (so **2 cột với nhau**) | Không có "mục lục" nào sắp xếp theo "dòng có 2 cột bằng nhau" — vì giá trị cần tìm **đổi theo từng dòng** (dòng `AAA` so với `AAA`, dòng `BBB` so với `BBB`...). Buộc phải **đọc từng dòng** trong 631,585 dòng | **18 giây** |
+
+Ví von: thay vì tra mục lục, phải **lật từng trang trong 631,585 trang** để tìm đúng 1 trang có
+"số ghi ở đầu bằng số ghi ở cuối" → mất 18 giây chỉ để lấy về **1 dòng**.
+
+**Vì sao đánh index không cứu được?** Index chỉ giúp khi biết trước **giá trị cụ thể** cần tìm.
+`parent_id = id` không có giá trị cụ thể nào — nó là quan hệ giữa 2 cột, index không mô tả được
+kiểu này. Đây là khác biệt căn bản với Issue 1 của `TRACKING-mysql-load-assessment.md` — Issue 1
+fix được bằng index vì điều kiện là `kb_id = '<giá trị cụ thể>'`.
+
+---
+
+#### ❓ Giải đáp — lần nào upload cũng full scan? Root folder khác KB folder thế nào?
+
+*(Câu hỏi của Kiên 10/08, đã xác minh trực tiếp trên code v0.26.4 — đúng version production)*
+
+**1. Có, lần nào cũng chạy — và 2 lần mỗi lượt upload.**
+
+4 dòng đầu của `upload_document()` chạy mỗi lần gọi hàm, không cache, không điều kiện bỏ qua
+(`ragflow-0.26.4/api/db/services/file_service.py:515-519`):
+
+```python
+root_folder = self.get_root_folder(user_id)        # ← full scan lần 1
+pf_id = root_folder["id"]
+self.init_knowledgebase_docs(pf_id, user_id)       # (không full scan — nhận root_id truyền sẵn)
+kb_root_folder = self.get_kb_folder(user_id)       # ← bên trong gọi lại get_root_folder = full scan lần 2
+kb_folder = self.new_a_file_from_kb(kb.tenant_id, kb.name, kb_root_folder["id"])
+```
+
+**1b. Tìm root folder ra để LÀM GÌ?** *(Kiên hỏi 10/08)*
+
+Không phải để ghi file vào đó. Root folder chỉ được dùng làm **điểm bắt đầu để lần xuống**
+đúng thư mục KB cần ghi. Đọc lại 5 dòng code trên theo trình tự:
+
+```
+get_root_folder(user_id)        → ra id của "/"            (gọi nó là AAA)
+   ↓ dùng AAA làm mốc
+get_kb_folder(user_id)          → tìm ".knowledgebase" có parent_id = AAA   → ra BBB
+   ↓ dùng BBB làm mốc
+new_a_file_from_kb(..., BBB)    → tìm/tạo "<tên KB>" có parent_id = BBB     → ra CCC
+   ↓
+File mới được ghi vào với parent_id = CCC   ← đây mới là chỗ file thực sự nằm
+```
+
+Nói cách khác: mỗi tầng cần biết `id` của tầng cha để tìm mình, và root là tầng trên cùng
+nên phải lấy nó trước. Vấn đề nằm ở chỗ **cách lấy tầng trên cùng đó lại là cách tệ nhất** —
+quét cả bảng, trong khi 2 tầng dưới đều tra bằng giá trị cụ thể nên rất nhanh.
+
+➡️ **Đây chính là lý do vấn đề này đáng lẽ rất dễ sửa**: root folder của một tenant là **bất
+biến** — tạo một lần rồi không bao giờ đổi. Đúng ra chỉ cần cache lại `id` đó (hoặc đánh dấu
+bằng một cột riêng), thay vì đi quét 631,585 dòng lặp đi lặp lại 2 lần cho **mỗi** file upload.
+
+**2. Root folder và KB folder là 3 tầng thư mục KHÁC NHAU** (hay bị nhầm là một):
+
+| Thư mục | Hàm lấy | Điều kiện `WHERE` | Có full scan? |
+|---|---|---|---|
+| `/` (root folder) | `get_root_folder()` | `parent_id = id` — **so 2 cột** | 🔴 **CÓ** — 18s |
+| `.knowledgebase` (kb_root folder) | `get_kb_folder()` | `parent_id = '<id của root>'` — giá trị cụ thể | ✅ Không, dùng được index |
+| `<tên KB>` (kb folder) | `new_a_file_from_kb()` | `parent_id = '<id kb_root>'` + `name = '<tên KB>'` | ✅ Không |
+
+⚠️ Nhưng `get_kb_folder()` **gọi lại `get_root_folder()` ngay dòng đầu** (dòng 269) → vẫn dính
+full scan lần 2, dù bản thân query tìm `.knowledgebase` là nhanh.
+
+**3. Số lượng KB KHÔNG ảnh hưởng — tổng số file trong tài khoản mới ảnh hưởng.**
+
+Full scan quét **toàn bộ bảng `file`** (631,585 dòng, gộp chung mọi KB), không quét riêng KB nào.
+Hệ quả thực tế trên tài khoản đang dùng (6 KB, trong đó `Voffice-doc-sum` chiếm ~394k document):
+
+- Upload vào KB **nhỏ nhất** (chỉ vài file) **vẫn mất đúng 18 giây** — vì vẫn phải lật hết 631,585 dòng
+- KB `Voffice-doc-sum` làm bảng `file` phình to → **làm chậm luôn cả 5 KB còn lại**
+- Bảng `file` càng lớn → càng chậm tuyến tính, không phụ thuộc KB đích là cái nào
+
+**4. Chỉ có 2 lần/upload, không phải 3** (đã tra hết mọi nơi gọi `get_root_folder` trong v0.26.4):
+
+| Vị trí | Có trong flow upload? |
+|---|---|
+| `file_service.py:515` — `upload_document()` gọi trực tiếp | ✅ Lần 1 |
+| `file_service.py:269` — `get_kb_folder()` gọi lại | ✅ Lần 2 |
+| `file_service.py:678` — `delete_docs()` | ❌ Không — thuộc flow xoá document |
+
+→ Câu thứ 3 bắt được trong slow log lúc 12:29:08 đến từ **request khác chạy song song** (UI đang
+mở, hoặc upload nhiều file cùng lúc), không phải từ cùng 1 lần gọi `upload_document`.
+
+---
+
+**Bằng chứng — nguồn code**
+
+`ragflow-0.26.4/api/db/services/file_service.py` dòng 237-246 (**đúng version production**):
+
+```python
+@classmethod
+@DB.connection_context()
+def get_root_folder(cls, tenant_id):
+    # Get or create root folder for tenant
+    for file in cls.model.select().where(
+        (cls.model.tenant_id == tenant_id),
+        (cls.model.parent_id == cls.model.id)      # <-- so cột với cột, không dùng được index
+    ):
+        return file.to_dict()
+    ...
+```
+
+**Tệ hơn: chạy đúng 2 lần mỗi upload.** `get_kb_folder()` (dòng 262-274) gọi lại `get_root_folder()`:
+
+```python
+def get_kb_folder(cls, tenant_id):
+    root_folder = cls.get_root_folder(tenant_id)    # <-- gọi lại lần 2
+    root_id = root_folder["id"]
+    ...
+```
+
+Và `upload_document()` (dòng 513-519) gọi cả hai:
+
+```python
+def upload_document(self, kb, file_objs, user_id, src="local", parent_path=None, parser_config_override=None):
+    root_folder = self.get_root_folder(user_id)      # lần 1  (dòng 515)
+    pf_id = root_folder["id"]
+    self.init_knowledgebase_docs(pf_id, user_id)     # KHÔNG gọi get_root_folder (nhận root_id truyền sẵn)
+    kb_root_folder = self.get_kb_folder(user_id)     # lần 2, bên trong lại gọi get_root_folder (dòng 518)
+```
+
+✅ **Đã xác minh (10/08, trên code v0.26.4)**: `init_knowledgebase_docs()` (dòng 360) **không**
+gọi `get_root_folder` — nó nhận `root_id` truyền sẵn làm tham số, chỉ query theo giá trị cụ thể.
+Tra toàn bộ nơi gọi `get_root_folder` trong v0.26.4 cho ra đúng 3 vị trí: dòng 515
+(`upload_document`), dòng 269 (`get_kb_folder`), dòng 678 (`delete_docs` — **không** thuộc flow
+upload).
+
+→ Vậy 1 lần upload gây **2 lần** full scan (~36s nếu mỗi lần 18s). Câu thứ 3 bắt được trong slow
+log lúc 12:29:08 đến từ **request khác chạy song song**, không phải từ cùng 1 lần `upload_document`.
+
+**Bằng chứng — đã có issue upstream nào chưa? (tra 10/08 theo yêu cầu của Kiên)**
+
+🔶 **Chưa tìm thấy issue nào mô tả đúng vấn đề này.** Đã tra:
+
+| Nguồn tra | Kết quả |
+|---|---|
+| GitHub issues, keyword `get_root_folder` | Không có issue nào về hiệu năng. Chỉ ra 3 issue Feature không liên quan (#14736, #15240, #12313) + 1 PR đã merge (#14345 "Refa: unify document create flows") |
+| GitHub issues, keyword `file table slow query index` | Không liên quan (#15049 onnxruntime, #14628 s3 connector, #3022 hanging at parsing) |
+| Web search "ragflow upload slow MySQL large knowledge base" | Chỉ ra các issue về **parsing chậm** (#7576, #11142, #4673) — khác hẳn: đó là tầng embedding/task executor, không phải MySQL |
+
+⚠️ **Quan trọng — đã kiểm tra branch `main` mới nhất** (không chỉ v0.26.4):
+`get_root_folder()` trên `main` **vẫn còn nguyên** `parent_id == id`, **vẫn không có cache**.
+
+→ Nghĩa là: **nâng version RagFlow sẽ KHÔNG tự khỏi.** Đây không phải bug đã fix ở bản mới mà
+mình đang chạy bản cũ — nó vẫn đang tồn tại ở bản mới nhất upstream.
+
+→ Vì sao chưa ai báo? Nhiều khả năng vì vấn đề chỉ lộ ra khi bảng `file` đủ lớn (mình có
+631,585 dòng), còn đa số người dùng chỉ có vài trăm/vài nghìn dòng — quét hết cũng chỉ mất
+vài ms nên không ai nhận ra.
+
+➡️ **Hệ quả cho hướng xử lý**: mình là bên đầu tiên chạm vào giới hạn này, nên **không có bản
+vá sẵn để chờ**. Muốn xử lý thì phải tự mở issue/PR lên upstream, hoặc tự vá tại chỗ.
+
+**Bằng chứng — quy mô tích luỹ**
+
+Từ query gom nhóm (mục 3.3): query này chạy **783,945 lần**, tổng **838 giờ 59 phút** — gấp hơn 4
+lần query đứng thứ hai. Đây là nguồn tải MySQL lớn nhất của toàn hệ thống.
+
+**Đã thử / cân nhắc**
+
+| Phương án | Kết quả |
+|---|---|
+| Suy luận "25s là do MinIO PUT + thumbnail CPU" (từ đọc code flow, trước khi đo) | ❌ **Sai** — slow log cho thấy 3 câu MySQL 17-19s chiếm gần hết 25s. INSERT `file`/`file2document` chỉ 0.1-0.2s |
+| Nghi ngờ `duplicate_name(kb_id, name)` (Issue 1b của tracking cũ) | ❌ **Đã loại từ trước** — `EXPLAIN` cho `rows: 1`, dùng index `document_name`, không phải nút thắt |
+| Đánh composite index để fix | ❌ **Không khả thi** — `parent_id = id` là so cột với cột, **không index nào dùng được**. Đây là điểm khác biệt căn bản so với Issue 1 (fix được bằng index) |
+| Bật slow log `long_query_time = 1` (như các phiên trước) | ⚠️ Không đủ — nhiều bước nhỏ dưới 1s bị bỏ sót. Phải hạ xuống `0.1` mới thấy toàn cảnh |
+| Đọc slow log bằng `SELECT ... sql_text` không cắt ngắn | ❌ Tràn màn hình vì câu `DELETE ... NOT IN (nghìn id)`. Phải dùng `LEFT(..., 80)` hoặc `\G` |
+
+**Còn tồn đọng nếu để nguyên**
+
+- Mỗi lần upload 1 văn bản tốn ≥2 lần full-scan 631k dòng → 25s/văn bản không giảm được
+- Bảng `file` càng lớn thì càng chậm tuyến tính — đối tác đẩy càng nhiều dữ liệu, càng tệ
+- Chiếm CPU MySQL liên tục (838 giờ tích luỹ), ảnh hưởng cả các query khác trên cùng instance
+
+**Hướng xử lý tiếp**
+
+Root cause nằm ở **code app RagFlow**, ngoài phạm vi dự án hiện tại (ràng buộc: chỉ sửa qua
+`values.yaml` + Helm, không sửa code app — xem memory `ragflow-deploy-constraints.md`). Cần báo
+đội phát triển RagFlow / team quản lý source.
+
+Các hướng khả dĩ (để tham khảo khi báo, **chưa đánh giá khả thi trên production**):
+
+1. **Sửa query để dùng được index** — root folder là dòng có `parent_id = id`; có thể thay bằng
+   điều kiện dùng hằng số, ví dụ đánh dấu bằng cột riêng (`is_root = 1`) hoặc quy ước `parent_id
+   IS NULL` thay vì trỏ về chính nó. Cần đội dev quyết định vì ảnh hưởng schema.
+2. **Cache kết quả `get_root_folder(tenant_id)`** — root folder của 1 tenant gần như không đổi,
+   không cần query lại mỗi lần upload. Đây là fix rẻ nhất về mặt schema.
+3. **Bỏ lời gọi trùng lặp** — `get_kb_folder()` đã gọi `get_root_folder()` bên trong, nhưng
+   `upload_document()` vẫn gọi riêng thêm 1 lần ở dòng 515 → truyền kết quả xuống thay vì gọi lại.
+   Riêng cách này **giảm được một nửa** (2 lần → 1 lần) mà không đụng schema.
+4. ✅ **Đã xác minh (10/08)**: hàm `get_root_folder()` ở v0.26.4 (production) **giống hệt** bản
+   0.24.0 — cùng dòng `where((tenant_id == tenant_id), (parent_id == cls.model.id))`. Kết luận
+   root cause áp dụng đúng cho production, không cần dè dặt vì lệch version nữa.
+
+#### ⭐ Phương án (d) — thay điều kiện tìm: `parent_id = id` → `name = '/'`
+
+**Đã kiểm chứng bằng dữ liệu thật production (mục 3.5, 10/08)** — đây là phương án gọn nhất:
+
+| Tiêu chí | Bằng chứng |
+|---|---|
+| Có tìm ra đúng root folder không? | ✅ Ra đúng 1 dòng, `id = 22cdb226...`, `parent_id = id` |
+| Có bị trùng dòng không? | ✅ `COUNT(*)` = **1** cho `/`, = **1** cho `.knowledgebase` |
+| Nhanh hơn bao nhiêu? | 🚀 **18s → 0.00s** (>1000 lần) |
+| Sửa bao nhiêu dòng code? | **1 dòng** (`file_service.py:244`) |
+
+Sửa cụ thể — chỉ đổi vế điều kiện thứ 2:
+
+```python
+# HIỆN TẠI (dòng 244) — so 2 cột cùng dòng, không dùng được index
+.where((cls.model.tenant_id == tenant_id), (cls.model.parent_id == cls.model.id))
+
+# SỬA THÀNH — so cột với hằng số, dùng được index
+.where((cls.model.tenant_id == tenant_id), (cls.model.name == "/"))
+```
+
+⚠️ **Đánh giá trước đó của tôi cần điều chỉnh.** Trước khi có mục 3.5, tôi xếp phương án vá code
+bằng `sed` vào nhóm "không khuyến nghị", lý do: *"nếu có 2 dòng cùng `name = '/'` thì kết quả sẽ
+khác bản gốc"*. Dữ liệu thật cho thấy **không có dòng trùng** → giả thuyết đó **sai**, và mức rủi
+ro của phương án (d) thấp hơn hẳn so với đánh giá ban đầu:
+
+- Đây là **thay 1 chuỗi trong 1 dòng** — đúng loại việc mà 2 patch `codePatch` hiện có đang làm
+- Không thêm dòng mới, không đụng indent Python (khác phương án (b) cache — cần thêm biến/decorator)
+- ✅ Vẫn nên **test ở non-prod trước**: rủi ro giảm ≠ rủi ro bằng 0
+
+✅ **Đã sửa vào chart 10/08** — Kiên chốt làm (d) trước, **bỏ qua (a)** vì sau patch mỗi lần chỉ
+còn ~0.00s nên gọi 2 lần cũng không đáng kể.
+
+➡️ **Chi tiết triển khai + các bước apply: xem `PLAN-apply-patch-get-root-folder.md`**
+(gồm: vì sao chọn `initContainer` thay `postStart`, cơ chế `codePatch`, 6 bước deploy có lệnh
++ giải nghĩa cờ, cách rollback). Chart đã sửa xong, **chưa deploy**.
+
+**Rủi ro còn lại của (d)** — cần ghi rõ, không được bỏ qua:
+
+| Rủi ro | Mức | Ghi chú |
+|---|---|---|
+| Tenant **mới** chưa có root folder → `name = '/'` không ra dòng nào | Thấp | Code có sẵn nhánh tự tạo khi không tìm thấy (`file_service.py:246-259`) — hành vi giữ nguyên |
+| Về sau xuất hiện dòng trùng `name = '/'` do race condition | Thấp | Hiện `COUNT(*)` = 1. Code v0.26.4 đã có logic dedup cho `.knowledgebase` (dòng 79) → chuyện trùng là có thật với thư mục khác, nên vẫn cần theo dõi |
+| ❓ Chưa xác minh: có index cụ thể nào trên cột `file.name` | Thấp | Suy ra từ `0.00 sec` trên bảng 631k dòng. Chưa chạy `SHOW INDEX FROM file` để xem tên index |
+
+---
+
+## 4b. Breakdown bước 4 "Update metadata" (5s) — MySQL tham gia những phần nào?
+
+*(Kiên hỏi 11/08. Quan trọng vì đã lỡ báo sếp "số 1 + số 4 đều liên quan MySQL" — cần xác minh
+để đính chính nếu sai.)*
+
+**Endpoint**: `PUT /datasets/<dataset_id>/documents/<document_id>` — `api/apps/restful_apis/document_api.py`
+
+### Luồng đầy đủ, đánh dấu hệ thống nào tham gia
+
+| # | Thao tác | Hệ thống | Chi phí |
+|---|---|---|---|
+| 1 | `KnowledgebaseService.query(id=dataset_id, tenant_id=...)` — kiểm tra quyền sở hữu KB | 🟡 MySQL | Tra khoá chính, 1 dòng |
+| 2 | `KnowledgebaseService.get_by_id(dataset_id)` — lấy KB | 🟡 MySQL | Tra khoá chính, 1 dòng. **Trùng lặp với #1** |
+| 3 | `DocumentService.query(kb_id=..., id=document_id)` — kiểm tra doc thuộc KB | 🟡 MySQL | Tra khoá chính, 1 dòng |
+| 4 | `validate_document_update_fields(...)` | Python | Không query |
+| 5 | `Document.select().join(Knowledgebase).where(Document.id == doc_id)` — lấy `tenant_id` | 🟡 MySQL | JOIN 2 bảng theo khoá chính, 1 dòng. **Trùng lặp với #3** |
+| 6 | `_split_combined_values(meta_fields)` | Python | Xử lý chuỗi |
+| 7 | `index_exist(index_name, "")` | 🔴 **ES** | Round-trip mạng |
+| 8 | `get(doc_id, index_name, [kb_id])` | 🔴 **ES** | Round-trip mạng |
+| 9 | `replace_meta_fields(index_name, doc_id, processed_meta)` — **ghi metadata** | 🔴 **ES** | Round-trip + ghi index |
+| 9b | *(nếu #9 fail)* `delete_document_metadata` + `insert_document_metadata` | 🔴 **ES** | **2 vòng ES nữa** + query MySQL lại |
+
+**MySQL: 4 lần — cả 4 đều tra khoá chính, 1 dòng.**
+**ES: 3 lần — mỗi lần một round-trip mạng tới `10.211.145.107:8051` (máy NGOÀI cluster).**
+
+### Bằng chứng đo thật — 4 câu MySQL đó KHÔNG có trong slow log
+
+```sql
+SELECT LEFT(CONVERT(sql_text USING utf8), 110) AS query, COUNT(*) AS so_lan, ROUND(AVG(query_time),3) AS tb FROM mysql.slow_log WHERE CONVERT(sql_text USING utf8) LIKE '%knowledgebase%' OR CONVERT(sql_text USING utf8) LIKE '%INNER JOIN%knowledgebase%' GROUP BY LEFT(CONVERT(sql_text USING utf8), 110) ORDER BY COUNT(*) DESC LIMIT 6\G
+```
+
+| # | Query | Số lần | tb (s) | Thuộc luồng nào |
+|---|---|---|---|---|
+| 1 | `INSERT INTO file (id, create_time, ..., parent_id, tenant_id)` | 99 | 0.164 | Bước 3 — upload |
+| 2 | `SELECT DISTINCT t1.id, t1.connector_id, t1.task_type...` | 7 | 0.134 | Parsing/task |
+| 3 | `SELECT t1.id, t1.doc_id, t1.from_page, t1.to_page...` | 3 | 0.436 | Parsing/task |
+| 4 | `SELECT t1.id, t1.create_time, ..., t1.avatar` | 2 | 0.206 | Khác |
+| 5-6 | `UPDATE knowledgebase SET update_time=..., doc_num=(...)` | 1+1 | 0.124 | Cập nhật bộ đếm doc |
+
+**Đọc được gì:**
+
+- 🔴 **KHÔNG có câu nào trong 4 câu MySQL của bước 4** (#1, #2, #3, #5 ở bảng trên)
+- Slow log đang bật ngưỡng **0.1s** → mọi câu chạy quá 0.1s đều bị ghi lại
+- ➡️ Cả 4 câu đó chạy **dưới 100ms**, tổng cộng **< 0.4 giây** trong 5 giây của bước này
+
+### ✅ Kết luận: bước 4 KHÔNG phải vấn đề MySQL
+
+| Thành phần | Ước tính trong 5s |
+|---|---|
+| MySQL (4 câu tra khoá chính) | **< 0.4s** — có bằng chứng: không lọt ngưỡng slow log 0.1s |
+| Elasticsearch (3 round-trip) | **~4.6s** — phần còn lại |
+
+⚠️ **Cần đính chính với sếp**: đã báo *"số 1 + số 4 đều liên quan đến MySQL"*. Thực tế:
+- Bước **1 (Check tồn tại)**: ✅ đúng là MySQL
+- Bước **4 (Update metadata)**: ❌ **là Elasticsearch**. MySQL chỉ tra 1 dòng để lấy `tenant_id`
+  (biết ghi vào index ES nào), gần như không tốn thời gian
+
+➡️ Tối ưu MySQL sẽ **không có tác dụng** với bước 4. Muốn giảm 5s này phải xem phía ES:
+độ trễ mạng (ES ngoài cluster), tải ES, số shard, hoặc gộp 3 round-trip thành ít hơn.
+
+### 💡 Ghi nhận: có 2 cặp query MySQL trùng lặp
+
+`#1` vs `#2` và `#3` vs `#5` — cùng lấy một dữ liệu hai lần. **Cùng dạng lỗi** với
+`get_root_folder` bị gọi 2 lần, nhưng **không đáng sửa**: tra khoá chính 1 dòng thì gọi 2 lần
+cũng chỉ tốn thêm vài ms, trong khi `get_root_folder` mỗi lần mất 18 giây.
+
+⭐ **Bài học**: cùng một dạng lỗi code, mức đáng sửa phụ thuộc hoàn toàn vào **chi phí mỗi lần
+gọi**. Phải đo trước khi quyết định sửa.
+
+---
+
+## 4c. Luồng XOÁ tài liệu — sếp hỏi có dính cùng lỗi không (11/08)
+
+> 🗣️ **Sếp (Nguyễn Chí Đông)**: *"Nhiều khả năng cái logic xóa 1 tài liệu nó cũng query mysql
+> giống cái logic đẩy dữ liệu vào, anh vừa xóa 1 cái lâu lắm Kiên ạ, nếu mà nó cùng như thế thì
+> tiện đợt tới sửa em sửa luôn giúp anh nhé"*
+
+### ✅ Sếp đoán ĐÚNG — nhưng patch hôm qua đã fix luôn rồi
+
+`file_service.py:677-680` — `delete_docs()` mở đầu **giống hệt** `upload_document()`:
+
+```python
+def delete_docs(cls, doc_ids, tenant_id):
+    root_folder = FileService.get_root_folder(tenant_id)      # ← CÙNG hàm đã patch
+    pf_id = root_folder["id"]
+    FileService.init_knowledgebase_docs(pf_id, tenant_id)
+```
+
+⭐ **Patch sửa BÊN TRONG hàm `get_root_folder()`, không sửa nơi gọi** → mọi luồng gọi hàm này
+đều được hưởng, kể cả xoá.
+
+| Luồng | Gọi `get_root_folder` | Trước patch | Sau patch |
+|---|---|---|---|
+| Upload document | 2 lần | ~36s | ✅ ~0s |
+| **Xoá document** | **1 lần** | **~18s** | ✅ **~0s** |
+
+➡️ Sếp nói *"vừa xoá 1 cái lâu lắm"* — nếu thao tác đó **trước 16:50 ngày 10/08** (lúc deploy)
+thì đúng là dính 18s. Sau thời điểm đó đã hết.
+
+### Bằng chứng đo — slow log 15 dòng cuối ngay sau khi xoá thử
+
+```sql
+SELECT start_time, ROUND(query_time,3) AS thoi_gian, rows_examined, LEFT(CONVERT(sql_text USING utf8), 100) AS query FROM mysql.slow_log ORDER BY start_time DESC LIMIT 15\G
+```
+
+Chỉ có **2 loại query**, lặp đi lặp lại:
+
+| Query | Số dòng | rows_examined | Thời gian |
+|---|---|---|---|
+| `SELECT COUNT(t1.id) FROM task INNER JOIN document ON t1.doc_id = t2.id` | 6 | **164.280** | **2.7 - 3.4s** |
+| `DELETE FROM pipeline_operation_log WHERE kb_id = '73932b965...'` | 9 | 2.914 | 0.11 - 0.46s |
+
+**Đọc được gì:**
+- ⭐ **KHÔNG có câu nào quét bảng `file`** — nếu chưa patch phải thấy `rows_examined ~631585`.
+  Xác nhận patch đã che luôn luồng xoá
+- ⚠️ Câu `COUNT(task INNER JOIN document)` **KHÔNG thuộc luồng xoá** — xem bên dưới
+
+### ⚠️ Phân biệt: `COUNT(task INNER JOIN document)` là task executor, không phải luồng xoá
+
+Tra ra `task_service.py:315-335`:
+
+```python
+with DB.lock("get_task", -1):          # ← KHOÁ TOÀN CỤC
+    docs = (cls.model.select(...)
+        .join(Document, on=(cls.model.doc_id == Document.id))
+        .join(File2Document, ..., join_type=JOIN.LEFT_OUTER)
+        .join(File, ..., join_type=JOIN.LEFT_OUTER)
+        .where(Document.status == VALID, Document.run == RUNNING, ...))
+```
+
+Đây là **task executor định kỳ hỏi "có document nào cần xử lý không"** — chạy nền liên tục vì
+đối tác đang đẩy 106 doc/phút. Nó lọt vào 15 dòng cuối chỉ vì **chạy song song** đúng lúc xoá.
+
+🔴 **Đáng lo riêng**: có `DB.lock("get_task", -1)` — khoá toàn cục. Query mất 2.7-3.4s mà chạy
+6 lần trong 8 giây → các lượt gọi chồng lên nhau phải chờ khoá, có thể làm chậm thao tác khác.
+Tích luỹ 12h: **34.781 lần / 115.325 giây (~32 giờ)** — nặng nhất hệ thống hiện tại.
+🔶 Ghi nhận việc riêng, chưa ưu tiên.
+
+### Xoá 1 file cũ (đã upload xong từ lâu) thì sao?
+
+*(Kiên hỏi tiếp)* — Trực giác nói "nhanh hơn vì không có task đang chạy", nhưng **ngược lại**:
+
+| Thao tác trong `remove_document()` | File đang xử lý dở | File đã xong từ lâu |
+|---|---|---|
+| `cancel_all_task_of()` — đặt cờ Redis | Có tác dụng | ⚪ Vô hại, **vốn chỉ tốn vài ms** |
+| `TaskService.filter_delete()` | Có | 🟢 Nhẹ |
+| `docStoreConn.delete({"doc_id"}, chunk_index_name, kb_id)` — xoá chunk khỏi **ES** | Ít chunk | 🔴 **Đầy đủ chunk** |
+| `delete_chunk_images()` — xoá ảnh khỏi **MinIO** | Ít | 🔴 Nhiều hơn |
+| `remove_dataset_nav_doc_sync()` — sửa file markdown điều hướng KB | Có | 🟡 **Chỗ đáng ngờ còn lại** |
+| Cleanup knowledge graph | Có thể | ✅ **KHÔNG chạy** — xem dưới |
+
+⭐ **Xoá file cũ tốn kém HƠN xoá file đang parse dở** — ngược trực giác. Lý do: file đã parse
+xong nghĩa là dữ liệu đã lan ra khắp nơi (chunk ES, ảnh MinIO). Càng "hoàn thiện" càng nhiều
+thứ phải gỡ.
+
+### Redis trong luồng xoá làm gì? *(Kiên hỏi)*
+
+`task_service.py:593-609`:
+
+```python
+def cancel_all_task_of(doc_id):
+    for t in TaskService.query(doc_id=doc_id):
+        REDIS_CONN.set(f"{t.id}-cancel", "x")      # ← đặt CỜ huỷ
+
+def has_canceled(task_id):
+    if REDIS_CONN.get(f"{task_id}-cancel"):        # ← task executor tự đọc cờ
+        return True
+```
+
+**Bối cảnh**: upload không xử lý ngay trong request — tạo **task** rồi trả về luôn, task executor
+làm nền (parse, chunk, embedding). Nếu xoá tài liệu **đang xử lý dở**, executor vẫn chạy tiếp →
+ghi chunk cho document không còn tồn tại → rác dữ liệu.
+
+**Vì sao dùng Redis mà không gọi thẳng executor?** Vì executor là **tiến trình khác**, thậm chí
+**pod khác** (3 pod ragflow trên node05/node06). Pod nhận request xoá không gọi được vào vòng lặp
+đang chạy ở pod kia. Redis đóng vai **bảng tin chung**.
+
+⭐ Đây là **cooperative cancellation** — hợp tác chứ không cưỡng chế. Redis không "giết" được
+task; chỉ treo biển, executor phải **chủ động** kiểm tra giữa các bước. Task đang kẹt ở bước dài
+(embedding) sẽ không thấy biển cho tới khi xong bước đó.
+
+⚠️ **Đính chính**: bản nháp trước liệt kê Redis vào "4 nơi phải dọn" khiến nó trông như phần đáng
+kể của thời gian xoá. **Sai** — `SET` một khoá chỉ vài ms, gần như miễn phí.
+
+### ⭐ BREAKDOWN CHI TIẾT — xoá 1 file thì xoá đúng những gì, ở đâu
+
+*(Kiên yêu cầu 11/08: "breakdown chi tiết ra là khi xóa 1 file thì nó xóa những thành phần gì,
+ở đâu nữa, cụ thể ra")*
+
+Đọc theo đúng thứ tự code chạy: `file_service.py:delete_docs()` → `document_service.py:remove_document()`
+
+| # | Xoá/sửa **cái gì** | **Ở đâu** | Hàm | Chi phí |
+|---|---|---|---|---|
+| 1 | Tìm thư mục gốc của tenant | MySQL bảng `file` | `get_root_folder()` `file_service.py:678` | 🟢 **~0s** (đã patch; trước là 18s) |
+| 2 | Đặt cờ `"{task_id}-cancel" = x` cho mỗi task | **Redis** | `cancel_all_task_of()` `task_service.py:593` | 🟢 Vài ms |
+| 3 | Xoá dòng document + trừ bộ đếm `token_num`, `chunk_num`, `doc_num` của KB | MySQL bảng `document` + `knowledgebase` | `delete_document_and_update_kb_counts()` `:696` | 🟢 Tra khoá chính, có `FOR UPDATE` |
+| 4 | Xoá các bản ghi task của tài liệu | MySQL bảng `task` | `TaskService.filter_delete()` | 🟢 Nhẹ |
+| 5 | **Xoá ảnh của từng chunk** | **MinIO** | `delete_chunk_images()` `:548` | 🔴 **Vòng lặp — xem dưới** |
+| 6 | Xoá ảnh thumbnail của tài liệu | **MinIO** | `remove_document()` `:489-491` | 🟡 1 lần gọi |
+| 7 | **Xoá toàn bộ chunk (đoạn văn bản đã tách)** | **Elasticsearch** index `ragflow_<tenant_id>` | `docStoreConn.delete({"doc_id": ...})` `:497` | 🔴 **Nặng nhất** |
+| 8 | Gỡ dòng của tài liệu khỏi file markdown điều hướng KB | **ES/lưu trữ** | `remove_dataset_nav_doc_sync()` `:507` | 🟡 ❓ chưa đo |
+| 9 | Xoá metadata của tài liệu | **Elasticsearch** index metadata riêng | `DocMetadataService.delete_document_metadata()` `:516` | 🟡 |
+| 10 | Gỡ tài liệu khỏi knowledge graph (entity, relation, graph, subgraph, community_report) | **Elasticsearch** | `remove_document()` `:521-540` | ✅ **KHÔNG chạy** — KB không bật graphrag |
+| 11 | Xoá file gốc đã upload | **MinIO** | `STORAGE_IMPL.rm(b, n)` `file_service.py:704` | 🟡 1 lần gọi |
+| 12 | Xoá liên kết file ↔ document | MySQL bảng `file`, `file2document` | `filter_delete()`, `delete_by_document_id()` `:701-702` | 🟢 Nhẹ |
+| 13 | *(chỉ với tài liệu loại TABLE)* Đếm lại số doc trong KB | MySQL bảng `document` | `count_by_kb_id()` `:326` | 🔴 `COUNT` cả KB — nhưng chỉ với `parser_id = TABLE` |
+
+**Tổng cộng: 13 bước, chạm 4 hệ thống.**
+
+### Vì sao bước 5 (xoá ảnh chunk) đáng chú ý
+
+```python
+def delete_chunk_images(cls, doc, tenant_id):
+    page, page_size = 0, 1000
+    while True:
+        chunks = settings.docStoreConn.search(["img_id"], [], {"doc_id": doc.id}, ...)  # ← query ES
+        chunk_ids = settings.docStoreConn.get_doc_ids(chunks)
+        if not chunk_ids:
+            break
+        for cid in chunk_ids:
+            if settings.STORAGE_IMPL.obj_exist(doc.kb_id, cid):   # ← gọi MinIO kiểm tra
+                settings.STORAGE_IMPL.rm(doc.kb_id, cid)          # ← gọi MinIO xoá
+        page += 1
+```
+
+⭐ **Mỗi ảnh tốn 2 lần gọi MinIO** (`obj_exist` + `rm`), cộng 1 query ES cho mỗi trang 1.000 chunk.
+Tài liệu có N ảnh → **2N lần gọi mạng tới MinIO**, chạy tuần tự không song song.
+
+### 🔍 Phần MySQL — cụ thể xoá gì, bảng nào, câu SQL nào
+
+*(Kiên hỏi tiếp 11/08: "chỗ này cụ thể thì nó xoá cái gì ở mysql nhỉ?")*
+
+**5 bảng bị đụng tới. Chỉ 1 bảng là UPDATE, 4 bảng còn lại là DELETE/SELECT:**
+
+| Bảng | Thao tác | Xoá/sửa **dòng nào** | Câu SQL tương đương |
+|---|---|---|---|
+| `file` | **SELECT** (bước 1) | Tìm thư mục gốc của tenant — chỉ đọc, không xoá | `SELECT ... FROM file WHERE tenant_id = ? AND name = '/'` *(sau patch)* |
+| `document` | **DELETE** | Đúng **1 dòng** — bản ghi tài liệu | `DELETE FROM document WHERE id = '<doc_id>'` |
+| `knowledgebase` | **UPDATE** | Đúng **1 dòng** — trừ 3 bộ đếm của KB chứa tài liệu | `UPDATE knowledgebase SET token_num = token_num - ?, chunk_num = chunk_num - ?, doc_num = doc_num - 1 WHERE id = '<kb_id>'` |
+| `task` | **DELETE** | **Nhiều dòng** — mọi tác vụ xử lý của tài liệu này | `DELETE FROM task WHERE doc_id = '<doc_id>'` |
+| `file` | **DELETE** | **1 dòng** — bản ghi file (chỉ khi `source_type = KNOWLEDGEBASE`) | `DELETE FROM file WHERE source_type = 'knowledgebase' AND id = '<file_id>'` |
+| `file2document` | **DELETE** | **1 dòng** — bảng nối file ↔ document | `DELETE FROM file2document WHERE document_id = '<doc_id>'` |
+
+**Chi tiết 3 bộ đếm bị trừ ở `knowledgebase`** (`document_service.py:719-723`):
+
+```python
+Knowledgebase.update(
+    token_num=Knowledgebase.token_num - doc.token_num,   # tổng số token của KB
+    chunk_num=Knowledgebase.chunk_num - doc.chunk_num,   # tổng số chunk của KB
+    doc_num=Knowledgebase.doc_num - 1,                   # tổng số tài liệu của KB
+).where(Knowledgebase.id == doc.kb_id).execute()
+```
+
+⭐ Đây chính là 3 cột đã thấy khi query `knowledgebase` ở trên (`doc_num: 760540`,
+`chunk_num: 740235`) — chúng là **bộ đếm luỹ kế**, không phải `COUNT(*)` tính lại mỗi lần.
+Nên đọc rất nhanh, nhưng bù lại **phải trừ tay mỗi lần xoá**.
+
+**Toàn bộ bước 3 nằm trong 1 transaction có khoá** (`document_service.py:702-723`):
+
+```python
+with DB.atomic():
+    doc = cls.model.select(id, kb_id, token_num, chunk_num)
+             .where(id == doc_id).for_update().get_or_none()    # ← KHOÁ dòng document
+    if doc is None: return False                                 # đã bị xoá bởi request khác
+    deleted = cls.model.delete().where(id == doc_id).execute()
+    Knowledgebase.update(...).execute()                          # trừ bộ đếm
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `DB.atomic()` | Transaction — hoặc cả 2 thao tác cùng thành công, hoặc cùng huỷ. Tránh trường hợp xoá document rồi mà bộ đếm chưa trừ |
+| `.for_update()` | **Khoá dòng** cho tới hết transaction. Ngăn 2 request cùng xoá 1 tài liệu → trừ bộ đếm 2 lần |
+| `get_or_none()` + `if doc is None` | Idempotent — request thứ 2 thấy dòng đã mất thì trả `False`, không lỗi |
+
+⚠️ **Điểm cần theo dõi**: `FOR UPDATE` giữ khoá trên dòng `document` **và** dòng `knowledgebase`
+tương ứng. Khi đối tác đẩy 106 doc/phút, mọi upload cũng phải `UPDATE knowledgebase` (cộng bộ đếm)
+→ có thể **tranh chấp khoá trên cùng 1 dòng KB**. ❓ Chưa đo, nhưng là chỗ đáng nghi nếu sau này
+thấy xoá/upload chậm bất thường lúc tải cao.
+
+**Bước 13 — `count_by_kb_id()`** chỉ chạy khi `parser_id == TABLE`:
+
+```python
+docs = cls.model.select().where(cls.model.kb_id == kb_id)
+count = docs.count()      # ← COUNT trên TOÀN BỘ KB (760k dòng)
+```
+
+🔴 Nếu tài liệu là dạng bảng thì bước này quét cả KB. Có cache theo `kb_id` (`kb_table_num_map`)
+nên xoá nhiều file cùng KB chỉ tính 1 lần — nhưng lần đầu vẫn nặng.
+✅ Với tài liệu thường (`parser_id != TABLE`) thì **bỏ qua hoàn toàn**.
+
+### Tổng hợp theo hệ thống
+
+| Hệ thống | Số bước | Nội dung | Chi phí |
+|---|---|---|---|
+| **Elasticsearch** | 4 bước (7, 8, 9, 10) | Chunk, metadata, nav markdown, knowledge graph | 🔴 **Nặng nhất** |
+| **MinIO** | 3 bước (5, 6, 11) | Ảnh chunk (vòng lặp 2N lần gọi), thumbnail, file gốc | 🔴 Nhiều round-trip |
+| **MySQL** | 5 bước (1, 3, 4, 12, 13) | `file`, `document`, `task`, `file2document`, `knowledgebase` | 🟢 **Nhẹ — đã đo bằng slow log, không câu nào nặng** |
+| **Redis** | 1 bước (2) | Đặt cờ huỷ task | 🟢 Vài ms |
+
+### Đo `knowledgebase` — loại trừ knowledge graph
+
+```sql
+SELECT name, doc_num, chunk_num, LEFT(parser_config, 200) AS config FROM knowledgebase ORDER BY doc_num DESC LIMIT 3\G
+```
+
+```
+name: Voffice-doc-sum
+doc_num: 760540
+chunk_num: 740235
+config: {"layout_recognize": "DeepDOC", "chunk_token_num": 512, "delimiter": "\n",
+         "enable_children": false, "children_delimiter": "", "auto_keywords": 0,
+         "auto_questions": 0, "html4excel": false, "topn_tags"...}
+
+name: Test t?i        doc_num: 501    chunk_num: 500
+name: ?TXD Wiki       doc_num: 103    chunk_num: 1237
+```
+
+**Đọc được gì:**
+- ✅ **KHÔNG có `graphrag`/`use_graph` trong config** → nhánh cleanup knowledge graph (nghi là
+  nặng nhất) **không chạy**. Loại được một giả thuyết
+- 🔺 **`doc_num` = 760.540 — tăng gần GẤP ĐÔI** so với ghi nhận 395.137 (07/08). Do đối tác đẩy
+  106 doc/phút liên tục
+- ❓ `chunk_num` 740.235 cho 760.540 doc = **chưa tới 1 chunk/tài liệu** — bất thường vì
+  `chunk_token_num: 512`. Hoặc văn bản rất ngắn (hợp lý với "văn bản tóm tắt"), hoặc **phần lớn
+  chưa parse xong**. Khả năng thứ hai khớp với việc task executor chạy 34.781 lần
+- 💡 Dấu `?` trong tên KB là do terminal VDI không hiển thị tiếng Việt, **không phải lỗi dữ liệu**
+
+### Hệ quả của việc bảng lớn gấp đôi
+
+- Nếu **chưa** patch `get_root_folder`, giờ full-scan sẽ mất **hơn 18 giây** (bảng lớn hơn)
+  → patch càng lúc càng có giá trị
+- Query `COUNT(task INNER JOIN document)` quét 164.280 dòng sẽ **nặng dần** theo thời gian
+
+### 🔶 Còn tồn đọng (Kiên quyết định dừng, không xoá thêm file để đo)
+
+- [ ] Chưa đo được `remove_dataset_nav_doc_sync()` — nghi sửa file markdown điều hướng của KB
+      760k document, phải đọc + ghi lại toàn bộ
+- [ ] Chưa đo được thời gian thực tế phần ES/MinIO trong luồng xoá (slow log chỉ đo MySQL)
+
+---
+
+## 5. Bài học
+
+| Bài học | Cách phát hiện sớm lần sau |
+|---|---|
+| **`WHERE col_a = col_b` (2 cột cùng bảng) không bao giờ dùng được index** — khác hẳn `WHERE col = 'hằng'`. Đánh bao nhiêu index cũng vô ích | Đọc `WHERE` trong slow log: thấy vế phải là **tên cột** chứ không phải giá trị → biết ngay là full scan, không cần `EXPLAIN` |
+| **Suy luận từ đọc code flow có thể sai hoàn toàn.** Đã đoán "25s là MinIO + thumbnail CPU" dựa trên đọc `upload_document()`, nhưng đo thật thì 3 câu MySQL chiếm gần hết | Luôn đo bằng slow log **trước** khi kết luận bước nào chậm, đừng suy từ cấu trúc code |
+| **`long_query_time` phải khớp với thứ đang tìm.** Ngưỡng 1s hợp lý để tìm query đơn lẻ chậm, nhưng bỏ sót flow gồm nhiều bước nhỏ cộng dồn | Đang debug 1 flow nhiều bước → hạ xuống `0.1`; đang tìm query nặng đơn lẻ → giữ `1` |
+| **Đọc slow log phải gom nhóm, không đọc từng dòng.** `GROUP BY` + `SUM(query_time)` lộ ra thủ phạm 783,945 lần/838 giờ mà đọc 20 dòng gần nhất không thấy được quy mô | Luôn chạy query gom nhóm **trước**, rồi mới soi chi tiết dòng cụ thể |
+| **Câu SQL dài làm tràn màn hình VDI.** `DELETE ... NOT IN (nghìn id)` khiến output không đọc nổi | Dùng `LEFT(CONVERT(sql_text USING utf8), 80)` để liệt kê, `\G` khi cần đọc full 1 câu |
+| **Một lời gọi hàm trong code có thể thành nhiều query.** `get_kb_folder()` gọi lại `get_root_folder()` → 1 dòng code thành 2 lần full scan | Khi thấy query lặp bất thường trong slow log, tra ngược xem hàm nào gọi hàm nào |
+| **Số lần query trong slow log ≠ số lần 1 request gọi.** Ban đầu thấy 3 câu cùng lúc → tưởng 1 lần upload gọi 3 lần. Tra code mới biết chỉ 2 lần, câu thứ 3 từ request song song khác | Đếm số lời gọi bằng cách `grep` toàn bộ codebase (`grep -rn "get_root_folder"`), đừng suy từ số dòng trong slow log |
+| **Tra code phải đúng version đang chạy production.** Repo có sẵn 0.24.0 nhưng production chạy 0.26.4 — may là code giống nhau, nhưng nếu khác thì kết luận sai hoàn toàn | `git clone --depth 1 --branch <tag>` bản đúng version rồi đối chiếu, trước khi báo dev |
+| **"Chưa có ai báo issue" không có nghĩa là mình sai** — có nghĩa là mình chạm giới hạn trước người khác. Bug này chỉ lộ ra khi bảng `file` đủ lớn; đa số user chỉ có vài nghìn dòng nên quét hết vẫn mất vài ms | Tra issue upstream mà không ra → **kiểm tra thêm branch `main`** xem code còn lỗi không, thay vì kết luận "chắc mình hiểu nhầm" |
+| **Kiểm tra `main` chứ không chỉ version đang chạy.** Nếu `main` đã fix thì hướng xử lý là nâng version; nếu `main` còn lỗi thì phải tự vá — hai hướng hoàn toàn khác nhau | `curl raw.githubusercontent.com/<repo>/main/<file>` đọc thẳng bản mới nhất, nhanh hơn clone |
+| **Đánh giá rủi ro dựa trên giả thuyết phải đi đo, đừng để nguyên.** Đã xếp phương án vá code vào nhóm "rủi ro cao" vì lo `name = '/'` có dòng trùng — chạy `COUNT(*)` 10 giây thì thấy **không trùng**, rủi ro thấp hơn hẳn | Mỗi khi viết "nếu X xảy ra thì nguy hiểm" → hỏi ngay **"X có thật không, đo bằng câu nào?"**. Giả thuyết chưa đo mà đem đi ra quyết định thì dễ chọn sai hướng |
+| **Cùng một bảng, đổi cách hỏi thì nhanh gấp 1000 lần.** `parent_id = id` mất 18s, `name = '/'` mất 0.00s — cùng bảng 631k dòng, cùng trả 1 dòng | Nghi query chậm do "bảng to" → thử viết lại điều kiện theo hằng số rồi đo. Bảng to chỉ là điều kiện cần, cách hỏi mới quyết định |
+| **`\G` cũng là ký tự kết thúc câu, `;` thì không thay thế được nó.** Câu dùng `\G` chạy được dù không có `;`; câu dùng bảng ngang mà quên `;` sẽ treo ở prompt `->` | Thấy MySQL hiện `->` thay vì `mysql>` → câu chưa kết thúc, gõ `;` rồi Enter là xong (không cần `^C` chạy lại) |
+| **Sửa bên trong hàm thì mọi nơi gọi đều được hưởng.** Patch `get_root_folder` nhắm luồng upload, nhưng fix luôn cả luồng xoá (`delete_docs` dòng 678) mà không phải làm gì thêm | Trước khi sửa, `grep -rn "<tên hàm>"` để biết **có bao nhiêu nơi gọi** — vừa lường được tác động, vừa biết được lợi ích ngoài dự tính |
+| **Xoá dữ liệu tốn kém hơn ghi dữ liệu.** Ghi chỉ thêm vào 1 chỗ; xoá phải tìm và gỡ ở MỌI nơi dữ liệu đã lan tới (MySQL, ES, MinIO, Redis). Nên file **đã parse xong** xoá CHẬM hơn file đang parse dở — ngược trực giác | Đánh giá chi phí xoá thì đếm xem dữ liệu đã lan ra bao nhiêu hệ thống, đừng chỉ nhìn 1 bảng |
+| **Slow log chỉ đo MySQL — không thấy gì ≠ không có vấn đề.** Luồng xoá không để lại câu MySQL nặng nào, nhưng vẫn chậm vì phần ES/MinIO nằm ngoài tầm đo | Khi slow log sạch mà người dùng vẫn kêu chậm → chuyển sang đo tầng khác (log ứng dụng, `curl` đo độ trễ ES), đừng kết luận "đã hết chậm" |
+| **Bảng dùng chung nghĩa là 1 KB lớn làm chậm mọi KB.** Bảng `file` gộp chung mọi KB của tài khoản → full scan quét hết 631k dòng bất kể upload vào KB nào | Khi thấy query full scan trên bảng dùng chung, đừng chỉ nhìn KB/tenant đang thao tác — nhìn tổng số dòng cả bảng |
+
+---
+
+## 6. Nợ kỹ thuật
+
+| Nợ | Nguồn | Rủi ro nếu bỏ quên |
+|---|---|---|
+| `slow_query_log` bật bằng `SET GLOBAL`, mất khi pod restart | Mục 3.1 phiên này (đã mất 2 lần trước đó) | Restart pod → mù quan sát trở lại, phải bật lại thủ công mỗi lần cần debug |
+| ~~Bảng `mysql.slow_log` tích luỹ rất lớn (783,945 dòng chỉ riêng 1 loại query)~~ | ~~Hệ quả của việc bật log ngưỡng 0.1s~~ | ✅ **Đã xử lý 10/08** — `TRUNCATE mysql.slow_log` → `Query OK, 0 rows affected (0.50 sec)`. Bảng đã quá lớn tới mức chính câu query đo mất **161s cho 2 lần chạy** |
+| ~~Source code tra cứu là `0.24.0`, production chạy `0.26.4`~~ | ~~Repo chỉ có sẵn bản 0.24.0~~ | ✅ **Đã xử lý 10/08** — clone bản v0.26.4 về đối chiếu, code `get_root_folder()` giống hệt, kết luận vẫn đúng |
+| Source v0.26.4 hiện nằm ở `/Users/macboook/.claude/jobs/feb3bf0f/tmp/ragflow-0.26.4/` (thư mục tạm của job) | Clone 10/08 để đối chiếu | Thư mục tạm có thể bị dọn khi job kết thúc → lần sau cần tra lại phải clone lại. Cân nhắc copy vào repo nếu còn dùng nhiều |
+
+---
+
+## 7. Việc tiếp theo
+
+### Ngay lập tức (không cần downtime)
+
+- [x] ~~Đọc `init_knowledgebase_docs()` để giải thích vì sao có 3 câu full scan~~ → ✅ **Xong
+      10/08**: hàm này **không** gọi `get_root_folder` (nhận `root_id` truyền sẵn). 1 lần upload
+      chỉ gây **2** lần full scan; câu thứ 3 đến từ request khác chạy song song
+- [x] ~~Xác minh hàm `get_root_folder()` ở version 0.26.4 có giống 0.24.0 không~~ → ✅ **Xong
+      10/08**: giống hệt, kết luận root cause áp dụng đúng cho production
+- [x] ~~`TRUNCATE mysql.slow_log` sau khi debug xong để giải phóng dung lượng~~ → ✅ **Xong 10/08**:
+      `Query OK, 0 rows affected (0.50 sec)`. Lưu ý `0 rows affected` là bình thường với
+      `TRUNCATE` (drop/recreate bảng, không đếm từng dòng), **không phải** "không xoá được gì"
+- [ ] Đo `SELECT COUNT(*) FROM file` để biết chính xác kích thước bảng (hiện chỉ suy từ
+      `rows_examined` = 631,585)
+- [x] ~~Xác nhận root folder `/` và `.knowledgebase` có tồn tại, có bị trùng không~~ → ✅ **Xong
+      10/08 (mục 3.5)**: cả 2 tồn tại, nối đúng cây, **mỗi cái đúng 1 dòng, không trùng**.
+      `name = '/'` chạy **0.00s** vs `parent_id = id` **18s** → chốt được phương án (d)
+- [ ] Chạy `SHOW INDEX FROM file` để biết tên index đang phục vụ cột `name` (hiện chỉ suy ra từ
+      thời gian 0.00s, chưa xem trực tiếp) ❓
+
+### Ngắn hạn
+
+> 🎯 **PHẠM VI ƯU TIÊN — Kiên chốt 10/08.** Chỉ tập trung **2 API**:
+>
+> | # | API | Trạng thái |
+> |---|---|---|
+> | 1 | **Upload document vào 1 KB** | ✅ **XONG 10/08** — Issue U1 đã fix, xem `PLAN-apply-patch-get-root-folder.md` |
+> | 2 | **Retrieval** | ✅ Đã xử lý ở đợt trước, không thuộc phạm vi đợt này |
+>
+> ⚠️ **API list document (Issue 7) — CHƯA ƯU TIÊN.** Sau khi fix U1, các query của Issue 7 nổi
+> lên đầu bảng slow log (#2-#6 trong top 8). **Chúng không chậm đi** — chỉ là trước đây bị
+> `get_root_folder` (838 giờ tích luỹ) át hết nên không nhìn thấy. Đường **GHI** (upload) đã
+> nhanh; đường **ĐỌC** (list document) vẫn chậm nhưng để sau.
+
+- [x] ~~Tra xem upstream đã có issue nào cho vấn đề này chưa~~ → 🔶 **Xong 10/08: CHƯA CÓ.**
+      Tra GitHub issues (`get_root_folder`, `file table slow query index`) + web search đều không
+      ra issue nào đúng vấn đề. Quan trọng hơn: **branch `main` mới nhất vẫn còn nguyên lỗi**
+      (`parent_id == id`, không cache) → **nâng version sẽ không tự khỏi**
+- [ ] Báo đội phát triển RagFlow về Issue U1 kèm bằng chứng (mục 3-4 file này) — **là bên đầu
+      tiên báo**, nên cần kèm số liệu đầy đủ: 631,585 dòng, 18s/lần, 2 lần/upload, 783,945 lần
+      chạy tích luỹ 838h59m
+- [ ] Báo luôn Issue 7 (`get_filter_by_kb_id`) — vẫn còn trong top slow query, cùng nhóm nguyên
+      nhân "code app query không tối ưu". ⚠️ **Chưa ưu tiên fix** (xem khung phạm vi ở trên),
+      nhưng vẫn nên báo upstream cùng lúc với U1 vì cùng một lần liên hệ
+- [ ] Trace nốt 4 bước còn lại của flow 55s (LLM tóm tắt 10s, Update metadata 8s, Parse chunk 6s,
+      Check tồn tại 6s) — hiện mới xong đúng bước Upload document
+
+### Dài hạn
+
+- [ ] Đưa `slow_query_log` + `long_query_time` vào ConfigMap của chart (xoá nợ kỹ thuật, dùng
+      chung với Issue 5 của `TRACKING-mysql-load-assessment.md`)
+- [ ] Cân nhắc bổ sung mysqld_exporter + Grafana để không phải bật/tắt slow log thủ công mỗi lần
+
+---
+
+## 8. Rủi ro còn lại
+
+| Rủi ro | Mức độ | Giảm thiểu |
+|---|---|---|
+| Đối tác tiếp tục đẩy dữ liệu → bảng `file` lớn thêm → full scan càng chậm tuyến tính | 🔴 Cao | Chưa có cách giảm thiểu ở tầng hạ tầng; phụ thuộc hoàn toàn vào việc đội dev sửa code |
+| Query 838 giờ tích luỹ vẫn đang chạy liên tục, chiếm CPU MySQL ảnh hưởng query khác | 🔴 Cao | Đã migrate sang node06 (CPU rảnh hơn) nên chịu tải tốt hơn, nhưng không giải quyết gốc |
+| ~~Kết luận dựa trên code 0.24.0 có thể không đúng với 0.26.4 đang chạy~~ | ✅ Đã loại bỏ | Đã clone v0.26.4 đối chiếu 10/08 — code giống hệt, không còn rủi ro này |
+| Bảng `mysql.slow_log` phình to do log ngưỡng 0.1s | 🟢 Thấp | Tắt slow log hoặc truncate sau khi debug xong |

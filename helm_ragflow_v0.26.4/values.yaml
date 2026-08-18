@@ -1,0 +1,414 @@
+# Based on docker compose .env file
+
+# Global image pull secrets configuration
+global:
+  # Global image repo prefix to render all images from a mirror/registry.
+  # Example: "registry.example.com/myproj"
+  # When set, template will replace the registry part of each image and keep the path.
+  # Leave empty to use per-image repositories as-is.
+  repo: ""
+  # Global image pull secrets for all pods
+  imagePullSecrets: []
+
+env:
+  # The type of doc engine to use.
+  # Available options:
+  # - `elasticsearch` (default)
+  # - `infinity` (https://github.com/infiniflow/infinity)
+  # - `opensearch` (https://github.com/opensearch-project/OpenSearch)
+  DOC_ENGINE: elasticsearch
+  # DOC_ENGINE: infinity
+  # DOC_ENGINE: opensearch
+
+  # --- v0.26 BAT BUOC PHAI SET ---------------------------------------------
+  # entrypoint.sh v0.26 co bug: neu API_PROXY_SCHEME rong, no van chon nginx
+  # config ragflow.conf.python NHUNG KHONG start server nao ca (khoi if chi
+  # match "hybrid"/"python"/"go", khong co nhanh else) => nginx khong co
+  # upstream => 502 tren MOI endpoint.
+  # Gia tri: "python" (chi Python server) | "go" (chi Go server) | "hybrid" (ca hai)
+  API_PROXY_SCHEME: "python"
+
+  # The version of Elasticsearch.
+  STACK_VERSION: "8.11.3"
+
+  # The password for Elasticsearch
+  ELASTIC_PASSWORD: infini_rag_flow_helm
+
+  # The password for OpenSearch.
+  # At least one uppercase letter, one lowercase letter, one digit, and one special character
+  OPENSEARCH_PASSWORD: infini_rag_flow_OS_01
+
+  # The password for MySQL
+  MYSQL_PASSWORD: infini_rag_flow_helm
+  # The database of the MySQL service to use
+  MYSQL_DBNAME: rag_flow
+  # External MySQL host (only required when mysql.enabled=false)
+  # MYSQL_HOST: ""
+  # External MySQL port (defaults to 3306 if not set)
+  # MYSQL_PORT: "3306"
+  # External MySQL user (only when mysql.enabled=false), default is root if omitted
+  # MYSQL_USER: "root"
+
+  # The username for MinIO.
+  MINIO_ROOT_USER: rag_flow
+  # The password for MinIO
+  MINIO_PASSWORD: infini_rag_flow_helm
+  # External MinIO host
+  # MINIO_HOST: ""
+  # External MinIO port (defaults to 9000 if not set)
+  # MINIO_PORT: "9000"
+
+  # The password for Redis
+  REDIS_PASSWORD: infini_rag_flow_helm
+  # External Redis host (only required when redis.enabled=false)
+  # REDIS_HOST: ""
+  # External Redis port (defaults to 6379 if not set)
+  # REDIS_PORT: "6379"
+
+  # The local time zone.
+  TZ: "Asia/Shanghai"
+
+  # Uncomment the following line if you have limited access to huggingface.co:
+  # HF_ENDPOINT: https://hf-mirror.com
+
+  # The maximum file size for each uploaded file, in bytes.
+  # You can uncomment this line and update the value if you wish to change 128M file size limit
+  # MAX_CONTENT_LENGTH: "134217728"
+  # After making the change, ensure you update `client_max_body_size` in nginx/nginx.conf correspondingly.
+
+  # The number of document chunks processed in a single batch during document parsing.
+  DOC_BULK_SIZE: 4
+
+  # The number of text chunks processed in a single batch during embedding vectorization.
+  EMBEDDING_BATCH_SIZE: 16
+
+ragflow:
+  image:
+    # Image custom (build tu code v0.26.x, da sua phan build query cho tieng Viet)
+    repository: 10.60.170.184:8083/vmlp/lfnovo/ragflow
+    tag: v2-latest
+    pullPolicy: IfNotPresent
+    # Upstream goc, giu lai de tham chieu:
+    # repository: infiniflow/ragflow
+    # tag: v0.26.4
+    pullSecrets: []
+  # Optional service configuration overrides
+  # to be written to local.service_conf.yaml
+  # inside the RAGFlow container
+  # https://ragflow.io/docs/dev/configurations#service-configuration
+  #
+  # LUU Y: dung service_conf de tro toi ES NGOAI. Neu khong set, chart se tu
+  # sinh ES_HOST tro toi StatefulSet ES noi bo trong cluster (xem templates/env.yaml).
+  service_conf:
+    es:
+      hosts: 'https://10.211.145.107:8051'
+      username: 'aihub_prod'
+      password: 'j1#&VC64Zo'
+
+  # Optional yaml formatted override for the
+  # llm_factories.json file inside the RAGFlow
+  # container.
+  llm_factories:
+    # factory_llm_infos:
+    # - name: OpenAI-API-Compatible
+    #   logo: ""
+    #   tags: "LLM,TEXT EMBEDDING,SPEECH2TEXT,MODERATION"
+    #   status: "1"
+    #   llm:
+    #     - llm_name: my-custom-llm
+    #       tags: "LLM,CHAT,"
+    #       max_tokens: 100000
+    #       model_type: chat
+    #       is_tools: false
+
+  # Kubernetes configuration
+  deployment:
+    # So pod phuc vu web/API + task_executor.
+    # An toan de scale: task_executor dung Redis Stream Consumer Group nen
+    # moi task chi duoc giao cho dung 1 consumer (khong bao gio 1 file bi 2 pod
+    # xu ly trung). Web/API stateless theo request.
+    replicas: 3
+
+    strategy:
+    resources:
+
+    # De trong = pod chay duoc tren MOI node (image da copy len tat ca node
+    # worker). Neu chi copy len mot so node, dat lai label o day de gioi han.
+    nodeSelector: {}
+
+    affinity:
+      # Loai tru 2 node khoi workload ragflow.
+      # required... = rang buoc CUNG: pod tha Pending chu khong len cac node nay.
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: NotIn
+                  values:
+                    # Tai nguyen sap can kiet
+                    - vrp-kubeengine04
+                    # Danh RIENG cho mysql/minio/redis (chung bi ghim o day boi
+                    # local PV). Image ragflow nang ~7-8GB/ban, de len day se
+                    # day node vuot nguong disk-pressure -> kubelet gan taint
+                    # NoSchedule -> mysql/minio/redis khong schedule duoc nua.
+                    # Da xay ra that ngay 2026-07-31.
+                    - vrp-kubeengine07
+      # Uu tien trai 3 pod ra 3 node khac nhau. Dung "preferred" (khong phai
+      # "required") de pod van chay duoc neu cluster thieu node.
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/component: ragflow
+              topologyKey: kubernetes.io/hostname
+
+  service:
+    # Use LoadBalancer to expose the web interface externally
+    type: NodePort
+    port: 80
+    nodePort: 8999
+    name: ragflow
+  admin:
+    # Enable Admin Service
+    enabled: true
+    # Admin Service port configuration
+    port: 9381
+    # Admin Service type
+    serviceType: ClusterIP
+  api:
+    service:
+      enabled: true
+      type: ClusterIP
+
+  # --- Issue #4 hotfix: patch code Python trong image --------------------------
+  # Ap dung qua initContainer (KHONG dung postStart): Kubernetes dam bao
+  # initContainer chay xong (exit 0) TRUOC khi container chinh start, nen file
+  # da duoc patch chac chan co tren dia truoc khi Python import chung.
+  # postStart chay SONG SONG voi ENTRYPOINT, khong dam bao thu tu.
+  #
+  # Moi patch chay: sed -i '<expr>' <file>, roi (neu co 'verify') grep kiem tra.
+  # 'verify' RAT QUAN TRONG: sed khong khop van tra exit 0 => patch truot am tham,
+  # pod van Running voi code CHUA duoc patch. Co verify thi pod se Init:Error.
+  codePatch:
+    enabled: true
+    patches:
+      # LUU Y: code v0.26 DA CO SAN minimum_should_match (rag/nlp/query.py dong
+      # 92/165/229). Patch nay co the da thua - can verify lai sau khi deploy:
+      #   kubectl -n <ns> exec <pod> -c ragflow -- grep -n minimum_should_match /ragflow/rag/nlp/query.py
+      - file: rag/nlp/query.py
+        expr: 's/{"original_query": original_query}/{"minimum_should_match": min_match, "original_query": original_query}/'
+        verify: 'minimum_should_match'
+
+      # --- Issue U1 hotfix (10/08/2026): get_root_folder() full-scan bang `file` ---
+      # Xem chi tiet + so lieu do thuc te: TRACKING-upload-document-25s.md
+      #
+      # VAN DE: get_root_folder() tim thu muc goc bang `parent_id == id` - so 2 COT
+      # cua CUNG 1 DONG. MySQL khong dung duoc index cho kieu so sanh nay, buoc phai
+      # quet sach bang `file` (631.585 dong) => 18 giay MOI LAN CHAY.
+      # Ham nay chay 2 lan cho MOI file upload (upload_document goi 1 lan,
+      # get_kb_folder goi lai 1 lan nua) => ~36s chi rieng phan tim thu muc goc.
+      # Slow log: 783.945 lan chay, tich luy 838 gio 59 phut - nguon tai lon nhat he thong.
+      #
+      # CACH SUA: doi sang tim bang `name == "/"` - so cot voi HANG SO, dung duoc index.
+      # Da do thuc te tren production node06 (10/08, muc 3.5 file TRACKING):
+      #   parent_id = id  -> 18.02 giay
+      #   name = '/'      ->  0.00 giay   (nhanh hon >1000 lan)
+      #
+      # DA KIEM CHUNG TRUOC KHI AP DUNG:
+      #   1. `name = '/'` tra ve DUNG 1 dong (COUNT(*) = 1) - khong co ban ghi trung,
+      #      nen ket qua TUONG DUONG voi ban goc. Da chay tren production.
+      #   2. Chuoi can thay xuat hien DUNG 1 lan trong file => sed khong sua nham cho khac.
+      #   3. Chuoi verify `cls.model.name == "/"` CHUA ton tai trong file goc (grep = 0)
+      #      => neu sed truot, grep se fail that su. Neu chon chuoi da co san thi
+      #      verify luon pass va tro thanh vo dung.
+      #   4. Da chay `python3 -m ast` tren ban da patch => cu phap Python hop le.
+      #
+      # LUU Y: dung dau phan cach `|` thay vi `/` vi chuoi thay the co chua "/".
+      # Ban chat khong doi: van la "tim thu muc goc cua tenant", chi doi cach nhan dien.
+      - file: api/db/services/file_service.py
+        expr: 's|(cls.model.parent_id == cls.model.id)|(cls.model.name == "/")|'
+        verify: 'cls.model.name == "/"'
+
+      # Code that la timeout="600s" (co nhay kep + chu 's'), KHONG phai timeout=600.
+      # Pattern cu 's/timeout=600/timeout=30/g' KHONG BAO GIO KHOP - da verify tren
+      # pod that ngay 2026-07-29.
+      # CANH BAO: query tren KB 141k doc hien mat ~13s. Dat timeout qua thap se
+      # cat ca query hop le. Dang de 600s (khong doi) - bo comment neu muon giam.
+      # - file: rag/utils/es_conn.py
+      #   expr: 's/timeout="600s"/timeout="120s"/g'
+      #   verify: 'timeout="120s"'
+
+infinity:
+  image:
+    repository: infiniflow/infinity
+    tag: v0.7.0
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+  storage:
+    className:
+    capacity: 5Gi
+  deployment:
+    strategy:
+    resources:
+  service:
+    type: ClusterIP
+
+elasticsearch:
+  # false = KHONG tao StatefulSet ES trong cluster.
+  # He thong dang dung ES NGOAI (10.211.145.107:8051), cau hinh qua
+  # ragflow.service_conf.es o tren. Neu de true, chart se tao pod ES noi bo
+  # khong ai dung - tren prod no da nam Pending 65 ngay.
+  enabled: false
+  image:
+    repository: elasticsearch
+    tag: "8.11.3"
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+  initContainers:
+    alpine:
+      repository: alpine
+      tag: latest
+      pullPolicy: IfNotPresent
+    busybox:
+      repository: busybox
+      tag: latest
+      pullPolicy: IfNotPresent
+  storage:
+    className:
+    capacity: 20Gi
+  deployment:
+    strategy:
+    resources:
+      requests:
+        cpu: "4"
+        memory: "16Gi"
+  service:
+    type: ClusterIP
+
+opensearch:
+  image:
+    repository: opensearchproject/opensearch
+    tag: 2.19.1
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+  initContainers:
+    alpine:
+      repository: alpine
+      tag: latest
+      pullPolicy: IfNotPresent
+    busybox:
+      repository: busybox
+      tag: latest
+      pullPolicy: IfNotPresent
+  storage:
+    className:
+    capacity: 20Gi
+  deployment:
+    strategy:
+    resources:
+      requests:
+        cpu: "4"
+        memory: "16Gi"
+  service:
+    type: ClusterIP
+
+minio:
+  enabled: true
+  image:
+    # Giu image DA CO SAN tren node (cluster air-gapped, khong pull duoc tu
+    # internet). Chart v0.26.4 upstream doi sang pgsty/minio:RELEASE.2026-03-25
+    # nhung node chi cache docker.io/minio/minio:RELEASE.2025-06-13T11-33-47Z
+    # => dung tag upstream se ImagePullBackOff.
+    repository: minio/minio
+    tag: RELEASE.2025-06-13T11-33-47Z
+    pullPolicy: IfNotPresent
+    # Upstream v0.26.4 goc:
+    # repository: pgsty/minio
+    # tag: RELEASE.2026-03-25T00-00-00Z
+    pullSecrets: []
+  storage:
+    # PHAI khop PVC dang chay tren prod - storageClassName cua PVC la IMMUTABLE,
+    # doi gia tri se lam helm upgrade fail: "spec is immutable after creation".
+    className: local-minio
+    capacity: 5Gi
+  deployment:
+    strategy:
+    resources:
+    # Chay tren node co label ragflow-target=true
+    nodeSelector:
+      ragflow-target: "true"
+    affinity: {}
+  service:
+    type: ClusterIP
+
+mysql:
+  enabled: true
+  image:
+    repository: mysql
+    tag: 8.0.39
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+  storage:
+    # PHAI khop PVC dang chay tren prod (xem ghi chu o minio.storage.className)
+    className: local-mysql
+    capacity: 5Gi
+  deployment:
+    strategy:
+    resources:
+    # Da migrate sang node06 (07/08/2026) - xem PLAN-mysql-migrate-node06.md
+    # Chay tren node co label ragflow-mysql-target=true (rieng cho mysql, khac ragflow-target dung chung voi minio/redis)
+    nodeSelector:
+      ragflow-mysql-target: "true"
+    affinity: {}
+  service:
+    type: ClusterIP
+
+redis:
+  enabled: true
+  image:
+    repository: valkey/valkey
+    tag: 8
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+  storage:
+    # PHAI khop PVC dang chay tren prod (xem ghi chu o minio.storage.className)
+    className: local-redis
+    capacity: 5Gi
+  persistence:
+    enabled: true
+    # Set's the retention policy for the persistent storage (only available in k8s 1.32 or later)
+    # https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#persistentvolumeclaim-retention
+    # retentionPolicy:
+      # whenDeleted: Delete
+      # whenScaled: Delete
+  deployment:
+    strategy:
+    resources:
+    # Chay tren node co label ragflow-target=true
+    nodeSelector:
+      ragflow-target: "true"
+    affinity: {}
+  service:
+    type: ClusterIP
+
+
+# This block is for setting up web service ingress. For more information, see:
+# https://kubernetes.io/docs/concepts/services-networking/ingress/
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local

@@ -176,3 +176,57 @@ minimum_should_match theo request hiện tại.
 nên test A/B trên vài câu hỏi thực tế trước khi rollout toàn bộ.
 
 ### Trạng thái: ROOT CAUSE ĐÃ CHỐT (code + số liệu khớp). Fix ĐỀ XUẤT xong, CHƯA viết patch cuối / CHƯA deploy.
+
+---
+
+## 10. PATCH ĐÃ DEPLOY (2026-07-24) — KHÔNG FIX ĐƯỢC, MỤC 8 SAI Ở KẾT LUẬN CUỐI
+
+### Đã làm:
+- Deploy patch mục 9 (F1) thật qua initContainer (thay postStart để tránh race điều kiện khởi động,
+  xem nhánh worktree-fix-query-patch-initcontainer) — **XÁC NHẬN patch đã vào code chạy thật**:
+  `grep minimum_should_match /ragflow/rag/nlp/query.py` trong pod → thấy dòng 85 đã có
+  `"minimum_should_match": min_match`.
+- Log ES thật xác nhận query gửi lên có `"minimum_should_match": "30%"` đúng vị trí (bên trong
+  `query_string`, không phải sai chỗ).
+- **Latency KHÔNG đổi: `_search` vẫn ~13s (UI), ES `_search` trực tiếp vẫn ~3.2-3.3s.**
+
+### Đo kiểm chứng ES có ăn config không (để loại trừ nghi ngờ "config bị bỏ qua"):
+Test trực tiếp lên ES với `track_total_hits: true, size: 0` (đếm CHÍNH XÁC, không bị chặn ở ngưỡng
+10000 mặc định), quét `minimum_should_match` từ 0% → 100% trên CÙNG query thật đã bắt:
+```
+minimum_should_match=0%   -> total_hits_EXACT = 141,340 / 141,340 (100.0%)
+minimum_should_match=30%  -> total_hits_EXACT = 141,340 / 141,340 (100.0%)
+minimum_should_match=70%  -> total_hits_EXACT = 141,331 / 141,340 (~100.0%)
+minimum_should_match=100% -> total_hits_EXACT = 140,469 / 141,340 (99.4%)
+```
+**KẾT LUẬN: ES CÓ ăn `minimum_should_match` đúng cấu hình** (không phải bug config bị bỏ qua/sai vị trí —
+đã loại nghi ngờ này bằng đo trực tiếp). NHƯNG dù ép `minimum_should_match=100%` (bắt buộc khớp CẢ 4
+mệnh đề OR cấp cao nhất), match set gần như không giảm — vẫn 99.4% toàn bộ corpus.
+
+### ROOT CAUSE THẬT (đính chính mục 8): không phải "thiếu minimum_should_match"
+Dump cấu trúc `query.bool.must[0].query_string.query` thật (câu hỏi "quy định về thời hạn thanh toán và
+nghiệm thu hợp đồng xây dựng") cho thấy rag_tokenizer chỉ tách câu thành **4 mệnh đề OR cấp cao nhất**,
+và một số mệnh đề trong đó chứa **hư từ / mảnh ký tự vô nghĩa đứng thành clause riêng**, ví dụ:
+`(v à)^1.0`, `("v ệ")^1.0` — "và" là 1 trong những từ phổ biến nhất tiếng Việt, tự nó khớp gần như mọi
+document trong kho. Vì minimum_should_match chỉ giới hạn SỐ LƯỢNG mệnh đề cần khớp (không sửa được nội
+dung BÊN TRONG từng mệnh đề), nếu 1 mệnh đề đã tự thân match ~100% corpus, siết % không giúp gì — ép
+khớp 4/4 mệnh đề vẫn kéo theo mệnh đề "rác" đó, match set không thu hẹp.
+
+⟹ Bug thật nằm ở tầng **tokenize/query-build** (rag/nlp/query.py hoặc rag_tokenizer) sinh ra clause OR
+chứa hư từ với boost ngang từ khóa thật, KHÔNG phải ở việc thiếu tham số minimum_should_match.
+`minimum_should_match` (mục 8-9) là NGHI PHẠM ĐÃ LOẠI, không phải root cause.
+
+### Hướng tiếp theo (CHƯA làm):
+1. Đọc lại `FulltextQueryer.question()` phần build query_string (rag/nlp/query.py, cả 2 nhánh Chinese
+   và non-Chinese) — tìm nơi các mệnh đề OR cấp cao nhất được ghép, xem có filter stopword/hư từ tiếng
+   Việt trước khi đưa vào query không (nghi ngờ: KHÔNG có, vì "và" lọt qua).
+2. Xem `rag_tokenizer.py` / danh sách stopword đang dùng có bao phủ hư từ tiếng Việt phổ biến
+   ("và", "về", "của", "là", "có"...) không — nếu thiếu, đây là nguồn gây match rộng thật sự.
+3. Cân nhắc: thêm bước lọc stopword tiếng Việt TRƯỚC khi build query_string, hoặc hạ boost các mệnh đề
+   chứa hư từ, thay vì chỉ chỉnh minimum_should_match.
+4. Patch minimum_should_match=30% đã deploy: giữ lại hay rollback? Vô hại (không gây regression, ES vẫn
+   ăn đúng) nhưng KHÔNG giải quyết được vấn đề chính — cân nhắc giữ tạm vì không risk, chờ fix gốc ở
+   bước 1-3.
+
+### Trạng thái: Mục 8 (root cause "thiếu minimum_should_match") ĐÃ BỊ BÁC BỎ bằng đo. Cần điều tra lại
+tầng tokenize/query-build. Fix minimum_should_match đã deploy nhưng KHÔNG giải quyết vấn đề chính.
