@@ -905,3 +905,218 @@ vài phút: **1.806s → 25.921s (14×)**. Đã thử: tải đồng thời · k
 **RAGFlow không instrument tầng retrieval** — không có field duration ở access log, `logging.debug`
 có sẵn nhưng bật không lên bằng env thông dụng. Đây là lý do gốc khiến **5 phiên debug** phải đo
 tách tầng thủ công từ ngoài và vẫn không kết luận được.
+
+---
+
+# 7. PHIÊN 2026-08-18 (chiều) — PHÂN RÃ 1 REQUEST & LOẠI TRỪ `_search`
+
+## 7.1 Cách đo mới (đột phá về phương pháp)
+
+Trước đây đo từ ngoài (curl tổng thời gian) nên không tách được tầng. Phiên này dùng
+**log sẵn có của `elasticsearch-py`** — thư viện tự in `[status:200 duration:X.XXXs]` cho
+**mọi** lời gọi HTTP tới ES, ở mức INFO (không cần bật DEBUG, không cần build lại image).
+
+```bash
+kubectl -n ragflow logs -l app.kubernetes.io/component=ragflow -c ragflow -f --tail=0 --max-log-requests=6 \
+  | grep -Ei "_search|took|ESConn"
+```
+
+⟹ Lần đầu tiên tách được **thời gian ES** ra khỏi **thời gian tổng**.
+
+## 7.2 Phân rã 1 request (3 mẫu đầu)
+
+| Mẫu | TỔNG | `_search`#1 | `_search`#2 | Ngoài ES | % ngoài ES |
+|---|---|---|---|---|---|
+| A | 9.199s | 5.341 | 0.230 | 3.628s | 39% |
+| B | 5.674s | 4.068 | 0.227 | 1.379s | 24% |
+| C | 7.618s | 1.648 | 0.234 | 5.736s | **75%** |
+
+⚠️ Mẫu A+B suýt dẫn tới kết luận sai "`_search` là thủ phạm". Mẫu C phủ định.
+**Bài học: 2 mẫu không đủ khi CẢ HAI tầng đều dao động.**
+
+## 7.3 🔴 Đ11 — 10 mẫu ghép cặp: `_search` BỊ LOẠI
+
+```bash
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w "$i TONG=%{time_total}\n" -X POST "$URL" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY"
+done
+```
+Song song, terminal 2 bắt `duration:` của từng `_search`.
+
+| # | TỔNG | `_search`#1 | `_search`#2 | ES tổng | **Ngoài ES** | % ngoài |
+|---|---|---|---|---|---|---|
+| 1 | 7.718 | 3.402 | 0.289 | 3.691 | 4.027 | 52% |
+| 2 | 6.824 | 3.814 | 0.254 | 4.068 | 2.756 | 40% |
+| 3 | 5.487 | 3.628 | 0.212 | 3.840 | 1.647 | 30% |
+| 4 | 11.894 | 1.025 | 0.245 | 1.270 | **10.624** | **89%** |
+| 5 | 8.017 | 5.849 | 0.236 | 6.085 | 1.932 | 24% |
+| 6 | 3.328 | 1.172 | 0.256 | 1.428 | 1.900 | 57% |
+| 7 | **22.290** | 1.373 | 0.266 | 1.639 | **20.651** | **93%** |
+| 8 | 9.052 | 0.754 | 0.235 | 0.989 | **8.063** | **89%** |
+| 9 | 11.239 | 2.035 | 0.245 | 2.280 | 8.959 | 80% |
+| 10 | 14.007 | 2.415 | 0.302 | 2.717 | 11.290 | 81% |
+
+**KẾT LUẬN — `_search` KHÔNG phải thủ phạm:**
+- Request **chậm nhất** (22.290s) có `_search` chỉ **1.373s** ⟹ 93% thời gian ở ngoài ES
+- Request **nhanh nhất** (3.328s) có `_search` **1.172s** ⟹ gần bằng nhau
+- **Nghịch tương quan**: TỔNG càng lớn thì tỉ lệ ngoài-ES càng lớn (24% → 93%)
+- Tầng "ngoài ES" dao động **1.6s → 20.7s (12.5×)** — đúng bằng biên độ triệu chứng gốc
+
+## 7.4 Hạ tầng ES — sạch toàn bộ
+
+| Nghi ngờ | Cách đo | Kết quả |
+|---|---|---|
+| Hàng đợi search ES | `_cat/thread_pool` 11 node | `0 0 0` toàn bộ, mọi vòng |
+| CPU ES quá tải | `_nodes/hot_threads` | idle |
+| Mạng RAGFlow→ES | trong pod, `match_all` ×5 | **31–33ms**, rất ổn định |
+| ES chạy query chậm | `match_all` trên 1.84M docs | `took=6ms` |
+
+## 7.5 Đ12 — A/B rerank BẬT/TẮT xen kẽ: RERANK BỊ LOẠI
+
+```bash
+BODY_ON='{"question":"...","dataset_ids":["73932b..."],"similarity_threshold":0.3,"vector_similarity_weight":0.6}'
+BODY_OFF='{"question":"...","dataset_ids":["73932b..."],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"rerank_id":"","top_k":1024}'
+for i in $(seq 1 6); do
+  curl -s -o /dev/null -w "$i ON  http=%{http_code} t=%{time_total}\n" -X POST "$URL" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY_ON"
+  curl -s -o /dev/null -w "$i OFF http=%{http_code} t=%{time_total}\n" -X POST "$URL" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY_OFF"
+done
+```
+
+| Cặp | ON | OFF |
+|---|---|---|
+| 1 | 4.450 | 7.113 |
+| 2 | 14.252 | 10.782 |
+| 3 | 13.429 | 15.877 |
+| 4 | 10.244 | 2.914 |
+| 5 | 3.591 | 4.643 |
+| 6 | 14.203 | 19.273 |
+
+http=200 cả 12 lượt. **OFF thắng 3/6, thua 3/6.** Biên độ TRONG một nhóm (ON: 3.6→14.3 = 4×)
+lớn hơn chênh lệch GIỮA hai nhóm ⟹ **rerank vô can**.
+
+## 7.6 Đ13 — CPU & CFS throttling: BỊ LOẠI
+
+```bash
+kubectl -n ragflow get pods -l app.kubernetes.io/component=ragflow \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .spec.containers[*]}  {.name} req={.resources.requests.cpu} lim={.resources.limits.cpu}{"\n"}{end}{end}'
+kubectl -n ragflow exec "$POD" -c ragflow -- sh -c 'cat /sys/fs/cgroup/cpu.stat || cat /sys/fs/cgroup/cpu/cpu.stat'
+kubectl -n ragflow exec "$POD" -c ragflow -- sh -c 'nproc; cat /proc/loadavg; ps -eo pid,pcpu,rss,comm --sort=-pcpu | head -12'
+```
+
+```
+req=  lim=            ← KHÔNG đặt CPU limit/request trên cả 3 pod
+nr_periods 0
+nr_throttled 0        ← không throttle (đúng vì không có limit)
+throttled_time 0
+
+nproc = 8
+loadavg = 0.85 / 0.70 / 0.67      ← ~11% của 8 core
+PID 42 = 15.5% CPU, RSS 1.89GB    (task executor ingest)
+PID 39 = 14.8% CPU, RSS 2.16GB    (task executor ingest)
+PID 40 =  1.2% CPU
+PID 25 =  0.7% CPU, RSS 858MB     (server API)
+```
+
+**⭐ DỮ KIỆN QUAN TRỌNG NHẤT PHIÊN NÀY:**
+Request mất **10–22 giây** trong khi **CPU chỉ 11%** và **không hề bị throttle**.
+⟹ Không có gì được TÍNH TOÁN trong 20 giây đó. Tiến trình đang **CHỜ (I/O wait)**.
+
+## 7.7 ⚠️ Sai lầm của phiên: quay lại đo thứ đã loại
+
+Sau khi loại ES + rerank + CPU, tôi đề xuất đo lại **embedding/LiteLLM gateway** —
+**Kiên chặn lại và yêu cầu đọc lại file.** File đã ghi rõ ở **3.15**:
+
+> Đo trực tiếp LiteLLM `10.208.137.53:8992` **đúng lúc ingest chạy**: **~150ms**,
+> min 0.116 max 0.238; 5 request song song về cùng lúc ⟹ **không có hàng đợi FIFO**.
+> "**không có contention ở embedding service. Toàn bộ Root cause A sụp đổ.**"
+
+Endpoint LiteLLM cũng đã có sẵn ở **3.14 dòng 1040–1041** (`http://10.208.137.53:8992/`) —
+tôi còn đi tìm lại thứ đã biết, tốn 3 lượt.
+
+**Bài học 0e (nối tiếp Bài học 0d): TRƯỚC KHI đề xuất đo bất cứ tầng nào, phải `grep`
+file tracking xem tầng đó đã bị loại chưa.** Logic loại trừ khép kín khiến ta bị cám dỗ
+quay lại nghi phạm cũ khi hết ý tưởng — đó là dấu hiệu phải đổi PHƯƠNG PHÁP, không phải
+đổi nghi phạm.
+
+## 7.8 Bảng tổng hợp TOÀN BỘ tầng đã loại (23 phiên + phiên này)
+
+| # | Tầng / Giả thuyết | Đo bằng | Số đo | Trạng thái |
+|---|---|---|---|---|
+| 1 | Mạng client → RAGFlow | curl | 6ms | ❌ loại |
+| 2 | Payload response lớn | đếm bytes | 270KB, 30 chunk | ❌ loại |
+| 3 | ES thực thi query | `_nodes/stats` | <1ms | ❌ loại |
+| 4 | ES hàng đợi search | `_cat/thread_pool` | `0 0 0` ×11 node | ❌ loại |
+| 5 | ES hot threads | `_nodes/hot_threads` | idle | ❌ loại |
+| 6 | Mạng RAGFlow → ES | trong pod | 31–33ms | ❌ loại |
+| 7 | **`_search` wall-clock** | **log `elasticsearch-py`** | **10 mẫu ghép cặp** | ❌ **loại (7.3)** |
+| 8 | Embedding service (LiteLLM) | curl trực tiếp lúc ingest chạy | 150ms, biên độ 2× | ❌ loại (3.15) |
+| 9 | `EMBEDDING_BATCH_SIZE=16` | song song 5 request | về cùng lúc | ❌ loại (3.15) |
+| 10 | **Rerank** | **A/B xen kẽ 6 cặp** | **3/6–3/6** | ❌ **loại (7.5)** |
+| 11 | LLM sinh câu trả lời | tách đo | 1.25s | ❌ loại |
+| 12 | CPU pod | `ps`, `loadavg` | 11% / 8 core | ❌ loại |
+| 13 | **CFS throttling** | **`cpu.stat`** | **`nr_throttled 0`** | ❌ **loại (7.6)** |
+| 14 | GIL contention 128 thread | Đ2 song song | parallelism 5.78× | ❌ loại |
+| 15 | Event loop bị block | Đ2 | cần 65s, thực 11.25s | ❌ loại |
+| 16 | Thread pool quá nhỏ | env + Đ2 | mặc định 128 | ❌ loại |
+| 17 | Tích lũy theo uptime | Đ2 | pod 13 phút vẫn 23.8s | ❌ loại |
+| 18 | Kết nối nguội khi rảnh | Đ9 | gap=30s → 1.806s (nhanh nhất) | ❌ loại |
+| 19 | Connection leak CLOSE_WAIT | Đ9, 3.20 | 269→340 đơn điệu, latency loạn | ❌ loại (2 lần) |
+| 20 | TLS handshake mỗi lời gọi | log INFO | mọi call ES 3–17ms | ❌ loại |
+| 21 | `refresh_interval` | Đ10 | **tệ hơn + gây sự cố** | ❌ loại |
+| 22 | `topk` 1024 vs 256 | A/B | 4–4 | ❌ loại |
+| 23 | `metadata_condition` | A/B | bỏ đi còn CHẬM HƠN | ❌ loại |
+| 24 | fd cạn | `ulimit` | 1,048,576 | ❌ loại |
+
+## 7.9 🔴 VỊ TRÍ HIỆN TẠI — nghịch lý đã thu hẹp tối đa
+
+```
+TỔNG request          = 3.3s → 22.3s   (biên độ 6.7×, cùng query, cùng cấu hình)
+  ├─ ES `_search`     = 0.75s → 5.85s  ❌ đã loại (không tương quan với TỔNG)
+  ├─ embedding        = 0.15s          ❌ đã loại
+  ├─ rerank           = ?              ❌ đã loại (A/B)
+  ├─ mạng             = 0.006s         ❌ đã loại
+  └─ ❓ CÒN LẠI       = 1.6s → 20.7s   🔴 KHÔNG THUỘC TẦNG NÀO ĐÃ BIẾT
+                                          và CPU chỉ 11% ⟹ đang CHỜ cái gì đó
+```
+
+**Đặc điểm của phần chưa xác định:**
+1. Chiếm **24% → 93%** tổng thời gian, tỉ lệ càng cao khi request càng chậm
+2. **Không tiêu CPU** (11% trên 8 core, không throttle) ⟹ là **I/O wait hoặc lock**
+3. **Không xuất hiện trong bất kỳ log nào** — không phải lời gọi HTTP ra ngoài
+   (mọi lời gọi HTTP đều được `urllib3`/`elasticsearch-py` log lại và đều nhanh)
+4. Dao động không theo quy luật thời gian, tải, hay khoảng nghỉ
+
+**Điểm 3 rất đáng chú ý:** nếu tiến trình chờ mạng thì phải có dòng log tương ứng.
+Không có ⟹ nhiều khả năng đang chờ **thứ không đi qua HTTP**: khoá trong process
+(`threading.Lock`), kết nối DB (PostgreSQL/Redis, dùng driver khác không log),
+hoặc MinIO.
+
+## 7.10 ⛔ Bế tắc của phương pháp đo-từ-ngoài
+
+Đã thử `py-spy dump` để chụp stack trace Python lúc đang chậm — **`pip install py-spy`
+thất bại** (môi trường air-gapped, `py-spy: not found`).
+
+```
+sh: 1: py-spy: not found
+```
+
+⟹ **Không thể profile tiến trình từ ngoài.** Mọi tầng đo được từ ngoài đều đã đo và đều sạch.
+
+### Ba đường đi tiếp (theo thứ tự ưu tiên)
+
+| # | Cách | Cần gì | Khả năng kết thúc issue |
+|---|---|---|---|
+| **1** | **Chèn timing vào `rag/nlp/search.py`** (bàn giao anh Cường) | build lại image | 🟢 **Cao nhất** — thấy thẳng đoạn nào nuốt thời gian |
+| **2** | Đưa `py-spy` (hoặc `austin`) vào image, hoặc mount binary offline | 1 file binary | 🟢 Cao — không cần sửa code |
+| **3** | Bật `faulthandler` + gửi `SIGABRT` để dump stack mọi thread | env `PYTHONFAULTHANDLER=1` + restart | 🟡 Trung bình — dump 1 lần, phải trúng lúc chậm |
+
+### Nghi phạm còn lại chưa đo (cho việc chèn timing nhắm vào)
+
+| Nghi phạm | Vì sao đáng nghi | Đo thế nào |
+|---|---|---|
+| **Khoá/`Lock` trong process** | Không tiêu CPU, không có log, dao động mạnh — đúng đặc trưng | stack trace thấy `acquire()` |
+| **PostgreSQL / Peewee** | Retrieval có truy vấn metadata KB/tenant; driver **không log duration** | timing quanh lời gọi DB |
+| **Redis** | Dùng cho cache + task queue, ingest đang bơm nặng | timing quanh lời gọi Redis |
+| **MinIO** | Log ingest cho thấy `MINIO PUT ... cost 0.168s` — retrieval có đọc không? | timing quanh lời gọi MinIO |
+| **`asyncio` ↔ thread pool** | `thread_pool_exec` chuyển đổi context; Đ2 đo parallelism tốt nhưng chưa đo **thời gian chờ được xếp lịch** | timing trước/sau `run_in_executor` |
