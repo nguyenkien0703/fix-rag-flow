@@ -59,8 +59,8 @@ query, lúc trả về **~2s**, lúc **>20s**.
 |---|---|---|---|---|
 | 1 | Query tiếng Việt build ra clause OR chứa hư từ (thiếu stopword) → match rộng ES | Cao | ⚠️ **WORKAROUND KHÔNG ĐỦ** — xem 3.2, workaround v0.26 giảm nhẹ nhưng KHÔNG giữ ổn định ở scale 1.9M (30 mẫu: min 1.98s, max 28.2s, chỉ 37% dưới 5s) | Đã custom image v0.26 (anh Cường). Cần đo tiếp xem còn dư địa cải thiện ở tầng tokenizer/query hay đã hết, chuyển hướng sang Issue 3 |
 | 2 | Patch cũ `minimum_should_match` (initContainer, từ Issue #4) có thể THỪA/conflict với code v0.26 upstream đã có sẵn tham số này | Trung bình | ✅ **LOẠI TRỪ** — xem lệnh 3.1, code trong pod khớp đúng gốc v0.26, không bị đè | — |
-| 3 | Latency tại scale MỚI (1.9M doc) dao động mạnh 1.98s-28.2s (30 mẫu thật, 3.2) — nghi bottleneck ở ES do scale (index/shard/HNSW/GC) | Cao | ✅ **LOẠI TRỪ (3.7/3.8)** — ES stats thật: query trung bình **<1ms** trên node chính, tệ nhất 4.4ms. Delta 1 request retrieval = ~287 query / ~1.74s ES trong tổng 3.6s. ES **không** phải bottleneck | Đóng hướng ES. Chuyển toàn bộ sang tầng Python (Issue 5/6/7) |
-| 4 | Retrieval tranh tài nguyên với luồng **ingest liên tục** từ bên đẩy tài liệu (Kiên nêu) | Cao | ✅ **XÁC NHẬN (3.6)** — nhưng contention KHÔNG ở ES/worker API mà ở **CPU pod + embedding service**. Log: `task_executor` (PID 445) xử lý ≥8 doc/23s liên tục, `Embedding chunks (0.59s→1.43s)` nối nhau, cùng KB đang test, cùng pod với `ragflow_server` (PID 48) | Fix 1: tách `task_executor` ra deployment riêng |
+| 3 | Latency tại scale MỚI (1.9M doc) dao động mạnh 1.98s-28.2s (30 mẫu thật, 3.2) — nghi bottleneck ở ES do scale (index/shard/HNSW/GC) | Cao | ✅ **LOẠI TRỪ (3.7/3.8)** — ES stats thật: query trung bình **<1ms** trên node chính, tệ nhất 4.4ms. Delta 1 request retrieval = ~287 query / ~1.74s ES trong tổng 3.6s. ES **không** phải bottleneck | Đóng hướng ES vĩnh viễn. (⚠️ Issue 5/6/7 nêu lúc đó ĐỀU đã bị phủ định sau này — xem dòng dưới) |
+| 4 | Retrieval tranh tài nguyên với luồng **ingest liên tục** từ bên đẩy tài liệu (Kiên nêu) | Cao | 🔶 **OPEN — CƠ CHẾ CHƯA XÁC ĐỊNH.** ⚠️ *Trước đây file này ghi ✅ XÁC NHẬN với cơ chế "CPU pod + embedding service" — **SAI, đã sửa**: CPU chỉ 10–20% (3.13) và embedding 150ms (3.15), cả hai bị phủ định.* **Điều CHẮC CHẮN:** ingest chạy liên tục, cùng pod, cùng KB, tỷ lệ traffic 320:9 (3.4/3.6). **Điều CHƯA BIẾT:** tranh **tài nguyên NÀO** | Nghi phạm hiện tại: hàng đợi trong process (`thread_pool_exec`). ❓ Chưa verify. **Phép thử rẻ nhất chưa làm: đo 10 mẫu khi ingest NGHỈ** |
 | 5 | 🔴 **ROOT CAUSE A — Embedding query bị xếp hàng sau ingest.** Mỗi retrieval gọi `emb_mdl.encode_queries` (`search.py:56`) / `get_vector` (`:199`) tới `qwen3-8b-embedding` qua API ngoài | Cao | 🔴 **CHỐT (3.6 + source)** — cùng embedding service đang bị ingest bơm liên tục 0.59-1.43s/batch → retrieval phải đợi. Giải thích trực tiếp dao động 2s↔28s | Fix 1 + Fix 3 (tách/scale embedding endpoint) |
 | 6 | ~~ROOT CAUSE B — `topk=1024`~~ | — | ❌ **PHỦ ĐỊNH (3.11/3.12)** — A/B xen kẽ 8 cặp: `topk=256` KHÔNG nhanh hơn (mean 13.9 vs 15.8s, thắng/thua 4–4; `topk=1024` cho 2 lần nhanh nhất 2.15s/2.96s). Kết quả trả về y hệt (cùng 10 chunk, cùng thứ tự) | Đóng hướng. Không cần sửa `topk` |
 | 7 | ~~ROOT CAUSE C — re-tokenize/rerank CPU-bound~~ | — | ❌ **PHỦ ĐỊNH (3.13)** — **CPU pod chỉ 10–20%** (Kiên quan sát trực tiếp). Nếu tokenize/rerank 1024 candidate thì CPU phải cao. Khớp với 3.11/3.12 | Đóng hướng. `pyvi` không phải vấn đề hiệu năng |
@@ -1922,6 +1922,83 @@ median mà biên độ vẫn 14× thì **chưa fix xong**.
 
 ---
 
+## 4.6 📋 BÀN GIAO — trạng thái phiên 2026-08-18 (đọc mục này nếu tiếp nhận issue)
+
+### Trạng thái một dòng
+
+🔶 **OPEN — CHƯA TÌM RA ROOT CAUSE.** Đã loại trừ **9 giả thuyết** bằng số đo trực tiếp.
+Không có fix nào sẵn sàng deploy. Nghi phạm hiện tại (chưa verify): **hàng đợi trong process**.
+
+### Tiến triển đã đạt — biết thêm gì so với lúc bắt đầu phiên
+
+**Lúc bắt đầu:** "cùng query lúc 2s lúc 20s", nghi ES/tokenizer (theo 3 phiên trước).
+
+**Bây giờ đã CHẮC CHẮN (mỗi cái có số đo trực tiếp):**
+
+| Điều đã biết chắc | Số đo | Lệnh |
+|---|---|---|
+| **100% thời gian nằm TRONG server** | `connect`=1ms, `total − start_transfer`=6ms, cả 25 mẫu | 3.7, 3.21 |
+| **ES không phải bottleneck** | <1ms/query, 1.7s trong 3.6s | 3.6, 3.8 |
+| **Không CPU-bound** | CPU pod 10–20% | 3.13 |
+| **Embedding vô can** | 150ms, biên độ 2×, đo lúc ingest chạy | 3.15 |
+| **LLM vô can** | 1.25s, biên độ 1.02× | 3.17 |
+| **Không cạn file descriptor** | `ulimit -n`=1,048,576, fd PID 48 = 45 | 3.19 |
+| **Phân bố LIÊN TỤC 2.07→48.41s** (không lưỡng cực) | 25 mẫu | 3.21 |
+| **Latency xấu dần theo phiên** | max 28.2 → 33.2 → **48.4s** | 3.2, 3.20, 3.21 |
+| **Có connection leak thật** | 227 CLOSE_WAIT tới LiteLLM gateway | 3.19 |
+| **Leak KHÔNG gây chậm** | cw tăng đơn điệu 296→322, latency nhảy loạn; run=9 = 1.97s khi cw=317 | 3.20 |
+
+**⟹ Giá trị lớn nhất của phiên này: thu hẹp không gian nghi phạm từ "toàn bộ hệ thống" xuống
+"một cơ chế xếp hàng bên trong process Python", và ĐÓNG VĨNH VIỄN hướng ES đã đi sai 3 phiên.**
+
+### Rào cản còn lại thuộc loại nào (phân biệt bắt buộc theo skill)
+
+| Rào cản | Loại | Chi tiết |
+|---|---|---|
+| Không profile được trong container | 🔧 **Chưa có công cụ** (không phải chưa biết cách) | `py-spy` không cài được: `pip install` exit 1 (image tối giản, **không có network ra ngoài**), `py-spy: not found` exit 127 (3.18). **Biết cách làm, thiếu phương tiện.** Cách gỡ: thêm py-spy vào image, hoặc `LOG_LEVEL=DEBUG` (code có sẵn `logging.debug` ở `search.py:590/606`) |
+| Chưa đo được khi ingest nghỉ | 🤝 **Cần phối hợp vận hành** (không phải kỹ thuật) | Phải nhờ bên đẩy tài liệu tạm dừng. **Đây là phép thử rẻ nhất và mạnh nhất còn lại** |
+| Phép thử restart chưa hoàn tất | ⚠️ **Lỗi thao tác, làm lại được ngay** | Bấm `^C` khi rollout đang chạy ⟹ đo trên pod cũ (3.20). Làm lại: chờ `rollout status` xong hẳn 3/3, không `^C` |
+| Chưa đọc `thread_pool_exec` | 📖 **Chưa làm, không có rào cản** | Lệnh đã soạn, chỉ cần chạy |
+
+### Đường cụt đã thử — ĐỪNG LẶP LẠI
+
+| # | Giả thuyết | Suy từ đâu | Cái làm lộ ra là SAI |
+|---|---|---|---|
+| 1 | Tokenizer/stopword tiếng Việt làm match rộng ES | phiên trước, đọc source v0.24.0 | ES <1ms/query (3.6) — sai tầng |
+| 2 | `minimum_should_match` thiếu ở nhánh Việt | phiên trước | Code v0.26 đã có sẵn (3.1) + ES không phải bottleneck |
+| 3 | ES chậm do scale 1.9M doc / HNSW / shard | suy từ quy mô KB | ES stats: 0.82–0.87ms/query (3.6) |
+| 4 | ES ngoài cụm ⟹ network hop | kiến trúc hạ tầng | `total − start_transfer` = 6ms (3.7) |
+| 5 | Response payload 2–5MB làm chậm | đọc sai cột log | Response 270KB, `len vector field: 0` (3.7) |
+| 6 | `metadata_condition contains` gây N+1 | suy luận cơ chế | **Bỏ filter đi CHẬM HƠN** 14–19s (3.9) — sai ngược hướng |
+| 7 | `topk=1024` nặng | source `search.py:142` + 287 ES query | A/B xen kẽ 8 cặp: **4–4**, kết quả y hệt (3.11/3.12) |
+| 8 | Rerank/re-tokenize CPU-bound | source `search.py:299/434/461` | **CPU 10–20%** (3.13, Kiên quan sát) |
+| 9 | Embedding xếp hàng sau ingest (`EMBEDDING_BATCH_SIZE=16`) | log ingest + env | Đo trực tiếp: **150ms, song song tốt** (3.15) |
+| 10 | LLM `qwen3-32b` (RAPTOR trong luồng query) | response chứa văn bản LLM sinh | 1.25s, biên độ **1.02×** (3.17) |
+| 11 | Cạn file descriptor | 104 CLOSE_WAIT | `ulimit`=1,048,576, fd=45 (3.19) |
+| 12 | Connection leak gây chậm | 227 CLOSE_WAIT tới gateway | cw đơn điệu, latency nhảy loạn (3.20) |
+| 13 | Phân bố lưỡng cực ⟹ timeout cố định 30s | 10 mẫu có khoảng trống 5–27s | 25 mẫu: vùng đó **đầy** (5.09/6.97/7.56/7.80/11.12/22.03) — **ảo giác cỡ mẫu nhỏ** (3.21) |
+| 14 | Rerank model gọi ra ngoài | `search.py:515` | **Không có `model_type=rerank`** trong DB (3.19) |
+| 15 | Load-balance lệch giữa 3 pod | log 1 pod chỉ có 9/30 request | 30 request chia ra 3 pod ⟹ LB hoạt động (3.4) |
+
+### Bị chặn bởi vận hành / ngoài phạm vi (KHÁC với "chưa fix được")
+
+| Việc | Loại | Ghi chú |
+|---|---|---|
+| Tắt `use_raptor` + `use_graphrag` | **Quyết định nghiệp vụ**, không phải kỹ thuật | Cần anh Cường/nghiệp vụ xác nhận có dùng không. Đáng làm **bất kể root cause** — mỗi doc tốn nhiều lời gọi `qwen3-32b` |
+| Giảm cường độ ingest | **Đàm phán với bên đẩy tài liệu** | Không nằm trong tay DevOps |
+| Sửa code leak (227 CLOSE_WAIT) | **Cần build image** — vượt ràng buộc `pullPolicy: Never` | Bug thật, cần báo anh Cường (người build custom image) |
+| `rollout restart` để test | **Cần cửa sổ bảo trì** (có downtime ngắn) | Phải báo trước bên đang cắm API |
+
+### Nếu tiếp nhận issue này, làm theo thứ tự
+
+1. **Đọc `thread_pool_exec` / `max_workers`** — lệnh đã soạn ở 4.5, nghi phạm số 1, không rủi ro
+2. **Đo 10 mẫu khi ingest NGHỈ** — phép thử một biến rẻ nhất, phân định dứt điểm ingest có liên quan không
+3. **Bật `LOG_LEVEL=DEBUG`** — code có `logging.debug("[Search] ...")` sẵn ở `search.py:590/606`
+4. **Làm lại phép thử restart cho đúng** (chờ 3/3 replicas, không `^C`)
+5. ⚠️ **KHÔNG quay lại 15 hướng ở bảng đường cụt trên** — mỗi cái đã có số đo phủ định
+
+---
+
 ## 5. Bài học
 
 0. ⭐ **BÀI HỌC LỚN NHẤT CỦA PHIÊN — "đọc source thấy vòng lặp nặng" KHÔNG PHẢI bằng chứng về latency.**
@@ -2014,6 +2091,12 @@ median mà biên độ vẫn 14× thì **chưa fix xong**.
 | Chưa biết cột cuối trong access log (1.9M–4.9M) là gì | 3.5, 3.7 | Không ảnh hưởng kết luận (đã có cách đo latency khác), nhưng đừng suy luận gì từ cột này |
 | `use_raptor: true` + `use_graphrag: true` trên KB production 1.9M doc | 3.6 | Mỗi document tốn thêm nhiều lời gọi LLM `qwen3-32b`. Nếu nghiệp vụ không dùng ⟹ đang đốt tài nguyên vô ích |
 | Chỉ đo/đọc log **1 trong 3** pod ragflow | 3.4 điểm 4 | Kết luận dựa trên ~30% traffic. Root cause là cấu trúc (chung pod, chung embedding) nên vẫn đúng cho cả 3, nhưng số liệu định lượng thì chưa đầy đủ |
+
+| 🔴 **Patch `sed 's/timeout=600/timeout=30/g'` (postStart, từ `05-FIX.md` mục 3) ĐÃ TRƯỢT ÂM THẦM** | 3.21 | Code thật là `timeout="600s"` (**có ngoặc kép + chữ `s`**), sed tìm `timeout=600` ⟹ **không match, exit 0, không cảnh báo**. Đây là **lần thứ 2** bài học "sed trượt âm thầm" thành hiện thực. ⟹ Mọi patch sed trong `values.yaml` **phải verify bằng grep sau khi apply**, không tin exit code |
+| 🔴 **Connection leak: 227 CLOSE_WAIT tới LiteLLM gateway + 8 tới MinIO** | 3.19, 3.20 | Bug thật (app không gọi `close()`), tăng theo mỗi request. **KHÔNG gây chậm** (3.20 đã chứng minh) nên không phải root cause, nhưng vẫn là leak cần sửa. Cần **build image** ⟹ báo anh Cường. Rủi ro nếu bỏ: tích tụ vô hạn, có thể gây vấn đề khác về sau |
+| **RAGFlow không instrument tầng retrieval** | 3.5 | Access log **không có field duration**; `logging.debug("[Search] ...")` có sẵn ở `search.py:590/606` nhưng **chưa bật**. ⟹ Đây là nợ GỐC làm mọi lần debug phải đo tách tầng thủ công, tốn cả phiên |
+| **Chỉ đo/đọc log 1 trong 3 pod** (`5kgvd`) | toàn phiên | Kết luận dựa trên ~30% traffic. Root cause là cấu trúc nên vẫn đúng cho cả 3, nhưng số liệu định lượng chưa đầy đủ |
+| **`use_raptor` + `use_graphrag` bật trên KB 1.9M doc** | 3.6 | Mỗi document tốn thêm nhiều lời gọi LLM `qwen3-32b`. Nếu nghiệp vụ không dùng ⟹ đang đốt tài nguyên. **Quyết định nghiệp vụ, không phải kỹ thuật** |
 
 ## 7. Việc tiếp theo
 
