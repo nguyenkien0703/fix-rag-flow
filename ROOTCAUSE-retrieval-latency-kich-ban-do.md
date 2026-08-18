@@ -19,6 +19,52 @@ Rút từ Bài học 0d của file tracking — **đã sai 3 lần cùng một k
 | R4 | **Cỡ mẫu ≥ 20** trước khi kết luận hình dạng phân bố | 10 mẫu từng tạo ảo giác "khoảng trống 5–27s" (3.20 → bị 3.21 phủ định) |
 | R5 | **Patch `sed` phải verify bằng `grep` sau khi apply**, không tin exit code | `sed 's/timeout=600/timeout=30/'` đã trượt âm thầm 2 lần |
 | R6 | Mọi phép đo ghi kèm **thời điểm** và **tên pod** | Đang chỉ đo 1/3 pod; latency xấu dần theo phiên |
+| R7 | **Gán biến từ `kubectl -o jsonpath` xong phải `echo` kiểm tra trước khi dùng** | Xem "Sự cố thi hành" ngay dưới — mảng rỗng gán chuỗi rỗng, lệnh sau chết với thông báo lạc hướng |
+
+### ⚠️ Sự cố thi hành 2026-08-18 13:47 — label selector sai (đã sửa)
+
+Lệnh Đ1 lần đầu **không chạy được**. Nguyên văn:
+
+```
+error: error executing jsonpath "{.items[0].metadata.name}": array index out of bounds: index 0, length 0
+object given to jsonpath engine was:
+   map[string]interface {}{"apiVersion":"v1", "items":[]interface {}{}, "kind":"List", ...}
+```
+rồi mọi lệnh sau: `error: pod, type/name or --filename must be specified`
+
+**Chẩn đoán:** `"items":[]` + `kind:"List"` = API server **trả lời thành công**, tập kết quả rỗng.
+Nếu sai namespace sẽ là `namespaces "x" not found`, thiếu quyền sẽ là `Forbidden`.
+⟹ thu hẹp về đúng một khả năng: **label `app=ragflow` không tồn tại**.
+
+**Label THẬT** (`kubectl -n ragflow get pods --show-labels`):
+
+| Pod | Label dùng để lọc |
+|---|---|
+| `ragflow-b68585df9-2dhbz` / `-45ffm` / `-brm7m` | `app.kubernetes.io/component=ragflow` |
+| `ragflow-mysql-0` | `app.kubernetes.io/component=mysql` |
+| `ragflow-minio-0` | `app.kubernetes.io/component=minio` |
+| `ragflow-redis-0` | `app.kubernetes.io/component=redis` |
+
+Chart Helm `ragflow-0.1.1` dùng label chuẩn `app.kubernetes.io/*`, **không** dùng `app=`.
+⟹ Đã sửa toàn bộ lệnh trong file này sang `-l app.kubernetes.io/component=ragflow`.
+
+**Bài học (cùng họ với "sed trượt âm thầm"):** `-o jsonpath` trên mảng rỗng **không** làm lệnh gán
+thất bại — nó gán chuỗi rỗng, rồi để lệnh SAU chết với thông báo hoàn toàn khác
+("pod must be specified"), làm lạc hướng chẩn đoán sang quyền/namespace.
+Dòng `echo "POD=$POD"` trong kịch bản đã làm đúng việc của nó: phơi ra `POD=` rỗng.
+
+### 📌 Trạng thái cụm lúc bắt đầu đo (2026-08-18 ~13:50)
+
+**3 pod ragflow đều `AGE 9m49s` — vừa restart xong.** Đây là cơ hội không tính trước:
+
+- Phép thử **Đ7** (restart rồi đo) trở thành **miễn phí, không cần downtime** — cụm đã ở trạng thái sạch.
+- ⟹ **Đổi thứ tự ưu tiên:** chạy Đ1 **và** Đ2 trong cùng cửa sổ này, trước khi pod kịp "già".
+- Cách đọc kết quả Đ2 trong bối cảnh pod mới 10 phút tuổi:
+
+| Kết quả Đ2 trên pod vừa restart | Suy ra |
+|---|---|
+| Vẫn dao động 2→40s | ❌ Loại giả thuyết "tích tụ theo uptime" ⟹ nghẽn mang tính **CẤU TRÚC**, có ngay từ lúc khởi động |
+| Nhanh & ổn định (biên độ <3×) | Có mốc "trạng thái sạch" để so lại sau vài giờ ⟹ xác nhận yếu tố tích tụ |
 
 ### Ba dữ kiện ràng buộc mọi giả thuyết mới
 
@@ -110,7 +156,7 @@ local ⟹ **chưa chắc đúng với prod**.
 **Lệnh:**
 
 ```bash
-POD=$(kubectl -n ragflow get pods -l app=ragflow -o jsonpath='{.items[0].metadata.name}')
+POD=$(kubectl -n ragflow get pods -l app.kubernetes.io/component=ragflow -o jsonpath='{.items[0].metadata.name}')
 echo "POD=$POD  TS=$(date '+%F %T')"
 
 echo "=== 1. env lien quan concurrency ==="
@@ -133,9 +179,9 @@ kubectl -n ragflow exec "$POD" -c ragflow -- sh -c \
 <summary><b>Giải nghĩa từng cờ</b> (liệt kê cả cờ đã biết để đối chiếu)</summary>
 
 ```
-kubectl -n ragflow get pods -l app=ragflow -o jsonpath='{.items[0].metadata.name}'
+kubectl -n ragflow get pods -l app.kubernetes.io/component=ragflow -o jsonpath='{.items[0].metadata.name}'
 │ ├─ -n ragflow        namespace chứa deployment
-│ ├─ -l app=ragflow    label selector, lọc đúng pod ragflow (bỏ pod khác trong ns)
+│ ├─ -l app.kubernetes.io/component=ragflow    label selector, lọc đúng pod ragflow (bỏ pod khác trong ns)
 │ └─ -o jsonpath=...   in ĐÚNG tên pod đầu tiên, không kèm header
 │                      → gán vào biến, tránh gõ tay tên pod đổi sau mỗi rollout
 
@@ -298,7 +344,7 @@ tối giản, không có network ra ngoài) — **không cần cài gì thêm**.
 **Bước 1 — tìm ĐÚNG tên biến điều khiển log level (đừng đoán):**
 
 ```bash
-POD=$(kubectl -n ragflow get pods -l app=ragflow -o jsonpath='{.items[0].metadata.name}')
+POD=$(kubectl -n ragflow get pods -l app.kubernetes.io/component=ragflow -o jsonpath='{.items[0].metadata.name}')
 kubectl -n ragflow exec "$POD" -c ragflow -- sh -c \
   'grep -rn -E "LOG_LEVEL|setLevel|basicConfig|DEBUG" /ragflow/common/log_utils.py /ragflow/api/settings.py /ragflow/common/settings.py 2>/dev/null | head -20'
 ```
@@ -316,7 +362,7 @@ kubectl -n ragflow rollout status deployment/ragflow --timeout=300s
 **Bước 3 — bắn 1 request rồi lấy log đúng cửa sổ đó:**
 
 ```bash
-POD=$(kubectl -n ragflow get pods -l app=ragflow -o jsonpath='{.items[0].metadata.name}')
+POD=$(kubectl -n ragflow get pods -l app.kubernetes.io/component=ragflow -o jsonpath='{.items[0].metadata.name}')
 kubectl -n ragflow logs "$POD" -c ragflow -f --tail=0 > /tmp/dbg.log 2>&1 &
 LOGPID=$!
 sleep 2
@@ -387,7 +433,7 @@ ingest rồi xét **tương quan**.
 **Lệnh** (20 mẫu — R4 — kèm đếm dòng log ingest trong 10s ngay trước mỗi mẫu):
 
 ```bash
-POD=$(kubectl -n ragflow get pods -l app=ragflow -o jsonpath='{.items[0].metadata.name}')
+POD=$(kubectl -n ragflow get pods -l app.kubernetes.io/component=ragflow -o jsonpath='{.items[0].metadata.name}')
 for i in $(seq 1 20); do
   N=$(kubectl -n ragflow logs "$POD" -c ragflow --since=10s 2>/dev/null | grep -c "Embedding chunks")
   T=$(curl -s -o /dev/null -w "%{time_total}" -X POST "$URL" \
@@ -509,13 +555,18 @@ lặp 6 lần × sleep 3    ⟹ lấy mẫu ~18 giây, đủ phủ trọn một 
 
 ## Đ7 — Làm lại phép thử restart CHO ĐÚNG
 
+> ✅ **CẬP NHẬT 2026-08-18 13:50 — KHÔNG CẦN CHẠY, KHÔNG CẦN DOWNTIME NỮA.**
+> 3 pod ragflow đo được `AGE 9m49s` ⟹ cụm **đã vừa restart xong**. Chỉ cần chạy **Đ2 ngay bây giờ**
+> là có luôn dữ liệu "sau restart" mà không phải rollout lần nữa. Giữ mục này làm tham chiếu
+> cho lần sau, hoặc để đo lại **sau vài giờ** nhằm so với mốc sạch hiện tại.
+
 ⚠️ **Có downtime ngắn — phải báo trước các bên đang cắm API.** Chỉ chạy nếu Đ1–Đ3 chưa dứt điểm.
 Lần trước (3.20) hỏng vì bấm `^C` giữa rollout ⟹ đo nhầm pod cũ.
 
 ```bash
 kubectl -n ragflow rollout restart deployment/ragflow
 kubectl -n ragflow rollout status deployment/ragflow --timeout=600s   # KHONG bam ^C
-POD=$(kubectl -n ragflow get pods -l app=ragflow -o jsonpath='{.items[0].metadata.name}')
+POD=$(kubectl -n ragflow get pods -l app.kubernetes.io/component=ragflow -o jsonpath='{.items[0].metadata.name}')
 echo "POD_MOI=$POD  $(date '+%T')"
 for i in $(seq 1 20); do
   curl -s -o /dev/null -w "run=$i total=%{time_total}\n" -X POST "$URL" \
