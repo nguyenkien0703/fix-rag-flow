@@ -12,24 +12,33 @@ query, lúc trả về **~2s**, lúc **>20s**.
 **Đây KHÔNG phải issue mới** — là Issue #4 / Issue 10 đã điều tra trước đó, nhưng bối cảnh
 đã thay đổi đáng kể (xem mục 2). File này bám tiếp đúng issue đó ở scale mới.
 
-> ## 🔴 TRẠNG THÁI: CHƯA TÌM RA ROOT CAUSE — mọi tầng đo được đều đã bị loại trừ
+> ## 🔴🔴 NGHI PHẠM HÀNG ĐẦU (2026-08-18 12:18): CONNECTION LEAK — xem 3.18
 >
-> **Số học không khớp, đây là điều cần giải thích:**
-> ES **1.7s** + embedding **0.15s** + network **6ms** ≈ **1.9s**. Tổng thực tế **3.6s → 28.2s**.
-> ⟹ **Còn 1.7s đến 26.3s không thuộc bất kỳ tầng nào đã đo.** Xem bảng 3.16.
+> **Bằng chứng đo được:**
+> - **104 CLOSE_WAIT / 283 connection (37%)** — `CLOSE_WAIT` = phía bên kia đã đóng nhưng **app chưa
+>   gọi `close()`**, nằm đó vô thời hạn, mỗi cái giữ 1 fd + 1 slot pool. **Đây là leak.**
+> - **`conn8992` tăng ĐƠN ĐIỆU 88 → 94** trong lúc 1 request chạy, **không bao giờ giảm**.
+>   Chuỗi theo thời gian: **67 → 88 → 94**.
+> - **Latency LEO THANG, không phải dao động ngẫu nhiên:**
+>   12:06 Postman **17.40s** → 12:18 curl **25.351s** → 12:16 Postman **10 phút 19.38 giây**.
 >
-> **Đã loại trừ hết (đừng điều tra lại — mỗi cái đều có số đo):**
-> Elasticsearch (<1ms/query) · network client (6ms) · payload (270KB/6ms) · **CPU pod (10–20%)** ·
-> **embedding LiteLLM (~150ms, biên độ 2×, đo ĐÚNG LÚC ingest chạy, không có hàng đợi FIFO)** ·
-> `topk` 1024 vs 256 (A/B 4–4, kết quả y hệt) · `metadata_condition` (bỏ đi còn chậm hơn) ·
-> `minimum_should_match` · load-balance 3 pod · tokenizer/stopword tiếng Việt.
+> **⭐ Giải thích được nghịch lý trung tâm** — "mọi backend đo riêng đều nhanh (ES <1ms, embedding
+> 150ms, LLM 1.25s) nhưng tổng lại 3.6s→10 phút": đo bằng `curl` **từ ngoài** thì lấy **connection
+> mới sạch** ⟹ nhanh. Trong pod, connection cũ kẹt CLOSE_WAIT **không tái dùng được** ⟹ phải mở mới,
+> và khi tiến tới trần (pool size / `ulimit -n`) thì **việc LẤY ĐƯỢC connection** thành phần chậm —
+> thời gian đó **vô hình** với ES stats, với curl ngoài, và **không tiêu CPU** (khớp 10–20%).
 >
-> **CPU 10–20% ⟹ latency là I/O WAIT.** Nhưng cả hai đích I/O đã biết (ES, embedding) đều nhanh và
-> ổn định. ⟹ Đang chờ **một thứ chưa được nhìn tới**.
+> **⭐ PHÉP THỬ QUYẾT ĐỊNH (chưa chạy):** `rollout restart` rồi đo ngay.
+> Nhanh hẳn (1-3s) rồi chậm dần ⟹ **root cause chốt**. Vẫn chậm ⟹ leak là bug thật nhưng không
+> phải nguyên nhân chính.
 >
-> **⚠️ Bài học của phiên (mục 5, điểm 0–0d):** đã suy luận sai **3 lần** (topk, rerank CPU-bound,
-> embedding) — **cả 3 đều vì đoán từ source code thay vì đo.** Bước tiếp: **profile trực tiếp trong
-> process** (`py-spy dump --pid 48`) hoặc bisect bằng biến thể request. **Không đoán tiếp.**
+> **Đã loại trừ hết (mỗi cái có số đo, đừng điều tra lại):** Elasticsearch (<1ms/query) ·
+> network client (6ms) · payload (270KB/6ms) · **CPU pod (10–20%)** · **embedding (150ms, biên độ 2×)** ·
+> **LLM qwen3-32b (1.25s, biên độ 1.02×)** · `topk` 1024 vs 256 (A/B 4–4) · `metadata_condition`
+> (bỏ đi còn chậm hơn) · `minimum_should_match` · load-balance 3 pod · tokenizer/stopword tiếng Việt.
+>
+> **⚠️ Đã suy luận sai 3 lần** (topk, rerank CPU, embedding) — đều vì đoán từ source thay vì đo
+> (Bài học 0d). Lần này có số đo trực tiếp, nhưng **vẫn phải chạy phép thử restart để chốt.**
 
 ### Bối cảnh hệ thống
 
@@ -60,6 +69,9 @@ query, lúc trả về **~2s**, lúc **>20s**.
 
 | 10 | ~~ROOT CAUSE A — embedding xếp hàng sau ingest~~ | — | ❌ **PHỦ ĐỊNH (3.15)** — đo trực tiếp LiteLLM `10.208.137.53:8992` **đúng lúc ingest chạy**: **~150ms**, min 0.116 max 0.238 (**biên độ 2×**); 5 request song song về cùng lúc ⟹ **không có hàng đợi FIFO**. Chiếm 4% tổng, không đóng góp vào dao động | Đóng hướng. `EMBEDDING_BATCH_SIZE=16` cũng vô can |
 | 11 | 🔴 **VẤN ĐỀ CÒN LẠI: 1.7s–26.3s không thuộc tầng nào đã đo.** ES 1.7s + embedding 0.15s + network 0.006s ≈ 1.9s, thực tế 3.6–28.2s | Cao | 🔴 **OPEN — chưa có nghi phạm nào có bằng chứng.** CPU 10–20% ⟹ I/O wait, nhưng cả 2 đích I/O đã biết đều nhanh | **Profile trực tiếp trong process** (`py-spy dump --pid 48`) khi request đang chậm, hoặc bisect bằng `vector_similarity_weight` 1.0/0.0/0.6. KHÔNG suy luận từ source nữa |
+
+| 12 | ~~LLM `qwen3-32b`~~ | — | ❌ **PHỦ ĐỊNH (3.17)** — 1.236/1.259/1.258s, **biên độ 1.02×** | Đóng hướng |
+| 13 | 🔴🔴 **CONNECTION LEAK (CLOSE_WAIT)** — **104 CLOSE_WAIT/283 conn (37%)**; `conn8992` tăng đơn điệu 67→88→94 không bao giờ giảm; latency leo thang 17.4s→25.4s→**10 phút 19s** | **Rất cao** | 🔴 **NGHI PHẠM HÀNG ĐẦU, có bằng chứng đo được (3.18)** — giải thích được nghịch lý "backend nhanh nhưng tổng chậm" + CPU thấp + I/O wait + xu hướng xấu dần | **Phép thử quyết định: `rollout restart` rồi đo ngay.** Nhanh hẳn rồi chậm dần ⟹ chốt. Tiếp: `ulimit -n`, đếm fd PID 48, xem CLOSE_WAIT nối tới port nào |
 
 ## 3. Lệnh đã chạy
 
@@ -1483,6 +1495,132 @@ kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'echo "gate
 
 ---
 
+### 3.18 🔴🔴 BẰNG CHỨNG MẠNH NHẤT: 104 CLOSE_WAIT + connection tăng đơn điệu = CONNECTION LEAK
+
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'awk "NR>1{print \$4}" /proc/net/tcp | sort | uniq -c | sort -rn'
+```
+
+**Output:**
+```
+    126 06
+    104 08
+     42 01
+      7 05
+      3 0A
+      1 04
+```
+
+**Giải mã trạng thái TCP (cột 4, hex):**
+
+| Hex | Trạng thái | Số | Nghĩa |
+|---|---|---|---|
+| `06` | TIME_WAIT | **126** | connection đã đóng, chờ hết 2×MSL. Nhiều ⟹ mở/đóng liên tục thay vì tái dùng |
+| `08` | **CLOSE_WAIT** | **104** | 🔴 **phía bên kia ĐÃ đóng, nhưng APP CHƯA gọi `close()`** — nằm đó **vô thời hạn**, mỗi cái giữ 1 file descriptor + 1 slot pool. **Đây là CONNECTION LEAK** |
+| `01` | ESTABLISHED | 42 | đang dùng thật |
+| `05` | FIN_WAIT2 | 7 | đang đóng |
+| `0A` | LISTEN | 3 | socket lắng nghe |
+| `04` | FIN_WAIT1 | 1 | đang đóng |
+| | **TỔNG** | **283** | |
+
+**Đo `conn8992` ĐỒNG THỜI với retrieval (đã sửa lỗi phép đo cũ — vòng đếm chạy nền trước):**
+
+```
+(for i in $(seq 1 25); do echo "t=$i conn8992=$(kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'grep -c 2320 /proc/net/tcp' 2>/dev/null)"; done &) ; curl ... ; sleep 20
+```
+
+**Output:**
+```
+88                          <- baseline truoc khi ban (grep 2320)
+0                           <- grep 1F91 (port 8081): khong co connection nao
+command terminated with exit code 1     <- binh thuong: grep khong tim thay -> exit 1
+--- baseline tren, gio ban retrieval ---
+t=1  conn8992=88     t=10 conn8992=92     t=19 conn8992=92
+t=2  conn8992=89     t=11 conn8992=92     t=20 conn8992=92
+t=3  conn8992=89     t=12 conn8992=92     t=21 conn8992=93
+t=4  conn8992=89     t=13 conn8992=92     t=22 conn8992=94
+t=5  conn8992=89     t=14 conn8992=92     t=23 conn8992=94
+t=6  conn8992=89     t=15 conn8992=92     t=24 conn8992=94
+t=7  conn8992=90     t=16 conn8992=92     t=25 conn8992=94
+t=8  conn8992=91     t=17 conn8992=92
+t=9  conn8992=92     t=18 conn8992=92
+RETRIEVAL total=25.351
+```
+
+**Postman cùng thời điểm (ảnh 12:16 PM):** `Status: 200 OK`, **`Time: 10 m 19.38 s`**, `Size: 264.59 KB`.
+
+**Đọc được gì:**
+
+1. 🔴 **104 CLOSE_WAIT / 283 connection (37%) = CONNECTION LEAK, có thật, đo được.**
+   `CLOSE_WAIT` không tự hết — nó tồn tại **cho tới khi app gọi `close()`** hoặc process chết.
+   App đang **rò rỉ connection**.
+2. 🔴 **`conn8992` TĂNG ĐƠN ĐIỆU 88 → 94 trong lúc 1 request retrieval chạy, KHÔNG BAO GIỜ GIẢM.**
+   Và so với phép đo trước đó (3.17): **67 → 88 → 94**. Connection tới gateway **chỉ tăng**.
+3. 🔴 **LATENCY LEO THANG THEO THỜI GIAN — khớp mô hình leak:**
+   | Thời điểm | Latency | conn_8992 |
+   |---|---|---|
+   | ~12:02 (3.15) | — | **67** |
+   | 12:06 Postman | **17.40s** | — |
+   | 12:18 curl | **25.351s** | **88 → 94** |
+   | 12:16 Postman | **10 phút 19.38 giây** | — |
+   ⟹ Càng nhiều request, càng nhiều connection kẹt CLOSE_WAIT, càng chậm. **Không phải dao động
+   ngẫu nhiên mà là XU HƯỚNG XẤU DẦN.**
+4. ⭐ **GIẢI THÍCH ĐƯỢC NGHỊCH LÝ TRUNG TÂM** ("mọi backend đo riêng đều nhanh nhưng tổng lại chậm"):
+   khi đo bằng `curl` **từ ngoài**, ta lấy **connection mới sạch** ⟹ nhanh. Trong pod, connection cũ
+   mắc kẹt CLOSE_WAIT **không tái dùng được** ⟹ mỗi request phải **mở connection mới**, và khi tiến
+   tới giới hạn (pool size / `ulimit -n` file descriptor) thì **việc LẤY ĐƯỢC connection** trở thành
+   phần chậm — thời gian đó **vô hình** với ES stats, với curl ngoài, và không tiêu CPU (khớp 10–20%).
+5. **Dự đoán kiểm chứng được (falsifiable):** nếu đây là root cause thì **restart pod sẽ làm nhanh trở
+   lại ngay**, rồi chậm dần theo số request. ⟹ **Đây là phép thử quyết định** (xem lệnh dưới).
+6. `grep -c 1F91` = 0 ⟹ không có connection tới port 8081. `exit code 1` của lệnh đầu là **bình
+   thường** (grep không match ⟹ exit 1), không phải lỗi.
+
+**Lệnh cần chạy tiếp:**
+
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'echo "== ulimit nofile =="; ulimit -n; echo "== so fd dang mo cua PID 48 =="; ls /proc/48/fd 2>/dev/null | wc -l; echo "== tong socket =="; awk "NR>1" /proc/net/tcp | wc -l'
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `ulimit -n` | **trần file descriptor** của process. Đây là con số quyết định: nếu số fd đang mở tiến gần trần ⟹ xác nhận cơ chế "chờ lấy được connection" |
+| `ls /proc/48/fd \| wc -l` | đếm fd **thực tế** PID 48 (ragflow_server) đang giữ. So với `ulimit -n` để biết còn cách trần bao xa |
+| `awk "NR>1" ... \| wc -l` | tổng socket TCP (trừ header) |
+
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'awk "NR>1 && \$4==\"08\" {print \$3}" /proc/net/tcp | sort | uniq -c | sort -rn | head'
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `\$4==\"08\"` | lọc **chỉ** dòng CLOSE_WAIT |
+| `print \$3` | in địa chỉ đích (hex) của các connection bị leak |
+| **Cách đọc** | phần lớn là `2320` (8992) ⟹ leak ở HTTP client gọi **LiteLLM**. Là `1F73` (8051) ⟹ leak ở **ES client**. Là `0CEA` (3306) ⟹ **MySQL** |
+
+**⭐ PHÉP THỬ QUYẾT ĐỊNH — restart pod rồi đo ngay:**
+
+```
+kubectl -n ragflow rollout restart deployment/ragflow -n ragflow
+```
+
+```
+kubectl -n ragflow rollout status deployment/ragflow --timeout=300s
+```
+
+```
+for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null -w "sau_restart run=$i total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"metadata_condition":{"logic":"and","conditions":[{"name":"listuserview_useridtwo","comparison_operator":"contains","value":"900034475"}]}}'; done
+```
+
+**Cách đọc phép thử này:**
+- **Nhanh hẳn ngay sau restart (1-3s) rồi chậm dần** ⟹ 🔴 **ROOT CAUSE CHỐT: connection leak.**
+  Fix: tìm chỗ không đóng connection trong code, hoặc workaround bằng restart định kỳ + tăng `ulimit`.
+- **Vẫn chậm ngay sau restart** ⟹ leak **không phải** nguyên nhân chính (dù vẫn là bug thật cần sửa),
+  phải điều tra tiếp.
+
+⚠️ **Cần báo trước các bên đang cắm API** — `rollout restart` có downtime ngắn.
+
+---
+
 ### Nghi phạm chưa được kiểm tra (liệt kê để không quên, KHÔNG phải kết luận)
 
 Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — không được xây fix lên bất kỳ cái nào trước khi đo:
@@ -1494,7 +1632,7 @@ Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — khô
 | **Rerank model** (khác embedding) | `search.py:515` `rerank_mdl.similarity(query, docs)`, `:615` `if rerank_mdl and sres.total > 0`. **Chưa kiểm** rerank model có được cấu hình không, và nếu có thì gọi tới đâu | `select * from tenant_model;` xem có rerank model; đo endpoint đó |
 | **MySQL** | `document_keyword`/`docnm_kwd` có thể query MySQL cho từng chunk. **Chưa đo MySQL** | `SHOW PROCESSLIST` khi request chậm; hoặc bật slow query log |
 | **MinIO** | Chưa đo. Retrieval có thể fetch gì từ object storage | log/metrics MinIO |
-| **Connection pool cạn** | Nếu pool tới ES/MySQL nhỏ và ingest chiếm hết ⟹ retrieval chờ **lấy connection**, không phải chờ query. ES query nhanh nhưng **chờ pool** thì không hiện trong ES stats | đếm connection trong `/proc/net/tcp`; tìm config pool size |
+| 🔴🔴 **CONNECTION LEAK (CLOSE_WAIT) — ĐÃ CÓ BẰNG CHỨNG, xem 3.18** | Nếu pool tới ES/MySQL nhỏ và ingest chiếm hết ⟹ retrieval chờ **lấy connection**, không phải chờ query. ES query nhanh nhưng **chờ pool** thì không hiện trong ES stats | đếm connection trong `/proc/net/tcp`; tìm config pool size |
 
 ⭐ **Nghi phạm số 1 theo mức độ khớp bằng chứng: async event loop bị block.** Nó giải thích được
 **đồng thời** cả 4 dữ kiện: CPU thấp, I/O wait, dao động theo thời điểm chứ không theo query, và
@@ -1621,14 +1759,20 @@ median mà biên độ vẫn 14× thì **chưa fix xong**.
 > **Không có fix nào sẵn sàng deploy.** Cả 3 root cause từng chốt đều đã bị phủ định. Việc tiếp theo
 > là **điều tra**, không phải fix.
 
-### 🔴 Ngay lập tức — tìm 1.7–26.3s còn thiếu
-- [ ] **Thử `py-spy dump --pid 48`** khi request đang chậm — cho biết process đứng ở dòng nào.
-      Nếu không cài được (image tối giản/không có network) thì bỏ qua sang mục dưới
-- [ ] **Bisect bằng `vector_similarity_weight` 1.0 / 0.0 / 0.6** xen kẽ cùng vòng lặp (mục 4.5 Cách 2)
-- [ ] **Kiểm `LOG_LEVEL`** — `search.py:590/606` có `logging.debug("[Search] ...")` sẵn, bật DEBUG
-      sẽ có trace từ chính RAGFlow
-- [ ] ⭐ **Đo 10 mẫu retrieval khi ingest NGHỈ** — phép thử một biến rẻ nhất và mạnh nhất còn lại
-- [ ] `select * from tenant_model;` — kiểm có **rerank model** được cấu hình không (chưa từng kiểm)
+### 🔴 Ngay lập tức — chốt giả thuyết connection leak (3.18)
+- [ ] ⭐ **PHÉP THỬ QUYẾT ĐỊNH: `rollout restart deployment/ragflow` rồi đo 10 mẫu NGAY.**
+      Nhanh hẳn (1-3s) rồi chậm dần ⟹ **root cause chốt**. Vẫn chậm ⟹ leak không phải nguyên nhân chính.
+      ⚠️ Báo trước các bên đang cắm API (có downtime ngắn)
+- [ ] `ulimit -n` + đếm fd của PID 48 — xác nhận có tiến gần trần file descriptor không
+- [ ] Xem **104 CLOSE_WAIT nối tới port nào** (`$4=="08"` rồi đếm `$3`): `2320`=LiteLLM,
+      `1F73`=ES, `0CEA`=MySQL ⟹ biết leak ở client nào
+- [ ] Theo dõi `CLOSE_WAIT` + tổng socket theo thời gian, xác nhận **tăng đơn điệu**
+- [ ] Nếu chốt là leak: tìm chỗ thiếu `close()`/`async with` trong code client tương ứng
+      (đọc source trong container, không đọc GitHub)
+
+### Đã có output, chưa phân tích
+- [ ] Bisect `vector_similarity_weight` 1.0/0.0/0.6 — **anh Kiên đã chạy nhưng chưa gửi output**
+- [ ] `select * from tenant_model;` — kiểm có rerank model được cấu hình không (chưa từng kiểm)
 
 ### Ngắn hạn — kiểm các nghi phạm chưa đo (mục 4.5)
 - [ ] MySQL: `SHOW PROCESSLIST` khi request chậm / bật slow query log
