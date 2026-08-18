@@ -833,3 +833,75 @@ Cùng một query, cùng pod, cùng khung vài phút ⟹ latency **1.806s → 25
 được từ ngoài.** Mọi phép đo từ ngoài — dù thiết kế khéo đến đâu — sẽ tiếp tục cho ra nhiễu.
 **PHẢI nhìn từ bên trong (Đ3 — bật DEBUG log).** Đây là việc còn lại duy nhất có khả năng kết thúc
 issue, và nó KHÔNG cần cài thêm công cụ (code đã instrument sẵn ở `search.py:590/606`).
+
+---
+
+## Đ10 — ⛔ THỬ NỚI `refresh_interval` 1s → 30s: THẤT BẠI, GÂY SỰ CỐ NGẮN
+
+**Giả thuyết:** `refresh_interval=1000ms` + ingest bulk `refresh=wait_for` ⟹ index bị ép refresh
+liên tục ⟹ vô hiệu query cache ⟹ retrieval phải đọc lại. Số liệu hậu thuẫn (`_stats/refresh`):
+
+| Index | refresh total | total_time_in_millis |
+|---|---|---|
+| `ragflow_doc_meta_22cdb...` | 2,820,748 | **83,171,118 ms ≈ 23 giờ** |
+| `ragflow_22cdb...` | 2,447,710 | **46,322,789 ms ≈ 12.9 giờ** |
+
+**Đã làm:** PUT `refresh_interval: "30s"` cho 2 index của KB đang test (2026-08-18 ~14:31).
+
+**Kết quả — ❌ THẤT BẠI VÀ GÂY SỰ CỐ:**
+
+1. Vòng lặp 10 mẫu **treo hoàn toàn**, không in nổi một dòng trong nhiều phút (trước đó mỗi request
+   2–25s). Request đơn lẻ cũng không trả về.
+2. 🔴 **UI RAGFlow ĐƠ.** Ingest tắc kéo theo API tắc.
+3. **Cơ chế gây sự cố:** ingest gọi bulk với `refresh=wait_for` ⟹ khi `refresh_interval=30s`,
+   **mỗi bulk phải chờ tới 30 giây** thay vì 1 giây. Hàng đợi bulk dồn ứ ⟹ nghẽn toàn hệ.
+4. **Hoàn nguyên** về `1000ms` cho cả 2 index ⟹ `"acknowledged":true`, request trả về **21.493s**
+   (chậm như cũ nhưng KHÔNG treo). Hệ thống về trạng thái ban đầu.
+
+⟹ ❌ **LOẠI giả thuyết refresh.** Đây là hướng ES cuối cùng.
+
+**⚠️ SAI LẦM CẦN GHI NHỚ:** đổi `refresh_interval` mà **không tính tới `refresh=wait_for` sẽ khuếch
+đại thời gian chờ mỗi bulk lên đúng bằng khoảng đó**. Đáng lẽ phải (a) sửa `wait_for` → `false`
+TRƯỚC, hoặc (b) thử trên index nhỏ trước. **Bài học: khi hai setting tương tác nhau, đổi một cái
+có thể khuếch đại cái kia — phải rà quan hệ trước khi đụng production.**
+
+---
+
+## 6. 🏁 TỔNG KẾT — GIỚI HẠN CỦA VIỆC ĐO TỪ NGOÀI
+
+### Đã loại trừ trong phiên này (bổ sung cho 15 giả thuyết cũ ở file tracking)
+
+| # | Giả thuyết | Bị loại bởi | Bằng chứng |
+|---|---|---|---|
+| 16 | Tranh GIL / thread pool dùng chung | Đ2 | Mức song song thực tế **5.78×** — không nối đuôi |
+| 17 | Event loop bị block bởi lời gọi sync | Đ2 | Cùng trên; nếu block thì 5 request ≈ 65s, thực tế 11.25s |
+| 18 | Thread pool `max_workers` nhỏ | Đ1 + Đ2 | Env không set ⟹ mặc định **128** |
+| 19 | Tích tụ theo uptime | Đ2 | Pod mới 13 phút vẫn chậm **23.8s** |
+| 20 | "Nguội khi rảnh" (cold connection) | Đ9 | `gap=30s` → **1.806s** (nhanh nhất) vs `gap=5s` → **25.921s** |
+| 21 | Connection leak gây chậm (lần 2) | Đ9 | CLOSE_WAIT 269→340 đơn điệu, latency nhảy loạn |
+| 22 | TLS handshake mỗi lời gọi ES | log INFO | Mọi lời gọi ES **3–17ms** |
+| 23 | `refresh_interval` ép mất cache | Đ10 | Nới lên 30s ⟹ **tệ hơn, gây sự cố** |
+
+### Kết luận trung thực về giới hạn
+
+**Không một biến nào quan sát được từ ngoài dự báo được latency.** Cùng query, cùng pod, cách nhau
+vài phút: **1.806s → 25.921s (14×)**. Đã thử: tải đồng thời · khoảng nghỉ · uptime · CLOSE_WAIT ·
+`topk` · `metadata_condition` · cường độ ingest · `refresh_interval`.
+
+⟹ **Việc còn lại KHÔNG phải đo thêm từ ngoài.** Phải **chèn instrument vào code retrieval**
+để biết đoạn nào nuốt thời gian.
+
+### Cần bàn giao cho anh Cường (người build custom image)
+
+| Việc | Vị trí | Ghi chú |
+|---|---|---|
+| **1. Chèn timing vào đường retrieval** | `rag/nlp/search.py` — quanh `:56` (`encode_queries`), `:199` (`get_vector`), `:299` (tokenize), `:434/461` (rerank), `:515` (`rerank_mdl.similarity`) | Log mốc thời gian **từng giai đoạn**. Đây là việc DUY NHẤT còn lại có khả năng kết thúc issue |
+| **2. `LOG_LEVELS` chứ không phải `LOG_LEVEL`** | `common/log_utils.py:50` `os.environ.get("LOG_LEVELS", "")` | Đã thử `LOG_LEVEL=DEBUG` ⟹ **vô tác dụng**. Định dạng: `pkg:level`, phân tách bằng `,`. `root` mặc định INFO (`:66`) |
+| **3. Sửa connection leak** | Client tới LiteLLM gateway | 227–340 CLOSE_WAIT, tăng đơn điệu. **Không gây chậm** (đã chứng minh 2 lần) nhưng là bug thật |
+| **4. Cân nhắc bỏ `refresh=wait_for`** ở đường ingest | Lệnh `_bulk` | Mỗi bulk tốn ~1s chỉ để chờ refresh. **KHÔNG phải root cause latency**, nhưng lãng phí rõ. ⚠️ Nếu đổi thì **đừng** đồng thời nới `refresh_interval` (xem Đ10) |
+
+### Nợ kỹ thuật gốc
+
+**RAGFlow không instrument tầng retrieval** — không có field duration ở access log, `logging.debug`
+có sẵn nhưng bật không lên bằng env thông dụng. Đây là lý do gốc khiến **5 phiên debug** phải đo
+tách tầng thủ công từ ngoài và vẫn không kết luận được.
