@@ -71,7 +71,7 @@ query, lúc trả về **~2s**, lúc **>20s**.
 | 11 | 🔴 **VẤN ĐỀ CÒN LẠI: 1.7s–26.3s không thuộc tầng nào đã đo.** ES 1.7s + embedding 0.15s + network 0.006s ≈ 1.9s, thực tế 3.6–28.2s | Cao | 🔴 **OPEN — chưa có nghi phạm nào có bằng chứng.** CPU 10–20% ⟹ I/O wait, nhưng cả 2 đích I/O đã biết đều nhanh | **Profile trực tiếp trong process** (`py-spy dump --pid 48`) khi request đang chậm, hoặc bisect bằng `vector_similarity_weight` 1.0/0.0/0.6. KHÔNG suy luận từ source nữa |
 
 | 12 | ~~LLM `qwen3-32b`~~ | — | ❌ **PHỦ ĐỊNH (3.17)** — 1.236/1.259/1.258s, **biên độ 1.02×** | Đóng hướng |
-| 13 | 🔴🔴 **CONNECTION LEAK (CLOSE_WAIT)** — **104 CLOSE_WAIT/283 conn (37%)**; `conn8992` tăng đơn điệu 67→88→94 không bao giờ giảm; latency leo thang 17.4s→25.4s→**10 phút 19s** | **Rất cao** | 🔴 **NGHI PHẠM HÀNG ĐẦU, có bằng chứng đo được (3.18)** — giải thích được nghịch lý "backend nhanh nhưng tổng chậm" + CPU thấp + I/O wait + xu hướng xấu dần | **Phép thử quyết định: `rollout restart` rồi đo ngay.** Nhanh hẳn rồi chậm dần ⟹ chốt. Tiếp: `ulimit -n`, đếm fd PID 48, xem CLOSE_WAIT nối tới port nào |
+| 13 | ❌ ~~CONNECTION LEAK gây chậm~~ **PHỦ ĐỊNH (3.20)**: cw tăng đơn điệu 296→322 nhưng latency nhảy loạn; run=9 chỉ 1.97s khi cw=317. Leak là bug thật nhưng KHÔNG gây chậm. Dữ kiện cũ: **104 CLOSE_WAIT/283 conn (37%)**; `conn8992` tăng đơn điệu 67→88→94 không bao giờ giảm; latency leo thang 17.4s→25.4s→**10 phút 19s** | **Rất cao** | 🔴 **NGHI PHẠM HÀNG ĐẦU, có bằng chứng đo được (3.18)** — giải thích được nghịch lý "backend nhanh nhưng tổng chậm" + CPU thấp + I/O wait + xu hướng xấu dần | **Phép thử quyết định: `rollout restart` rồi đo ngay.** Nhanh hẳn rồi chậm dần ⟹ chốt. Tiếp: `ulimit -n`, đếm fd PID 48, xem CLOSE_WAIT nối tới port nào |
 
 ## 3. Lệnh đã chạy
 
@@ -1682,6 +1682,100 @@ t=5 tong=489 close_wait=246
    worker/connection slot, **dù gateway vẫn trả lời curl đơn lẻ nhanh** (curl mở connection mới,
    được phục vụ ngay; còn RAGFlow tái dùng pool đã đầy connection chết).
    ❓ **Vẫn là giả thuyết** — phép thử restart sẽ phân định.
+
+---
+
+### 3.20 🔴🔴 PHÂN BỐ LƯỠNG CỰC — leak KHÔNG gây chậm, dấu hiệu TIMEOUT/RETRY
+
+⚠️ **Phép thử restart BỊ VÔ HIỆU:** Kiên bấm `^C` khi rollout đang chạy
+(`Waiting for deployment "ragflow" rollout to finish: 1 out of 3 new replicas have been updated`)
+⟹ `POD_MOI=ragflow-57d9856dff-5kgvd` là **pod CŨ, chưa restart**, và `cw8992` bắt đầu từ **296**
+chứ không phải 0. **10 mẫu dưới đây đo trên pod CHƯA restart.**
+(Kiên có quan sát thêm: sau restart gọi Postman 2 lần liên tiếp được **4s/5s** — ❓ chưa đo có hệ thống.)
+
+**Output:**
+
+```
+=== TRUOC restart ===
+cw_8992=261
+truoc_restart total=2.646
+=== RESTART ===
+deployment.apps/ragflow restarted
+Waiting for deployment "ragflow" rollout to finish: 1 out of 3 new replicas have been updated...
+^C
+POD_MOI=ragflow-57d9856dff-5kgvd
+=== SAU restart: 10 mau + cw moi mau ===
+run=1  total=3.023   cw8992=296
+run=2  total=2.048   cw8992=298
+run=3  total=28.643  cw8992=303
+run=4  total=4.025   cw8992=303
+run=5  total=3.985   cw8992=305
+run=6  total=27.555  cw8992=310
+run=7  total=4.184   cw8992=310
+run=8  total=30.854  cw8992=319
+run=9  total=1.973   cw8992=317
+run=10 total=33.196  cw8992=322
+```
+
+**Đọc được gì:**
+
+1. ❌ **CONNECTION LEAK KHÔNG PHẢI NGUYÊN NHÂN — nghi phạm thứ 5 bị loại.**
+   `cw8992` tăng **đơn điệu** 296→322, nhưng latency **nhảy loạn**: 3.0, 2.0, **28.6**, 4.0, 4.0,
+   **27.6**, 4.2, **30.9**, **1.97**, **33.2**.
+   **Bằng chứng phản bác trực tiếp:** `run=9` chỉ **1.973s** khi `cw=317` (gần cao nhất);
+   `run=2` = 2.048s khi `cw=298`. **Không có tương quan nào** giữa CLOSE_WAIT và latency.
+   ⟹ Leak vẫn là **bug thật** (227 socket bỏ rơi, cần báo anh Cường sửa) nhưng **không gây chậm.**
+2. 🔴 **PHÁT HIỆN MỚI, QUAN TRỌNG NHẤT: PHÂN BỐ LƯỠNG CỰC (bimodal), có KHOẢNG TRỐNG hoàn toàn.**
+
+   | Nhóm | Số mẫu | Giá trị |
+   |---|---|---|
+   | **Nhanh** | 6/10 | 1.97, 2.05, 3.02, 3.99, 4.03, 4.18 |
+   | **Khoảng giữa 5–27s** | **0/10** | — **KHÔNG CÓ MẪU NÀO** |
+   | **Chậm** | 4/10 | 27.56, 28.64, 30.85, 33.20 |
+
+3. ⭐ **Ý nghĩa của phân bố lưỡng cực: đây là TIMEOUT/RETRY, KHÔNG phải tài nguyên cạn dần.**
+   - Tài nguyên cạn dần (pool/CPU/memory) ⟹ latency tăng **mượt** (5s, 8s, 12s, 18s...).
+   - Lưỡng cực với **khoảng trống hoàn toàn** ⟹ có **đường nhanh ~2–4s**, và khi trúng một điều kiện
+     nào đó thì **cộng thêm một KHỐI thời gian gần như CỐ ĐỊNH ~25–29 giây**.
+   - **25–30 giây là chữ ký kinh điển của TIMEOUT rồi RETRY** (connect timeout 30s, hoặc 1 lần thử
+     thất bại + retry).
+4. 🔴 **Cơ chế giả định (khớp cả leak lẫn lưỡng cực):** pool đưa ra một connection **đã chết**
+   (chính là những cái kẹt CLOSE_WAIT) ⟹ request gửi vào đó **treo tới khi timeout (~25-30s)**
+   ⟹ retry bằng connection mới ⟹ thành công. Nếu **lấy được connection sống ngay** ⟹ nhanh 2–4s.
+   ⟹ **Leak không gây chậm TRỰC TIẾP, nhưng là NGUỒN của các connection chết** làm request trúng timeout.
+   ⟹ **Fix KHÔNG phải "restart để dọn"**, mà là: **pool biết kiểm tra connection còn sống (pre-ping)**,
+   hoặc **giảm timeout**, hoặc **sửa chỗ leak** để pool không còn connection chết.
+   ❓ **Vẫn là giả thuyết** — cần xác nhận con số timeout và tìm config tương ứng (lệnh 3.21).
+5. **`truoc_restart total=2.646`** khi `cw=261` — cũng nhanh. Càng củng cố điểm 1.
+6. ⚠️ **Cần đo lại phép thử restart cho ĐÚNG** — chờ `rollout status` xong hẳn (3/3 replicas),
+   KHÔNG bấm `^C`, rồi lấy tên pod mới.
+
+**Lệnh cần chạy tiếp (3.21): 25 mẫu đo phân bố + tìm config timeout**
+
+```
+for i in $(seq 1 25); do curl -s -o /dev/null -w "run=$i connect=%{time_connect} start=%{time_starttransfer} total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/json' -d '{...}'; done
+```
+
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'grep -rn "timeout" /ragflow/rag/utils/es_conn.py | head -15; grep -rn "timeout\|retry\|max_retries\|pool" /ragflow/common/settings.py 2>/dev/null | head -20'
+```
+
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- env | grep -iE "timeout|retry|pool"
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `%{time_connect}` | thời gian TCP handshake tới **RAGFlow** (không phải tới backend) — để loại trừ chậm ở tầng ngoài |
+| `%{time_starttransfer}` | byte đầu tiên về ⟹ server xử lý xong. Hiệu `total − start` = thời gian truyền |
+| 25 mẫu | cần cỡ mẫu lớn hơn 10 để xác nhận **khoảng trống 5–27s** là thật, không phải may |
+| `grep timeout es_conn.py` | tìm config timeout của ES client. **Ghi chú:** phiên trước có patch `sed 's/timeout=600/timeout=30/g'` trên file này (`05-FIX.md` mục 3) ⟹ **con số 30 này rất đáng nghi**, khớp khối 25-30s! |
+| `grep pool` | tìm cấu hình connection pool (size, pre-ping, recycle) |
+
+🔴 **Nghi phạm cụ thể xuất hiện:** `05-FIX.md` mục 3 ghi có patch `postStart`:
+`sed -i 's/timeout=600/timeout=30/g' /ragflow/rag/utils/es_conn.py`. **`timeout=30` khớp chính xác
+khối thời gian chậm 27.5–33.2s đo được!** ⟹ Phải kiểm patch này còn áp dụng không và nó đang
+timeout cái gì.
 
 ---
 
