@@ -976,6 +976,92 @@ khi retrieval chậm.
 
 ---
 
+### 3.14 Tìm endpoint thật của embedding service — ✅ ĐÃ CHẠY
+
+**Vì sao phải đào:** `service_conf.yaml` trong container **KHÔNG dùng được** — `base_url: 'http://:80'`
+(rỗng), `api_key: 'xxx'`, phần dưới toàn bị comment (`# factory: 'BAAI'`, `# name: 'bge-m3'`) ⟹ đó là
+**template mặc định**, không phải cấu hình đang chạy. Cấu hình model thật nằm trong **MySQL**.
+
+Và `kubectl get svc -n ragflow` chỉ có `ragflow-mysql` (ClusterIP 172.16.138.99:3306), `minio`, `redis`
+⟹ **không có service embedding/LiteLLM nào trong namespace này** ⟹ nó nằm ngoài namespace.
+
+Chạy trên `vrp-kubeengine04`:
+
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- env | grep -iE "base_url|api_base|openai|embed|llm|litellm"
+```
+
+**Output:**
+
+```
+EMBEDDING_BATCH_SIZE=16
+```
+
+**Đọc được gì:** biến duy nhất khớp. Endpoint **không** nằm trong env ⟹ phải lấy từ DB.
+`EMBEDDING_BATCH_SIZE=16` — xem phân tích ở cuối mục này, đây là con số quan trọng.
+
+**Bảng `tenant_llm` (schema cũ v0.24): RỖNG.** v0.26 đã migrate sang schema mới:
+`tenant_model_provider` / `tenant_model_instance` / `tenant_model` / `tenant_model_group`
+(còn thấy `tenant_model_instance_bak_20260731` = backup lúc migrate).
+
+⚠️ **Lệnh sai đã thử (ghi lại):** `select id, provider, model_name, model_type, base_url from
+tenant_model_instance;` → `ERROR 1054 (42S22): Unknown column 'provider' in 'field list'`.
+Schema mới khác dự đoán ⟹ phải `select *` trước khi đoán tên cột.
+
+```
+select * from tenant_model_provider;
+```
+
+**Output:**
+
+```
+| id                               | create_date         | provider_name         | tenant_id                        |
+| 8af1a5e69a2811f1b5b2fba64e6ce34f | 2026-08-17 18:43:54 | OpenAI-API-Compatible | 0775713275d111f198e53d33b00035ba |
+| 909c21f68cbd11f1aa37635d6e0f142c | 2026-07-31 16:55:22 | OpenAI-API-Compatible | 22cdb01e486a11f1ac9749e86cfe939a |
+2 rows in set (0.00 sec)
+```
+
+```
+select * from tenant_model_instance;
+```
+
+**Output:**
+
+```
+| id                               | create_date         | instance_name      | provider_id                      | api_key                  | status | extra                                                        |
+| 05e030d29a2a11f1b5b2fba64e6ce34f | 2026-08-17 18:54:30 | LiteLLM            | 8af1a5e69a2811f1b5b2fba64e6ce34f | sk-dqwMDlF1pCG_xxPF228_Vw | active | {"base_url": "http://10.208.137.53:8992/", "region": "default"} |
+| 5d3e78d28cd511f18d5d67e68cb92881 | 2026-07-31 19:45:44 | qwen3-8b-embedding | 909c21f68cbd11f1aa37635d6e0f142c | sk-dqwMDlF1pCG_xxPF228_Vw | active | {"base_url": "http://10.208.137.53:8992/", "region": "default"} |
+2 rows in set (0.01 sec)
+```
+
+**Đọc được gì:**
+
+1. 🎯 **ENDPOINT TÌM ĐƯỢC: `http://10.208.137.53:8992/`** — API key `sk-dqwMDlF1pCG_xxPF228_Vw`.
+2. 🔴 **CẢ HAI instance (`LiteLLM` và `qwen3-8b-embedding`) dùng CÙNG MỘT `base_url`** ⟹ đây là
+   **LiteLLM gateway**, và embedding đi qua chính gateway đó. **Không có đường riêng cho retrieval.**
+3. **`10.208.137.53` là IP NODE, không phải ClusterIP** (ClusterIP là dải `172.16.x.x`, ví dụ MySQL
+   `172.16.138.99`) ⟹ LiteLLM chạy **ngoài namespace `ragflow`**, truy cập qua **NodePort 8992**.
+   Giải thích vì sao `get svc -n ragflow` không thấy nó.
+4. `tenant_id = 22cdb01e486a11f1ac9749e86cfe939a` **khớp chính xác** `tenant_id` trong log ingest ở 3.6
+   ⟹ xác nhận đúng tenant/luồng đang chạy, không phải cấu hình mồ côi.
+5. Cả 2 `status = active`.
+
+**⭐ Phân tích `EMBEDDING_BATCH_SIZE=16` (giả thuyết cơ chế, ❓ chưa verify):**
+
+Biến này áp cho **ingest**: mỗi lần `task_executor` gửi **16 chunk** lên embedding trong MỘT request.
+Log 3.6 `Embedding chunks (0.59s → 1.43s)` chính là thời gian cho **16 chunk một lượt**.
+
+Trong khi đó **retrieval chỉ cần embed 1 câu hỏi**. Nếu LiteLLM/backend xử lý **tuần tự (FIFO,
+không ưu tiên)**, request 1-câu của retrieval phải **đợi hết các batch 16-chunk đang xếp trước nó**.
+Với ingest ≥8 doc/23s, hàng đợi lúc nào cũng có việc ⟹ **thời gian chờ phụ thuộc đúng lúc đó hàng đợi
+dài bao nhiêu** ⟹ khớp hoàn hảo với dao động 2s↔28s và với CPU pod chỉ 10–20% (đang chờ, không tính).
+
+⟹ Gợi ra một fix rẻ chưa có trong danh sách: **giảm `EMBEDDING_BATCH_SIZE`** làm mỗi đơn vị công việc
+của ingest ngắn hơn ⟹ retrieval chờ ít hơn (cơ chế "nhường đường"). Đánh đổi: ingest chậm hơn chút.
+**PHẢI verify hàng đợi có tuần tự thật không** (phép đo song song ở 3.15) trước khi tin cơ chế này.
+
+---
+
 ## 4. Issue chi tiết — 1 ứng viên còn lại (embedding), 5 giả thuyết đã bị phủ định
 
 ### 4.0 Bảng tách tầng thời gian (số liệu thật, không suy đoán)
