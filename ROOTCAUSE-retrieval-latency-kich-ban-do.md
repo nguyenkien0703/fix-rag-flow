@@ -215,11 +215,68 @@ ps -eo pid,pcpu,nlwp,args
 ```
 </details>
 
-**Output:**
+**Output — ✅ ĐÃ CHẠY 2026-08-18 13:50:55, pod `ragflow-b68585df9-2dhbz`:**
 
 ```
-⏳ CHỜ OUTPUT
+=== 1. env concurrency ===
+EMBEDDING_BATCH_SIZE=16
+   (KHONG co THREAD_POOL_MAX_WORKERS)
+
+=== 2. thread pool THAT ===  /ragflow/common/misc_utils.py
+245:def _thread_pool_executor():
+246-    max_workers_env = os.getenv("THREAD_POOL_MAX_WORKERS", "128")
+247-    try:
+248-        max_workers = int(max_workers_env)
+249-    except ValueError:
+250-        max_workers = 128
+251-    if max_workers < 1:
+252-        max_workers = 1
+253-    return ThreadPoolExecutor(max_workers=max_workers)
+256-async def thread_pool_exec(func, *args, **kwargs):
+257-    # loop.run_in_executor() submits the callable without propagating the caller's
+
+=== 3. diem nghen tuan tu ===
+/ragflow/api/db/services/file_service.py:22:  from concurrent.futures import ThreadPoolExecutor
+/ragflow/api/db/services/file_service.py:625:   with ThreadPoolExecutor(max_workers=12) as exe:
+/ragflow/api/db/services/file_service.py:844:   with ThreadPoolExecutor(max_workers=5) as exe:
+/ragflow/api/db/db_models.py:622: class DatabaseLock(Enum):
+/ragflow/api/ragflow_server.py:57: redis_lock = RedisDistributedLock("update_progress", lock_value=lock_value, timeout=60)
+/ragflow/api/apps/services/canvas_replica_service.py:199: lock = RedisDistributedLock(
+/ragflow/api/channels/wecom/channel.py:153/165/514: asyncio.Lock()
+/ragflow/api/channels/whatsapp/*: asyncio.Lock()
+/ragflow/api/utils/file_utils.py:43: sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
+
+=== 4. process + so thread ===
+/ragflow/api/ragflow_server.py:165:
+    app.run(host=settings.HOST_IP, port=settings.HOST_PORT, use_reloader=RuntimeConfig.DEBUG, debug=False)
+
+--- ps ---
+PID %CPU NLWP COMMAND
+  1   0.0    1 bash ./entrypoint.sh --enable-adminserver
+ 23   0.0    1 bash ./entrypoint.sh --enable-adminserver
+ 25   5.8   10 python3 admin/server/admin_server.py
+ 26   0.0    1 nginx: master process /usr/sbin/nginx
+ 27-34 0.0   1 nginx: worker process  (×8)
+ 35   0.0    1 bash ./entrypoint.sh --enable-adminserver
+ 36   0.0    1 bash ./entrypoint.sh --enable-adminserver
 ```
+
+**Đọc được gì:**
+
+1. ✅ **Xác nhận: `THREAD_POOL_MAX_WORKERS` KHÔNG được set trong env** ⟹ dùng mặc định **128**.
+   Code trong container v0.26.4 **khớp y hệt** bản v0.24.0 local đã đọc (mục 1).
+   ⟹ Theo bảng dự đoán Đ1: **pool rộng ⟹ loại giả thuyết "pool nhỏ"**. Đ2 sau đó xác nhận lại.
+2. **Các `Lock` tìm thấy đều KHÔNG nằm trên đường retrieval:** `wecom`/`whatsapp` là channel chat
+   (không dùng), `RedisDistributedLock("update_progress")` thuộc luồng **ingest**,
+   `threading.Lock()` cho `pdfplumber` thuộc luồng **parse tài liệu**,
+   `ThreadPoolExecutor(max_workers=12/5)` trong `file_service.py` thuộc luồng **file/upload**.
+   ⟹ Không có lock/pool riêng nào chặn đường retrieval.
+3. `app.run(...)` — server chạy **Quart dev server, một process**, đúng như đã biết.
+4. 🔴 **BẤT THƯỜNG CẦN LÀM RÕ: `ps | head -15` KHÔNG thấy `ragflow_server.py` lẫn `task_executor`.**
+   Chỉ thấy `admin_server.py` (PID 25, NLWP=10) + 8 nginx worker + vài `entrypoint.sh`.
+   PID **48** (`ragflow_server`) và PID **445** (`task_executor`) — hai process được nhắc suốt các
+   phiên trước — **không xuất hiện**. Nguyên nhân có thể: `head -15` cắt mất, hoặc pod vừa restart
+   nên PID khác. ⟹ **Phải chạy lại `ps` không cắt** (xem Đ8).
 
 ---
 
@@ -313,14 +370,56 @@ Muc song song thuc te ≈ (5 × median cua A) / TONG_WALL_CLOCK
 - ≈ **2–3** ⟹ nghẽn một phần, đối chiếu con số với Đ1.
 </details>
 
-**Output:**
+**Output — ✅ ĐÃ CHẠY 2026-08-18 13:52–13:53, pod `ragflow-b68585df9-2dhbz` (AGE ~13 phút):**
 
 ```
-⏳ CHỜ OUTPUT
+=== A. 3 request TUAN TU ===   2026-08-18 13:52:43
+tuan_tu run=1 total=23.810
+tuan_tu run=2 total=10.377
+tuan_tu run=3 total=13.016
+
+=== B. 5 request SONG SONG === 2026-08-18 13:53:30
+song_song run=4 total=6.173
+song_song run=2 total=7.870
+song_song run=5 total=7.872
+song_song run=1 total=11.217
+song_song run=3 total=11.218
+TONG_WALL_CLOCK=11.251661563
 ```
 
-**Ghi chú thi hành:** nếu SSH qua VDI đứt giữa chừng (bài học 9 — `Connection closed` khi lệnh chạy
-lâu), giảm phần A xuống 2 vòng, hoặc bọc `nohup ... > /tmp/d2.log 2>&1 &` rồi đọc file.
+### 🔴🔴 KẾT LUẬN Đ2 — KHÔNG CÓ NGHẼN TUẦN TỰ. Loại 3 nghi phạm hàng đầu cùng lúc.
+
+**Tính theo đúng công thức đã định TRƯỚC:**
+
+```
+median cua A = 13.016s
+Muc song song thuc te = (5 × 13.016) / 11.2517 = 5.78
+```
+
+| Dự đoán viết trước | Ngưỡng | Thực tế | Khớp? |
+|---|---|---|---|
+| Song song hoàn hảo | ≈ 5 | **5.78** | ✅ **ĐÂY** |
+| Nối đuôi hoàn toàn | ≈ 1 | | ❌ |
+| Nghẽn một phần | 2–3 | | ❌ |
+
+**Đọc được gì:**
+
+1. ❌ **LOẠI: tranh GIL** (nghi phạm #1) · ❌ **LOẠI: event loop bị block** (#2) ·
+   ❌ **LOẠI: thread pool nhỏ** (#3). Cả ba đều dự báo request nối đuôi.
+   Nếu nghẽn tuần tự thì request cuối phải ≈ 5 × 13s ≈ **65s**; thực tế cả chùm xong trong **11.25s**.
+2. ⭐ **DỮ KIỆN ĐẮT NHẤT: request trong chùm SONG SONG lại NHANH HƠN khi chạy một mình.**
+   - Tuần tự (1 request/lần): 10.377 – 23.810s
+   - Song song (5 request/lần): **6.173 – 11.218s**
+   ⟹ **Tăng tải 5× mà latency GIẢM.** Mọi giả thuyết tranh chấp tài nguyên đều dự báo ngược lại
+   (thêm tải ⟹ chậm hơn). ⟹ **Độ chậm KHÔNG đến từ tải, cũng không đến từ tranh chấp.**
+3. ⚠️ **GIẢ THUYẾT "TRANH GIL" CỦA TÔI Ở LƯỢT TRƯỚC LÀ SAI** — và sai đúng kiểu Bài học 0d:
+   suy từ cấu trúc code (`ThreadPoolExecutor(128)` + `@once` singleton) sang latency mà chưa đo.
+   **Đây là lần thứ 4 của mẫu sai này.** Ghi lại để không tái phạm.
+4. 🔴 **Pod mới ~13 phút tuổi vẫn chậm 23.8s** ⟹ ❌ **LOẠI luôn giả thuyết "tích tụ theo uptime"**
+   (Đ7 coi như đã trả lời). Nghẽn mang tính **CẤU TRÚC**, có ngay từ lúc khởi động.
+5. ⟹ **Không gian nghi phạm còn lại thu hẹp mạnh:** thứ gây chậm phải là cái mà **mỗi request tự
+   chờ một cách độc lập**, không xếp hàng với nhau, không tranh nhau — và **rẻ hơn khi làm hàng loạt**
+   (điểm 2 gợi ý có **cache/kết nối được hâm nóng** khi request đi liền nhau).
 
 ---
 
@@ -612,11 +711,90 @@ Anh Cường báo issue là **"không ổn định"** ⟹ giảm median mà biê
 
 ## 5. Bảng nghi phạm hiện tại (cập nhật sau mỗi phép đo)
 
-| # | Nghi phạm | Khớp D1? | Khớp D2? | Khớp D3? | Trạng thái |
-|---|---|---|---|---|---|
-| 1 | **Tranh GIL** giữa 128 thread của pool dùng chung | ✅ | ✅ | ✅ | ❓ chờ Đ1+Đ2 |
-| 2 | **Event loop bị block** bởi lời gọi sync trong coroutine | ✅ | ✅ | ✅ | ❓ chờ Đ2 |
-| 3 | Thread pool `max_workers` **nhỏ** | ✅ | ✅ | ✅ | ⚠️ **yếu đi** — source cho thấy mặc định 128 (mục 1) |
-| 4 | **MySQL** chậm/khoá | ✅ | — chưa đo | ✅ | ❓ chờ Đ6 — đích I/O DUY NHẤT chưa đo |
-| 5 | MinIO trong đường retrieval | ✅ | — chưa đo | ✅ | ❓ chưa kiểm có nằm trong đường không |
-| — | *15 giả thuyết đã bị phủ định* | | | | ❌ xem bảng "đường cụt" ở `TRACKING-api-retrieval-latency.md` mục 4.6 — **KHÔNG lặp lại** |
+**Cập nhật sau Đ1 + Đ2 (2026-08-18 13:53):**
+
+| # | Nghi phạm | Trạng thái |
+|---|---|---|
+| 1 | ~~**Tranh GIL** giữa 128 thread~~ | ❌ **LOẠI (Đ2)** — mức song song thực tế **5.78**, không nối đuôi |
+| 2 | ~~**Event loop bị block**~~ | ❌ **LOẠI (Đ2)** — cùng lý do; nếu block thì 5 request phải nối đuôi ≈65s |
+| 3 | ~~Thread pool `max_workers` nhỏ~~ | ❌ **LOẠI (Đ1+Đ2)** — env không set ⟹ 128; và Đ2 không thấy nghẽn |
+| — | ~~Tích tụ theo uptime~~ | ❌ **LOẠI (Đ2)** — pod mới 13 phút vẫn chậm 23.8s ⟹ Đ7 coi như đã trả lời |
+| 4 | **MySQL** chậm/khoá | ❓ **NGHI PHẠM SỐ 1 HIỆN TẠI** — đích I/O DUY NHẤT chưa đo (Đ6) |
+| 5 | MinIO trong đường retrieval | ❓ chưa kiểm có nằm trong đường không |
+| 6 | 🆕 **Chi phí per-request độc lập** (mỗi request tự trả, không tranh nhau) | ❓ **khớp Đ2 chặt nhất** — xem Đ8/Đ9 |
+| — | *15 giả thuyết cũ đã bị phủ định* | ❌ xem bảng "đường cụt" ở `TRACKING-api-retrieval-latency.md` mục 4.6 — **KHÔNG lặp lại** |
+
+### 🔴 Ràng buộc MỚI từ Đ2 — mọi giả thuyết từ đây phải thỏa thêm D4/D5
+
+| # | Dữ kiện mới | Nguồn |
+|---|---|---|
+| **D4** | **Không có nghẽn tuần tự** — 5 request đồng thời xong trong thời gian của 1 request (song song 5.78×) | Đ2 |
+| **D5** | ⭐ **Tăng tải 5× thì latency GIẢM** (10.4–23.8s → 6.2–11.2s) | Đ2 |
+
+**D5 rất mạnh và rất lạ.** Nó loại **toàn bộ** họ giả thuyết "tranh chấp tài nguyên" (thêm tải phải
+chậm hơn, không thể nhanh hơn). Và nó gợi ý cơ chế ngược: có thứ gì đó **được hâm nóng / tái sử dụng**
+khi các request đi liền nhau — cache, connection pool đã ấm, JIT, hoặc lazy-init được trả một lần
+rồi dùng chung.
+
+⟹ Nghi phạm mới đáng giá nhất: **một chi phí khởi tạo/làm nguội xảy ra khi request đi RỜI RẠC**
+(cache hết hạn, connection bị đóng do idle timeout rồi phải mở lại, model/tokenizer bị load lại).
+
+---
+
+## Đ8 — Liệt kê ĐẦY ĐỦ process + thread (làm rõ bất thường của Đ1 điểm 4)
+
+`ps | head -15` ở Đ1 **không thấy** `ragflow_server.py` lẫn `task_executor`. Phải xem trọn danh sách.
+
+**Dự đoán viết TRƯỚC (R1):**
+
+| Kết quả | Suy ra |
+|---|---|
+| Thấy `ragflow_server.py` với `NLWP` lớn (>100) | Pool 128 đang được dùng thật ⟹ khớp Đ2 (song song tốt) |
+| Thấy `ragflow_server.py` với `NLWP` nhỏ (<20) | Pool hầu như không dùng ⟹ đường retrieval chủ yếu là async, không qua thread pool |
+| **Không có `task_executor` trong pod này** | 🔴 Ingest chạy ở pod KHÁC ⟹ **giả thuyết "retrieval tranh tài nguyên với ingest cùng pod" (Issue 4) sụp đổ** |
+
+```bash
+POD=ragflow-b68585df9-2dhbz
+kubectl -n ragflow exec "$POD" -c ragflow -- sh -c 'ps -eo pid,pcpu,pmem,nlwp,etime,args --sort=-pcpu'
+```
+
+**Output:**
+
+```
+⏳ CHỜ OUTPUT
+```
+
+---
+
+## Đ9 — ⭐ PHÉP THỬ KHOẢNG NGHỈ: kiểm chứng D5 (tải cao lại nhanh hơn)
+
+**Đây là phép đo phân định mạnh nhất tiếp theo**, vì nó nhắm thẳng vào D5 — dữ kiện lạ nhất đang có.
+
+**Giả thuyết cần thử:** độ chậm tỉ lệ với **khoảng nghỉ TRƯỚC request**, chứ không phải với tải.
+Nếu đúng ⟹ có thứ gì đó **nguội đi khi rảnh** (connection idle-timeout rồi phải bắt tay lại,
+cache TTL hết hạn, lazy re-init).
+
+**Dự đoán viết TRƯỚC (R1):**
+
+| Kết quả | Suy ra |
+|---|---|
+| **Nghỉ càng lâu ⟹ càng chậm** (0s nhanh, 60s chậm) | 🔴 **CHỐT cơ chế "nguội khi rảnh"** ⟹ đi tìm cái gì có TTL/idle-timeout đúng khoảng đó |
+| Latency **không phụ thuộc** khoảng nghỉ | ❌ Loại; D5 chỉ là ngẫu nhiên do cỡ mẫu nhỏ ⟹ quay lại Đ6 (MySQL) |
+
+```bash
+TOKEN='ragflow-2KB-U6NBJYU62kIUtOhRv-kAL-LbhPmXaPbZfPPEaEw'
+URL='http://10.208.137.54:8999/api/v1/retrieval'
+BODY='{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6}'
+
+for gap in 0 0 5 5 15 15 30 30 60 60; do
+  sleep $gap
+  curl -s -o /dev/null -w "gap=${gap}s total=%{time_total}\n" -X POST "$URL" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY"
+done
+```
+
+**Output:**
+
+```
+⏳ CHỜ OUTPUT
+```
