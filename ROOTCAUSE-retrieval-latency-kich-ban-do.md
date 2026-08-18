@@ -1120,3 +1120,200 @@ sh: 1: py-spy: not found
 | **Redis** | Dùng cho cache + task queue, ingest đang bơm nặng | timing quanh lời gọi Redis |
 | **MinIO** | Log ingest cho thấy `MINIO PUT ... cost 0.168s` — retrieval có đọc không? | timing quanh lời gọi MinIO |
 | **`asyncio` ↔ thread pool** | `thread_pool_exec` chuyển đổi context; Đ2 đo parallelism tốt nhưng chưa đo **thời gian chờ được xếp lịch** | timing trước/sau `run_in_executor` |
+
+---
+
+# 8. LIFE CYCLE 1 REQUEST `/api/v1/retrieval` — ĐỌC TỪ SOURCE **v0.26.4** (đúng version đang chạy)
+
+> ⚠️ Trước mục này, mọi phân tích source đều dựa trên `ragflow-0.24.0` — **SAI VERSION**.
+> Đã clone `git clone --depth 1 --branch v0.26.4 https://github.com/infiniflow/ragflow.git ragflow-0.26.4`.
+> Cấu trúc v0.26.4 khác hẳn: **không còn** `api/apps/sdk/`, thay bằng `api/apps/restful_apis/`.
+
+## 8.1 Đường đi đầy đủ
+
+```
+POST /api/v1/retrieval
+│
+├─ [api/apps/restful_apis/chunk_api.py:314] async def retrieval_test(tenant_id)
+│  │
+│  │  ── GIAI ĐOẠN 1: VALIDATE + LOAD METADATA (toàn bộ là DB, KHÔNG log) ──
+│  ├─ :322  KnowledgebaseService.accessible()          → SQL, LẶP theo từng kb_id
+│  ├─ :324  KnowledgebaseService.get_by_ids(kb_ids)    → SQL
+│  ├─ :342  KnowledgebaseService.list_documents_by_ids() → SQL (chỉ khi có document_ids)
+│  ├─ :349  DocMetadataService.get_flatted_meta_by_kbs() → SQL (chỉ khi có metadata_condition)
+│  ├─ :374  KnowledgebaseService.get_by_id(kb_ids[0])  → SQL
+│  ├─ :377  get_model_config_from_provider_instance()  → SQL (config embedding)
+│  ├─ :382  get_model_config_from_provider_instance()  → SQL (config rerank, nếu có)
+│  ├─ :404  label_question(question, kbs)              → chỉ chạy nếu kb có `tag_kb_ids`
+│  │
+│  │  ── GIAI ĐOẠN 2: RETRIEVAL LÕI ──
+│  ├─ :391  await settings.retriever.retrieval(...)
+│  │   │
+│  │   ├─ [rag/nlp/search.py:576] RERANK_LIMIT = _rerank_window(page_size, top)
+│  │   │      page_size=30 ⟹ window = ceil(64/30)*30 = 90
+│  │   │      ⚠️ nếu CÓ rerank_mdl thì bị chặn bởi `top` (mặc định 1024)
+│  │   │
+│  │   ├─ :596  await self.search(req, ...)
+│  │   │   ├─ :56   await thread_pool_exec(emb_mdl.encode_queries, txt)   ← embedding (ĐÃ LOẠI, 150ms)
+│  │   │   └─ :195/213/220/225  await thread_pool_exec(dataStore.search)  ← 🔵 `_search` #1 (ĐÃ LOẠI)
+│  │   │
+│  │   ├─ :599  await self._prune_deleted_chunks(sres)
+│  │   │   └─ :87 → :64 `_existing_doc_ids()`
+│  │   │       └─ :73 `DocumentService.get_by_ids(unique_doc_ids)`
+│  │   │            🔴🔴 SQL `WHERE id IN (...)` với TỚI 90+ doc_id
+│  │   │            🔴🔴 KHÔNG CÓ LOG · KHÔNG ĐO ĐƯỢC TỪ NGOÀI
+│  │   │
+│  │   ├─ :646  await self._knn_scores(sres, idx_names, kb_ids)
+│  │   │   └─ :382 await thread_pool_exec(dataStore.search)  ← 🔵 `_search` #2 (0.21–0.30s, ổn định)
+│  │   │      ⭐ ĐÂY LÀ LỜI GIẢI cho câu hỏi "tại sao có 2 lần _search"
+│  │   │
+│  │   └─ :656-677  numpy argsort + lọc ngưỡng (CPU thuần, nhanh)
+│  │
+│  │  ── GIAI ĐOẠN 3: HẬU XỬ LÝ ──
+│  ├─ :411  settings.retriever.retrieval_by_children(chunks, tenant_ids)
+│  │   └─ :924 `self.dataStore.get(id, ...)` trong VÒNG LẶP — 🔴 **ĐỒNG BỘ, N+1**
+│  │            (mỗi `mom_id` = 1 lời gọi ES riêng; KHÔNG qua thread_pool)
+│  ├─ :422  enrich_chunks_with_document_metadata()   → SQL (chỉ khi bật reference_metadata)
+│  └─ :424+ map key, trả JSON
+```
+
+## 8.2 ⭐ Giải đáp: TẠI SAO CÓ ĐÚNG 2 LẦN `_search`
+
+Câu hỏi Kiên đặt ra từ đầu phiên, nay có đáp án từ source (`search.py:641-654`):
+
+```python
+# ES path: ask ES for the clean cosine score via a second
+# KNN-only call filtered by the candidate ids, then merge it
+# with locally computed term similarity using the user's weight.
+knn_scores = await self._knn_scores(sres, idx_names, kb_ids)
+```
+
+| Lần | Vị trí | Mục đích | Số đo thực tế |
+|---|---|---|---|
+| #1 | `search.py:195/213/225` qua `self.search()` | Hybrid search (full-text + kNN) lấy ~90 ứng viên | **0.754 – 5.849s** (dao động 7.7×) |
+| #2 | `search.py:382` qua `self._knn_scores()` | Gọi lại kNN CHỈ trên các id vừa tìm được, để lấy điểm cosine sạch | **0.212 – 0.302s** (rất ổn định) |
+
+⟹ Kiến trúc bình thường của v0.26.4, **không phải bug**. Cả hai đều đã loại ở mục 7.3.
+
+## 8.3 🔴 NGHI PHẠM SỐ 1 — `_prune_deleted_chunks` → `DocumentService.get_by_ids()`
+
+```python
+# rag/nlp/search.py:64-75
+async def _existing_doc_ids(self, doc_ids: list[str]) -> set[str]:
+    unique_doc_ids = list(dict.fromkeys(doc_ids))
+    def _load():
+        from api.db.services.document_service import DocumentService
+        return {row["id"] for row in DocumentService.get_by_ids(unique_doc_ids).dicts()}
+    return await thread_pool_exec(_load)
+```
+
+Chạy **mỗi request**, ngay sau `_search` #1 (`search.py:599`).
+
+**Vì sao nó khớp với 4 đặc điểm của "phần chưa xác định" (mục 7.9):**
+
+| Đặc điểm đã đo | `DocumentService.get_by_ids()` có khớp? |
+|---|---|
+| Chiếm 24–93% tổng thời gian | ✅ Có thể — không có trần thời gian, không timeout |
+| **Không tiêu CPU** (11%/8 core) | ✅ Đúng — thread ngồi chờ DB trả lời, không tính toán |
+| **Không xuất hiện trong log nào** | ✅ Đúng — **Peewee KHÔNG log duration**, khác hẳn `elasticsearch-py` |
+| Dao động theo trạng thái ingest | ✅ Đúng — **cùng DB mà ingest đang ghi liên tục** (`set_progress`, `handle_task done` bắn liên tục trong log) |
+
+**Cơ chế nghi ngờ:**
+1. `sres` chứa tới **90 chunk** (RERANK_LIMIT=90) ⟹ SQL `WHERE id IN (~90 giá trị)`
+2. Bảng `document` đang bị ingest **ghi liên tục** — log 3.6 cho thấy `set_progress()` bắn mỗi vài chục ms
+3. Nếu bảng thiếu index phù hợp, hoặc bị lock/vacuum, hoặc connection pool cạn ⟹ **query xếp hàng**
+4. Thời gian xếp hàng **dao động** theo mật độ ghi của ingest ⟹ giải thích 2s ↔ 22s
+
+**⭐ Chú thích trong chính source:** hàm này được đánh dấu là
+> `# Temporary safety net` ... `Keep this as a fallback, not as the primary delete mechanism.`
+
+⟹ Đây là **lớp vá tạm**, không phải chức năng lõi. Nếu nó là thủ phạm thì có thể **tắt/tối ưu mà không ảnh hưởng nghiệp vụ**.
+
+## 8.4 🟠 NGHI PHẠM SỐ 2 — `retrieval_by_children` gọi ES kiểu N+1 ĐỒNG BỘ
+
+```python
+# rag/nlp/search.py:922-924
+for id, cks in mom_chunks.items():
+    chunk = self.dataStore.get(id, idx_nms[0], [ck["kb_id"] for ck in cks])   # ← đồng bộ, trong vòng lặp
+```
+
+- Gọi từ `chunk_api.py:411`, **sau** `retrieval()`
+- `self.dataStore.get()` — **không** bọc `thread_pool_exec` ⟹ chạy **đồng bộ, chặn event loop**
+- Mỗi `mom_id` một lời gọi ES riêng ⟹ **N+1**
+- Chỉ kích hoạt khi chunk có field `mom_id` (parent-child chunking)
+
+⚠️ Nhưng nghi phạm này **có thể tự loại**: `dataStore.get()` đi qua `elasticsearch-py`
+⟹ **phải có log** `[status:200 duration:...]`. Log đã bắt được không thấy hàng loạt lời gọi kiểu này
+⟹ nhiều khả năng KB này không dùng parent-child chunking. **Cần xác nhận.**
+
+## 8.5 🟡 NGHI PHẠM SỐ 3 — Chuỗi truy vấn DB ở GIAI ĐOẠN 1
+
+Trước khi chạm tới ES lần nào, handler đã gọi **5–7 câu SQL** (`chunk_api.py:322, 324, 374, 377, 382`).
+Dòng `:322` nằm **trong vòng lặp** theo `kb_id`. Tất cả đều **không log**.
+
+Cùng một cơ chế với nghi phạm #1: cùng DB, cùng bị ingest ép tải.
+
+## 8.6 ⟹ KẾT LUẬN: TẤT CẢ ĐỀU CHỈ VỀ **DATABASE**
+
+Ba nghi phạm thì hai (#1, #3) là **PostgreSQL**, và đó chính là tầng duy nhất trong toàn bộ
+life cycle **chưa từng được đo suốt 5 phiên** — vì Peewee không log duration, khác với
+`elasticsearch-py` (log sẵn) và `urllib3` (log sẵn).
+
+**Đây giải thích trọn vẹn nghịch lý trung tâm:** "mọi backend đo được đều nhanh, nhưng tổng vẫn chậm"
+— vì backend chậm nhất là backend **không đo được**.
+
+## 8.7 BƯỚC ĐO TIẾP THEO (ưu tiên theo thứ tự)
+
+### Đ14 — Đo DB trực tiếp (KHÔNG cần build lại image) 🟢 ƯU TIÊN CAO NHẤT
+
+```bash
+# 1. Tìm DB đang dùng
+POD=$(kubectl -n ragflow get pods -l app.kubernetes.io/component=ragflow -o jsonpath='{.items[0].metadata.name}')
+kubectl -n ragflow exec "$POD" -c ragflow -- sh -c 'grep -A8 -iE "^postgres|^mysql|^oracle" /ragflow/conf/service_conf.yaml'
+
+# 2. Đo chính câu SQL mà _existing_doc_ids sinh ra, 10 lần, LÚC INGEST ĐANG CHẠY
+#    (thay <HOST> <USER> <DB> theo output bước 1)
+kubectl -n ragflow exec "$POD" -c ragflow -- sh -c '
+python3 -W ignore -c "
+import time
+from api.db.services.document_service import DocumentService
+from api.db.services.knowledgebase_service import KnowledgebaseService
+kb=\"73932b965e5e11f192725fd51894c519\"
+ids=[r[\"id\"] for r in KnowledgebaseService.list_documents_by_ids([kb])[:90]] if hasattr(KnowledgebaseService,\"list_documents_by_ids\") else []
+print(\"n_ids=\",len(ids))
+for i in range(10):
+    s=time.time()
+    n=len({r[\"id\"] for r in DocumentService.get_by_ids(ids).dicts()})
+    print(\"run=%d rows=%d t=%.3fs\"%(i,n,time.time()-s))
+"'
+```
+
+**Dự đoán khả chứng (viết TRƯỚC khi chạy, theo rule R1):**
+- Nếu DB là thủ phạm ⟹ thời gian dao động mạnh (vài trăm ms → nhiều giây), biên độ ≥5×
+- Nếu DB vô can ⟹ ổn định <100ms mọi lần ⟹ **loại DB, quay lại nghi phạm #2**
+
+### Đ15 — Đếm connection tới DB + kiểm tra pool
+
+```bash
+kubectl -n ragflow exec "$POD" -c ragflow -- sh -c 'grep -riE "max_connections|pool|POOL_SIZE" /ragflow/conf/service_conf.yaml; env | grep -iE "pool|db_"'
+```
+
+Nếu pool nhỏ (mặc định Peewee thường 8–32) mà ingest chiếm gần hết ⟹ retrieval phải **chờ lấy connection**
+— thời gian chờ này **không phải thời gian query**, và cũng **hoàn toàn vô hình**. Đây là cơ chế khớp
+nhất với dao động 12×.
+
+### Đ16 — Nếu DB vô can: bật `PYTHONFAULTHANDLER` để dump stack
+
+```bash
+kubectl -n ragflow set env deploy/ragflow PYTHONFAULTHANDLER=1
+# doi rollout, roi lúc request đang chậm:
+kubectl -n ragflow exec "$POD" -c ragflow -- sh -c 'kill -ABRT 25'
+```
+
+## 8.8 Cập nhật danh sách bàn giao anh Cường
+
+| Việc | Trạng thái mới |
+|---|---|
+| Chèn timing `rag/nlp/search.py` | 🔽 **Hạ ưu tiên** — Đ14 có thể kết luận mà không cần build image |
+| Thêm `py-spy` vào image | 🔽 Hạ ưu tiên — chỉ cần nếu Đ14 + Đ15 đều âm tính |
+| **Log duration cho Peewee** | 🔼 **MỚI, ưu tiên cao** — đây là lỗ hổng quan sát gốc rễ khiến 5 phiên không kết luận được |
