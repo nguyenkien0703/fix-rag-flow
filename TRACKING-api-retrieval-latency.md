@@ -22,16 +22,21 @@ query, lúc trả về **~2s**, lúc **>20s**.
 > - **A. Embedding query xếp hàng sau ingest** → gây **BẤT ỔN ĐỊNH**. Retrieval phải embed câu hỏi
 >   qua `qwen3-8b-embedding`, cùng endpoint mà `task_executor` đang bơm liên tục (≥8 doc/23s,
 >   0.59–1.43s mỗi batch), **cùng pod, cùng KB**.
-> - **B. `topk=1024` mặc định** (`search.py:142`) → gây **CHẬM CƠ BẢN**. 1024 candidate kéo về
->   Python (đo được **287 ES query/request**) nhưng chỉ trả về **10 chunk** → 99% công bỏ đi.
-> - **C. Re-tokenize + rerank 1024 candidate trong Python** (`search.py:299/434/461`), CPU-bound,
->   cùng CPU limit với ingest. Image custom cài **`pyvi`** → tokenizer tốt hơn nhưng nặng CPU hơn.
+> - ~~**B. `topk=1024`**~~ và ~~**C. rerank/re-tokenize CPU-bound**~~ → ❌ **ĐÃ BỊ PHỦ ĐỊNH (3.11–3.13).**
+>   A/B xen kẽ 8 cặp: `topk=256` **không nhanh hơn** (mean 13.9s vs 15.8s, thắng/thua 4–4, và `topk=1024`
+>   cho 2 lần nhanh nhất toàn phép đo: 2.15s/2.96s). Kết quả trả về **y hệt** (cùng 10 chunk, cùng
+>   thứ tự). **CPU pod chỉ 10–20%** (Kiên quan sát) ⟹ không có tầng nào CPU-bound.
+>
+> **⟹ CPU 10–20% là mấu chốt: 15 giây đó là thời gian CHỜ (I/O wait), không phải thời gian TÍNH.**
+> Đã loại trừ hết: ES (<1ms), network client (6ms), payload (270KB), CPU nội bộ (10–20%).
+> **Chỉ còn MỘT ứng viên: lời gọi `qwen3-8b-embedding` qua API ngoài.**
 >
 > **Vì sao mọi fix trước thất bại:** `minimum_should_match` giảm số doc ES match — nhưng ES vốn
 > không phải bottleneck. **Nhắm sai tầng suốt 3 phiên.**
 >
-> **Fix dứt điểm (mục 4.5):** Fix 1 tách `task_executor` khỏi pod API (giải quyết bất ổn định) +
-> Fix 2 giảm `topk` 1024→256 (giải quyết chậm cơ bản, thử được ngay không cần deploy).
+> **Fix (mục 4.5):** **Fix 3 tách/scale endpoint embedding là fix CHÍNH** (contention ở embedding
+> service, không ở CPU pod) + Fix 1 tách `task_executor` + Fix 4 giảm cường độ ingest.
+> ❓ **Còn phải verify:** đo trực tiếp latency `qwen3-8b-embedding` khi ingest chạy vs khi nghỉ.
 
 ### Bối cảnh hệ thống
 
@@ -55,8 +60,9 @@ query, lúc trả về **~2s**, lúc **>20s**.
 | 3 | Latency tại scale MỚI (1.9M doc) dao động mạnh 1.98s-28.2s (30 mẫu thật, 3.2) — nghi bottleneck ở ES do scale (index/shard/HNSW/GC) | Cao | ✅ **LOẠI TRỪ (3.7/3.8)** — ES stats thật: query trung bình **<1ms** trên node chính, tệ nhất 4.4ms. Delta 1 request retrieval = ~287 query / ~1.74s ES trong tổng 3.6s. ES **không** phải bottleneck | Đóng hướng ES. Chuyển toàn bộ sang tầng Python (Issue 5/6/7) |
 | 4 | Retrieval tranh tài nguyên với luồng **ingest liên tục** từ bên đẩy tài liệu (Kiên nêu) | Cao | ✅ **XÁC NHẬN (3.6)** — nhưng contention KHÔNG ở ES/worker API mà ở **CPU pod + embedding service**. Log: `task_executor` (PID 445) xử lý ≥8 doc/23s liên tục, `Embedding chunks (0.59s→1.43s)` nối nhau, cùng KB đang test, cùng pod với `ragflow_server` (PID 48) | Fix 1: tách `task_executor` ra deployment riêng |
 | 5 | 🔴 **ROOT CAUSE A — Embedding query bị xếp hàng sau ingest.** Mỗi retrieval gọi `emb_mdl.encode_queries` (`search.py:56`) / `get_vector` (`:199`) tới `qwen3-8b-embedding` qua API ngoài | Cao | 🔴 **CHỐT (3.6 + source)** — cùng embedding service đang bị ingest bơm liên tục 0.59-1.43s/batch → retrieval phải đợi. Giải thích trực tiếp dao động 2s↔28s | Fix 1 + Fix 3 (tách/scale embedding endpoint) |
-| 6 | 🔴 **ROOT CAUSE B — `topk=1024` mặc định.** `search.py:142` `topk = int(req.get("topk", 1024))` → ES trả 1024 candidate về Python mỗi request | Cao | 🔴 **CHỐT (source + 3.8)** — khớp với ~287 ES query/request. 1024 candidate phải qua rerank + re-tokenize + numpy trong Python | Fix 2: giảm `topk` 1024 → 256 (cắt 4× tải Python) |
-| 7 | 🔴 **ROOT CAUSE C — Re-tokenize 1024 chunk trong Python mỗi request.** `search.py:299` `rag_tokenizer.tokenize(...)` chạy trên toàn bộ chunk trả về; `:434/:461` `rerank`/`rerank_with_knn` + numpy | Cao | 🔴 **CHỐT (source)** — CPU-bound, chạy TRONG CÙNG process/pod với `task_executor`. Image custom có cài **`pyvi`** (ảnh 3.5) → tokenizer tiếng Việt tốt hơn nhưng **nặng CPU hơn** | Fix 1 (hết tranh CPU) + Fix 2 (giảm số chunk phải tokenize) |
+| 6 | ~~ROOT CAUSE B — `topk=1024`~~ | — | ❌ **PHỦ ĐỊNH (3.11/3.12)** — A/B xen kẽ 8 cặp: `topk=256` KHÔNG nhanh hơn (mean 13.9 vs 15.8s, thắng/thua 4–4; `topk=1024` cho 2 lần nhanh nhất 2.15s/2.96s). Kết quả trả về y hệt (cùng 10 chunk, cùng thứ tự) | Đóng hướng. Không cần sửa `topk` |
+| 7 | ~~ROOT CAUSE C — re-tokenize/rerank CPU-bound~~ | — | ❌ **PHỦ ĐỊNH (3.13)** — **CPU pod chỉ 10–20%** (Kiên quan sát trực tiếp). Nếu tokenize/rerank 1024 candidate thì CPU phải cao. Khớp với 3.11/3.12 | Đóng hướng. `pyvi` không phải vấn đề hiệu năng |
+| 9 | 🔴 **HỆ QUẢ TỪ CPU 10–20%: latency là I/O WAIT, không phải CPU.** Sau khi loại ES (<1ms), network client (6ms), payload (270KB), CPU (10–20%) ⟹ chỉ còn lời gọi **`qwen3-8b-embedding` qua API ngoài** | Cao | 🔴 **ỨNG VIÊN DUY NHẤT CÒN LẠI** — logic loại trừ đã đóng kín, nhưng ❓ **chưa đo trực tiếp** embedding service | Đo latency embedding trực tiếp khi ingest chạy vs nghỉ (việc tiếp theo) |
 | 8 | Giả thuyết `metadata_condition contains` gây N+1 / filter-in-Python | Cao | ❌ **PHỦ ĐỊNH (3.9)** — bỏ hẳn `metadata_condition` KHÔNG nhanh hơn, còn **chậm hơn** (14.2s/19.2s vs 3.6-10.2s) | Đóng hướng này. Ghi vào Bài học |
 
 ## 3. Lệnh đã chạy
@@ -833,7 +839,144 @@ ImportError: cannot import name 'REDIS_CONN' from partially initialized module '
    ⟹ 287 query đến từ **`topk=1024` chia trên shard**, không phải từ vòng lặp trong `es_conn.py`.
 
 
-## 4. Issue chi tiết — ROOT CAUSE ĐÃ CHỐT
+### 3.11 ⭐ PHÉP THỬ A/B XEN KẼ: `topk=1024` vs `topk=256` — ✅ ĐÃ CHẠY, Fix 2 bị LOẠI BỎ
+
+**Vì sao phải xen kẽ, không đo rời:** baseline dao động 1.98–28.2s. Đo 5 lần `topk=256` rồi so với
+5 lần `topk=1024` đo lúc khác ⟹ chênh lệch sẽ bị tải ingest chi phối, không đọc được gì. Chạy **hai
+request trong CÙNG một vòng lặp**, cách nhau vài giây ⟹ cùng điều kiện tải ⟹ so được **từng cặp**.
+
+Chạy trên `vrp-kubeengine04` (1 vòng lặp, 2 curl liên tiếp mỗi vòng — body giống hệt nhau, chỉ khác
+`"topk":256`):
+
+```
+for i in 1 2 3 4 5 6 7 8; do curl -s -o /dev/null -w "topk1024 run=$i total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <REDACTED>' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"metadata_condition":{"logic":"and","conditions":[{"name":"listuserview_useridtwo","comparison_operator":"contains","value":"900034475"}]}}'; curl -s -o /dev/null -w "topk256  run=$i total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <REDACTED>' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"topk":256,"metadata_condition":{"logic":"and","conditions":[{"name":"listuserview_useridtwo","comparison_operator":"contains","value":"900034475"}]}}'; done
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| 2 `curl` trong 1 vòng `for` | ⭐ **điểm quyết định của phép thử** — đảm bảo cả hai chịu cùng tải ingest. Nếu tách 2 loop riêng thì kết quả vô giá trị |
+| `"topk":256` | biến DUY NHẤT thay đổi giữa 2 request. `search.py:142` đọc `req.get("topk", 1024)` ⟹ client gửi thì override được default, **không cần deploy/sửa code** |
+| `-o /dev/null` | bỏ body, chỉ cần timing |
+| 8 vòng | đủ để thấy xu hướng qua nhiễu; 4-5 vòng thì một outlier đủ làm lệch kết luận |
+
+**Output:**
+
+```
+topk1024 run=1 total=13.121
+topk256  run=1 total=19.135
+topk1024 run=2 total=2.151
+topk256  run=2 total=10.261
+topk1024 run=3 total=21.033
+topk256  run=3 total=4.998
+topk1024 run=4 total=27.170
+topk256  run=4 total=13.103
+topk1024 run=5 total=14.207
+topk256  run=5 total=16.340
+topk1024 run=6 total=2.957
+topk256  run=6 total=17.375
+topk1024 run=7 total=19.835
+topk256  run=7 total=15.267
+topk1024 run=8 total=25.514
+topk256  run=8 total=14.777
+```
+
+**So sánh từng cặp:**
+
+| run | topk=1024 | topk=256 | Nhanh hơn |
+|---|---|---|---|
+| 1 | 13.121 | 19.135 | 1024 |
+| 2 | **2.151** | 10.261 | 1024 |
+| 3 | 21.033 | 4.998 | 256 |
+| 4 | 27.170 | 13.103 | 256 |
+| 5 | 14.207 | 16.340 | 1024 |
+| 6 | **2.957** | 17.375 | 1024 |
+| 7 | 19.835 | 15.267 | 256 |
+| 8 | 25.514 | 14.777 | 256 |
+| **Mean** | **15.75s** | **13.91s** | — |
+
+**Đọc được gì:**
+
+1. ❌ **`topk` KHÔNG PHẢI NGUYÊN NHÂN — Fix 2 BỊ LOẠI BỎ.** Thắng/thua chia **4–4**. Chênh mean 12%
+   (15.75 vs 13.91) **nằm hoàn toàn trong nhiễu** — biên độ nội tại của mỗi nhóm còn lớn hơn nhiều
+   (1024: 2.15→27.17 = 12.6×; 256: 5.00→19.14 = 3.8×).
+2. **`topk=1024` cho 2 lần NHANH NHẤT toàn bộ phép đo** (2.151s và 2.957s) — nhanh hơn *mọi* lần đo
+   `topk=256`. Nếu `topk` là nguyên nhân thì điều này không thể xảy ra.
+3. ⟹ **Xử lý 768 candidate dư (1024−256) rẻ đến mức không đo được.** Root cause B và C **bị phủ định**.
+
+---
+
+### 3.12 Verify recall giữa `topk=1024` và `topk=256` — ✅ ĐÃ CHẠY
+
+```
+curl -s -X POST '...' -d '{... KHONG co topk ...}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('\n'.join(f\"{c['id'][:12]} sim={c['similarity']:.4f}\" for c in d['data']['chunks']))" > /tmp/r1024.txt
+```
+
+```
+curl -s -X POST '...' -d '{... "topk":256 ...}' | python3 -c "..." > /tmp/r256.txt
+```
+
+```
+diff /tmp/r1024.txt /tmp/r256.txt && echo "GIONG NHAU HOAN TOAN - topk=256 an toan" || echo "CO KHAC BIET - xem diff tren"
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `c['id'][:12]` | cắt 12 ký tự đầu chunk-id — đủ phân biệt, dễ đọc, dễ diff |
+| `sim={...:.4f}` | in similarity 4 chữ số thập phân — để phát hiện khác biệt nhỏ về scoring |
+| `diff A B && echo ... \|\| echo ...` | `&&` chạy khi diff exit 0 (giống nhau), `\|\|` chạy khi exit≠0 (khác) ⟹ tự in kết luận |
+
+**Output:**
+
+```
+5fab1cc9ec8a sim=0.7104        (r1024)  |  5fab1cc9ec8a sim=0.7105  (r256)
+bfec6db16566 sim=0.5599                 |  bfec6db16566 sim=0.5599
+df8cd55deb60 sim=0.5399                 |  df8cd55deb60 sim=0.5399
+bc169c4effe4 sim=0.5292                 |  bc169c4effe4 sim=0.5292
+ef33eec926c2 sim=0.4961                 |  ef33eec926c2 sim=0.4961
+d916776f43ac sim=0.4901                 |  d916776f43ac sim=0.4902
+3d0e3edbd3b7 sim=0.4770                 |  3d0e3edbd3b7 sim=0.4771
+9232be58c9dd sim=0.4590                 |  9232be58c9dd sim=0.4590
+9c34c673689c sim=0.4528                 |  9c34c673689c sim=0.4529
+c316444b6bc0 sim=0.4371                 |  c316444b6bc0 sim=0.4372
+```
+```
+CO KHAC BIET - xem diff tren
+```
+
+**Đọc được gì:**
+
+1. **Cùng 10 chunk, CÙNG id, CÙNG thứ tự.** Khác biệt duy nhất là **chữ số thập phân thứ 4** của
+   similarity (0.7104 vs 0.7105; 0.4901 vs 0.4902). `diff` báo "khác" chỉ vì so **chuỗi text**.
+2. ⟹ **`topk=256` cho kết quả y hệt `topk=1024`** — không mất recall. Nhưng cũng **không nhanh hơn**
+   (3.11) ⟹ 768 candidate dư đó **vô hại về cả chất lượng lẫn thời gian**. Bằng chứng độc lập nữa
+   cho thấy tầng rerank/tokenize **không phải** bottleneck.
+
+---
+
+### 3.13 ⭐ QUAN SÁT CỦA KIÊN: CPU pod chỉ 10–20% — bằng chứng quyết định đổi hướng
+
+**Kiên quan sát trực tiếp trên monitoring:** CPU usage của pod ragflow **chỉ 10–20%**, không tăng
+khi retrieval chậm.
+
+**Đọc được gì (đây là suy luận quan trọng nhất của cả phiên):**
+
+1. ❌ **Root cause C (re-tokenize + rerank CPU-bound) BỊ PHỦ ĐỊNH.** Nếu Python đang tokenize/rerank
+   1024 candidate thì CPU phải cao — thực tế 10–20%. Khớp với 3.11 (giảm topk 4× không nhanh hơn)
+   và 3.12 (kết quả y hệt).
+2. 🔴 **15 giây đó là thời gian CHỜ (I/O wait), KHÔNG phải thời gian TÍNH.** Process nằm im chờ
+   response từ bên ngoài ⟹ CPU thấp là **hệ quả tất yếu**, không phải nghịch lý.
+3. ⟹ **Chờ ai?** Đã loại trừ: ES (<1ms/query, 3.6/3.8), network tới client (6ms, 3.7),
+   payload (270KB, 3.7), CPU nội bộ (10–20%, mục này). **Chỉ còn MỘT ứng viên: lời gọi
+   `qwen3-8b-embedding` qua API ngoài** (`search.py:56` `encode_queries`, `:199` `get_vector`).
+4. ⟹ **CPU thấp là bằng chứng ỦNG HỘ Root cause A, không phải chống lại nó.** Retrieval chờ
+   embedding; embedding đang bị `task_executor` bơm liên tục (3.6: 0.59–1.43s/batch, ≥8 doc/23s).
+5. **Hệ quả cho hướng fix:** Fix 1 (tách `task_executor` khỏi pod API) sẽ **KHÔNG đủ** nếu chỉ tách
+   process — vì contention không ở CPU pod mà ở **embedding service dùng chung**. ⟹ **Fix 3 (tách/scale
+   endpoint embedding) chuyển thành fix CHÍNH**, không còn là phụ.
+
+---
+
+## 4. Issue chi tiết — 1 ứng viên còn lại (embedding), 5 giả thuyết đã bị phủ định
 
 ### 4.0 Bảng tách tầng thời gian (số liệu thật, không suy đoán)
 
@@ -870,7 +1013,15 @@ Cùng MỘT query, đo 4 lần trong ~40 phút:
 **Vì sao đây là lời giải cho "cùng query lúc 2s lúc 20s":** không có tham số nào của query thay đổi giữa
 các lần đo — thứ duy nhất thay đổi là **trạng thái tải của ingest tại thời điểm đó**.
 
-### 4.2 🔴 ROOT CAUSE B — `topk=1024` mặc định (nguyên nhân chính của **CHẬM CƠ BẢN**)
+### 4.2 ❌ ~~ROOT CAUSE B — `topk=1024`~~ — ĐÃ BỊ PHỦ ĐỊNH (3.11/3.12)
+
+> **KẾT LUẬN NÀY ĐÃ SAI.** A/B xen kẽ 8 cặp cho thấy `topk=256` không nhanh hơn `topk=1024`
+> (mean 13.91s vs 15.75s, thắng/thua 4–4), và kết quả trả về y hệt. Giữ lại phần dưới để ghi nhận
+> lập luận đã dùng và vì sao nó sai: **suy từ source code (`topk=1024`) và số ES query (287) sang kết
+> luận về latency, mà không đo A/B trước.** 1024 candidate là thật, nhưng chi phí xử lý chúng rẻ
+> đến mức không đo được.
+
+**Lập luận cũ (đã bị phủ định):**
 
 `search.py:142`: `topk = int(req.get("topk", 1024))` — client không gửi `topk` ⟹ mặc định **1024**.
 `search.py:143`: `ps = int(req.get("size", topk))`.
@@ -881,7 +1032,13 @@ nhiều shard/node. Rồi **toàn bộ 1024 candidate được kéo về Python*
 
 **Trả về chỉ 10 chunk** (3.7: `chunks: 10, total: 10`) — tức **99% công việc bị bỏ đi** sau khi đã trả giá.
 
-### 4.3 🔴 ROOT CAUSE C — Re-tokenize + rerank 1024 candidate trong Python, cùng process với ingest
+### 4.3 ❌ ~~ROOT CAUSE C — Re-tokenize + rerank CPU-bound~~ — ĐÃ BỊ PHỦ ĐỊNH (3.13)
+
+> **KẾT LUẬN NÀY ĐÃ SAI.** **CPU pod chỉ 10–20%** — nếu đang tokenize/rerank 1024 candidate thì CPU
+> phải cao. Cộng với 3.11 (giảm topk 4× không nhanh hơn) và 3.12 (kết quả y hệt). Giữ lại để ghi
+> nhận: **đọc source thấy vòng lặp nặng ⟹ kết luận CPU-bound, mà không kiểm tra CPU thực tế.**
+
+**Lập luận cũ (đã bị phủ định):**
 
 - `search.py:299`: `chunks_tks = [rag_tokenizer.tokenize(self.qryr.rmWWW(ck)).split() for ck in chunks]`
   — **tokenize LẠI** từng candidate, mỗi request. Image custom cài **`pyvi`** (3.10 điểm 5) → tokenizer
@@ -910,84 +1067,79 @@ Chi phí tỷ lệ với **số candidate Python phải xử lý**, không tỷ 
 
 ---
 
-## 4.5 ⭐ HƯỚNG FIX DỨT ĐIỂM
+## 4.5 ⭐ HƯỚNG FIX (cập nhật sau 3.11–3.13 — Fix 2 đã bị loại, Fix 3 thành fix CHÍNH)
 
-Xếp theo đòn bẩy. Tất cả làm được qua `values.yaml` + `helm upgrade`, **không build image**
-(theo ràng buộc `pullPolicy: Never` đã ghi ở `investigate_issue_4/05-FIX.md`).
+> **Đổi hướng quan trọng:** CPU pod chỉ 10–20% ⟹ latency là **I/O wait**, không phải CPU-bound.
+> Contention **không** ở CPU pod ⟹ chỉ tách process (Fix 1) là **KHÔNG ĐỦ**. Phải xử lý ở
+> **embedding service dùng chung** (Fix 3).
 
-### FIX 1 — Tách `task_executor` ra khỏi pod API ⭐⭐⭐ (giải quyết BẤT ỔN ĐỊNH, đòn bẩy lớn nhất)
+### ⏸️ BƯỚC 0 (BẮT BUỘC LÀM TRƯỚC) — Đo trực tiếp `qwen3-8b-embedding`
 
-**Vấn đề nó giải:** Root cause A + phần contention của C.
+Toàn bộ hướng fix dưới đây dựa trên **suy luận loại trừ** (đã đóng kín: không phải ES, network,
+payload, CPU ⟹ chỉ còn embedding). Nhưng **chưa đo trực tiếp embedding service**. Không được deploy
+fix nào trước khi có số này — bài học của phiên này là **suy luận từ code mà không đo ⟹ sai 2 lần**
+(Root cause B và C).
 
-**Hiện tại:** 1 container chạy **3 process** — `ragflow_server.py` (API, PID 48), `task_executor.py`
-(ingest, PID 445), `sync_data_source.py`. Chung CPU limit, chung memory, chung embedding endpoint.
+**Cần lấy:**
+1. Endpoint thật của `qwen3-8b-embedding` (đang serve bởi LiteLLM? vLLM? service riêng?).
+2. Latency **một** lời gọi embedding khi **ingest đang chạy** (kỳ vọng: nhiều giây).
+3. Latency **một** lời gọi embedding khi **ingest tạm nghỉ/pause** (kỳ vọng: <0.5s).
 
-**Sau fix:** 2 workload riêng.
-- Deployment `ragflow-api`: chỉ `ragflow_server.py`. Nhận traffic NodePort 8999. CPU dành riêng.
-- Deployment `ragflow-worker`: chỉ `task_executor.py`. Scale độc lập theo tải ingest.
+**Nếu (2) ≫ (3) ⟹ root cause chốt dứt điểm, Fix 3 là đúng.**
+**Nếu (2) ≈ (3) ≈ nhanh ⟹ embedding vô can, phải mở lại điều tra** — lúc đó nghi phạm còn lại là
+tầng nào chờ khác trong Python (connection pool, lock, async event loop bị block).
 
-**An toàn khi tách:** `task_executor` tiêu thụ task qua **Redis Stream Consumer Group** ⟹ nhiều instance
-không xử lý trùng task. Đây là cơ chế upstream thiết kế sẵn cho việc scale worker.
+### FIX 3 ⭐⭐⭐ — Tách/scale endpoint embedding (FIX CHÍNH sau khi đổi hướng)
 
-**Kỳ vọng:** latency retrieval hết phụ thuộc chu kỳ ingest ⟹ **hết dao động 2s↔28s**. Đây là phần
-"không ổn định" mà anh Cường báo.
+**Vấn đề nó giải:** Root cause A — retrieval chờ embedding đang bị ingest bơm liên tục.
 
-❓ **Cần verify trước khi làm:** đọc `values.yaml` + entrypoint/`docker-entrypoint.sh` trong image để xác
-định cách tách process (biến môi trường bật/tắt component, hoặc override `command`/`args`).
+**Bằng chứng:** 3.6 (ingest gọi `Embedding chunks` 0.59–1.43s/batch, ≥8 doc/23s, không nghỉ),
+3.4 (tỷ lệ traffic 320 ingest : 9 retrieval), 3.13 (CPU thấp ⟹ đang chờ I/O).
 
-### FIX 2 — Giảm `topk` 1024 → 256 ⭐⭐ (giải quyết CHẬM CƠ BẢN, rẻ nhất, làm được ngay)
+**Ba lựa chọn, theo mức độ triệt để:**
+- **3a — Tăng replica embedding service.** Đơn giản nhất nếu nó là deployment tự quản trong cụm.
+  Nhưng nếu bottleneck là GPU thì tăng replica không giúp (cần thêm GPU).
+- **3b — Tách endpoint riêng cho retrieval vs ingest** (triệt để nhất). Retrieval dùng endpoint
+  riêng, không bao giờ bị tải ingest chen. ❓ Cần kiểm tra RAGFlow v0.26 có cho cấu hình embedding
+  model **khác nhau** cho luồng query vs luồng index không.
+- **3c — Rate-limit / priority queue ở tầng embedding gateway.** Nếu đang qua LiteLLM: đặt ưu tiên
+  cho request retrieval, hoặc giới hạn concurrency của ingest.
 
-**Vấn đề nó giải:** Root cause B + khối lượng của C.
+### FIX 1 ⭐⭐ — Tách `task_executor` ra khỏi pod API (vẫn nên làm, nhưng không đủ một mình)
 
-Cắt **4×** số candidate phải: kéo về từ ES, tokenize lại (`:299`), rerank + numpy (`:434/:461`).
-Vì chỉ trả về 10 chunk, 256 candidate vẫn thừa dư địa cho rerank chọn top 10.
+**Vấn đề nó giải:** tranh CPU/memory pod + cô lập lỗi. **Không** giải quyết được contention
+embedding (đó là Fix 3).
 
-**Cách 1 — không sửa code, làm được NGAY (khuyến nghị thử trước):** thêm `"topk": 256` vào JSON request.
-`search.py:142` đọc `req.get("topk", 1024)` ⟹ client gửi thì override được default.
+Hiện 1 container chạy 3 process: `ragflow_server.py` (API, PID 48), `task_executor.py` (ingest,
+PID 445), `sync_data_source.py`. An toàn khi tách vì `task_executor` dùng **Redis Stream Consumer
+Group** ⟹ mỗi task chỉ giao đúng 1 consumer.
 
-```
-curl -s -o /dev/null -w "topk256 total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"topk":256,"metadata_condition":{"logic":"and","conditions":[{"name":"listuserview_useridtwo","comparison_operator":"contains","value":"900034475"}]}}'
-```
+**Giá trị thật sau khi đổi hướng:** CPU hiện 10–20% nên tách CPU không cải thiện latency ngay. Nhưng
+đáng làm vì: (a) khi ingest tăng tải sẽ không kéo API xuống; (b) scale API và worker độc lập;
+(c) `task_executor` crash không làm chết API.
 
-**Cách 2 — sed đổi default** (nếu bên gọi API không chịu sửa payload), thêm vào `codePatch` initContainer:
+### FIX 4 ⭐⭐ — Giảm cường độ ingest / tắt RAPTOR + GraphRAG (đòn bẩy lớn, không cần code)
 
-```
-sed -i 's/req.get("topk", 1024)/req.get("topk", 256)/' /ragflow/rag/nlp/search.py
-```
+**Vấn đề nó giải:** cùng Root cause A, từ phía nguồn tải.
 
-⚠️ **Rủi ro:** giảm `topk` có thể giảm recall (bỏ sót kết quả liên quan nằm ngoài top 256). **Phải verify
-chất lượng** — chạy vài câu hỏi thật, so danh sách 10 chunk trả về giữa `topk=1024` và `topk=256`.
-Nếu trùng nhau ⟹ an toàn. Đây là **trade-off latency vs recall**, quyết định nghiệp vụ.
+- Đề nghị bên đẩy tài liệu **giới hạn concurrency** hoặc chuyển ingest sang **giờ thấp điểm**.
+- 🔴 **Xem lại `use_raptor: true` + `use_graphrag: true`** (3.6). Hai tính năng này khiến mỗi document
+  tốn thêm **nhiều lời gọi LLM `qwen3-32b`** (RAPTOR summarize, GraphRAG extract entity) — đây là
+  phần tải nặng nhất. **Nếu nghiệp vụ không thực sự dùng ⟹ tắt đi sẽ giảm mạnh tải embedding/LLM
+  toàn hệ thống**, và đây có thể là fix hiệu quả nhất trên mỗi đơn vị công sức.
 
-### FIX 3 — Tách/scale embedding service ⭐ (dọn phần xếp hàng còn lại sau Fix 1)
+### ❌ FIX 2 — Giảm `topk` 1024 → 256: ĐÃ LOẠI BỎ
 
-**Vấn đề nó giải:** phần còn lại của Root cause A.
+Xem 3.11/3.12. `topk=256` **không nhanh hơn** (mean 13.91s vs 15.75s, thắng/thua 4–4) và cho kết quả
+**y hệt**. Không cần sửa `topk`. Ghi lại để người sau không thử lại.
 
-Sau Fix 1, retrieval và ingest hết tranh CPU pod, **nhưng vẫn dùng chung** endpoint
-`qwen3-8b-embedding`. Hai lựa chọn:
-- **3a:** tăng replica embedding service (nếu nó là deployment tự quản trong cụm).
-- **3b:** cấu hình **endpoint embedding riêng** cho retrieval vs ingest, để tải ingest không làm nghẽn
-  đường của retrieval. (Cần kiểm tra RAGFlow v0.26 có cho tách embedding model theo mục đích không.)
+### Thứ tự thực hiện (cập nhật)
 
-❓ **Cần biết trước:** `qwen3-8b-embedding` đang được serve ở đâu, bởi ai (LiteLLM? vLLM? service riêng?),
-có scale được không.
-
-### FIX 4 — Giảm cường độ ingest (đàm phán vận hành, không phải code)
-
-Không phải fix kỹ thuật nhưng là đòn bẩy thật: đề nghị bên đẩy tài liệu **giới hạn concurrency** hoặc
-chuyển ingest sang **giờ thấp điểm**. Kể cả sau Fix 1, ingest vẫn tranh embedding/LLM quota.
-
-Cũng nên xem lại: `use_raptor: true` + `use_graphrag: true` khiến mỗi document tốn thêm nhiều lời gọi LLM.
-Nếu nghiệp vụ không thực sự dùng RAPTOR/GraphRAG ⟹ tắt đi sẽ giảm mạnh tải toàn hệ thống.
-
-### Thứ tự thực hiện đề xuất
-
-1. **Fix 2 cách 1** (thêm `topk:256` vào 1 request curl) — **0 rủi ro, 0 downtime**, đo ngay được hiệu quả.
-   Nếu latency giảm đáng kể ⟹ xác nhận Root cause B bằng thực nghiệm.
-2. **Fix 1** — làm chính, giải quyết bất ổn định. Cần downtime ngắn (rollout).
-3. Đo lại 30 mẫu như 3.2 sau mỗi fix, so trực tiếp với baseline hiện có
-   (min 1.98s / max 28.2s / mean 10.22s / median 9.57s).
-4. **Fix 3 / Fix 4** nếu sau 1+2 vẫn còn dao động.
+1. ⏸️ **BƯỚC 0 — đo trực tiếp embedding service.** Không deploy gì trước bước này.
+2. **Fix 4 phần "tắt RAPTOR/GraphRAG nếu không dùng"** — hỏi nghiệp vụ, rẻ nhất, đòn bẩy lớn.
+3. **Fix 3** — theo kết quả bước 0, chọn 3a/3b/3c.
+4. **Fix 1** — làm sau, vì lợi ích là kiến trúc/cô lập lỗi chứ không phải latency ngay.
+5. Đo lại 30 mẫu như 3.2 sau mỗi bước, đối chiếu **tiêu chí biên độ < 3×** dưới đây.
 
 ### Tiêu chí "fix dứt điểm" (định lượng, để biết khi nào xong)
 
@@ -1004,6 +1156,29 @@ median mà biên độ vẫn 14× thì **chưa fix xong**.
 ---
 
 ## 5. Bài học
+
+0. ⭐ **BÀI HỌC LỚN NHẤT CỦA PHIÊN — "đọc source thấy vòng lặp nặng" KHÔNG PHẢI bằng chứng về latency.**
+   Tôi chốt 2 root cause (B: `topk=1024`, C: rerank CPU-bound) **chỉ từ đọc source + đếm ES query**,
+   nghe rất hợp lý: 1024 candidate, tokenize lại từng cái, numpy trên vector — "đương nhiên" phải chậm.
+   **Cả hai đều SAI.** Cái làm lộ ra:
+   - **Kiên chỉ ra CPU pod chỉ 10–20%.** Một câu quan sát monitoring phủ định cả hai giả thuyết —
+     CPU-bound thì CPU phải cao.
+   - **A/B xen kẽ 8 cặp (3.11):** `topk=256` không nhanh hơn, thắng/thua 4–4, và `topk=1024` cho 2 lần
+     nhanh nhất toàn phép đo (2.15s/2.96s).
+   ⟹ **Phản xạ cần nhớ: trước khi tin một đoạn code là bottleneck, (a) xem CPU/IO có khớp không,
+   (b) chạy A/B đổi ĐÚNG một biến. Code nặng ≠ code chậm** — 768 candidate dư hoá ra rẻ đến mức
+   không đo được.
+
+0b. ⭐ **CPU thấp trong khi latency cao = I/O WAIT, và đó là thông tin cực mạnh để loại trừ.**
+   CPU 10–20% không phải nghịch lý cần giải thích — nó **thu hẹp** nghi phạm xuống chỉ còn "đang chờ
+   ai đó bên ngoài". Kết hợp với các phép loại trừ đã có (ES <1ms, network client 6ms, payload 270KB)
+   thì tập nghi phạm đóng kín lại còn **một**: lời gọi embedding. Một chỉ số monitoring cơ bản làm
+   được việc mà cả buổi đọc source không làm được.
+
+0c. **Phép thử A/B phải XEN KẼ, không đo rời.** Với hệ dao động 1.98–28.2s, đo 5 lần cấu hình A rồi
+   5 lần cấu hình B ở thời điểm khác ⟹ kết quả bị tải nền chi phối hoàn toàn. Đặt **2 request trong
+   CÙNG vòng lặp** (3.11) mới so được từng cặp. Nếu 3.11 đo rời, rất có thể tôi đã kết luận sai
+   "topk=256 nhanh hơn 12%" và đi deploy một fix vô nghĩa.
 
 1. **Đo tách tầng trước khi tối ưu tầng nào.** Suốt 3 phiên hướng điều tra nhắm vào ES (tokenizer,
    stopword, `minimum_should_match`, scale 1.9M doc). Số đo thật: **ES <1ms/query, chiếm 1.7/3.6s;
@@ -1060,21 +1235,25 @@ median mà biên độ vẫn 14× thì **chưa fix xong**.
 
 ## 7. Việc tiếp theo
 
-### Ngay lập tức (0 rủi ro, đo được ngay)
-- [ ] Chạy **Fix 2 cách 1** — thêm `"topk": 256` vào 1 request curl, so latency với baseline 3.6–10.2s
-- [ ] Nếu nhanh hơn rõ: chạy 30 mẫu như 3.2 với `topk=256`, so bảng phân bố với baseline
-- [ ] Verify recall: so danh sách 10 chunk trả về giữa `topk=1024` và `topk=256` trên 3-5 câu hỏi thật
-- [ ] 🔴 **Rotate Bearer token RAGFlow** (đã lộ trên GitHub PR #8)
+### ⏸️ BƯỚC 0 — BẮT BUỘC trước khi deploy bất cứ gì
+- [x] ~~Fix 2: thêm `topk:256`~~ — ❌ **ĐÃ THỬ, KHÔNG HIỆU QUẢ** (3.11), loại bỏ
+- [x] ~~Verify recall topk 1024 vs 256~~ — ✅ đã làm (3.12), kết quả y hệt
+- [ ] 🔴 **Xác định endpoint thật của `qwen3-8b-embedding`** — serve bởi LiteLLM / vLLM / service riêng?
+- [ ] 🔴 **Đo latency 1 lời gọi embedding khi ingest ĐANG CHẠY** (kỳ vọng: nhiều giây)
+- [ ] 🔴 **Đo latency 1 lời gọi embedding khi ingest NGHỈ/pause** (kỳ vọng: <0.5s)
+- [ ] Nếu (đang chạy) ≫ (nghỉ) ⟹ root cause chốt. Nếu ≈ nhau và đều nhanh ⟹ **mở lại điều tra**,
+      nghi phạm còn lại: connection pool / lock / async event loop bị block trong Python
 
-### Ngắn hạn (fix chính)
-- [ ] Đọc `values.yaml` + entrypoint image để xác định cách tách `task_executor` khỏi pod API
-- [ ] Triển khai **Fix 1** — 2 deployment `ragflow-api` / `ragflow-worker`
-- [ ] Verify Redis Stream Consumer Group hoạt động đúng khi worker tách riêng (không xử lý trùng task)
-- [ ] Đo lại 30 mẫu sau Fix 1, đối chiếu **tiêu chí biên độ < 3×** ở mục 4.5
+### Ngắn hạn (theo kết quả bước 0)
+- [ ] **Fix 4** — hỏi nghiệp vụ: có thực sự dùng `use_raptor` + `use_graphrag`? Nếu không ⟹ tắt
+      (đòn bẩy lớn nhất trên mỗi đơn vị công sức, giảm mạnh tải LLM/embedding)
+- [ ] **Fix 3** — chọn 3a (scale replica) / 3b (tách endpoint retrieval vs ingest) / 3c (priority queue)
 - [ ] Hỏi bên đẩy tài liệu: ingest chạy 24/7 hay theo lịch? Có giới hạn concurrency được không?
+- [ ] Đo lại 30 mẫu, đối chiếu **tiêu chí biên độ < 3×** ở mục 4.5
 
 ### Dài hạn
-- [ ] **Fix 3** — xác định `qwen3-8b-embedding` được serve ở đâu, có scale/tách endpoint được không
+- [ ] **Fix 1** — tách `task_executor` ra deployment riêng (lợi ích kiến trúc/cô lập lỗi, không phải
+      latency ngay vì CPU hiện chỉ 10–20%). Verify Redis Consumer Group không xử lý trùng task
 - [ ] **Fix 4** — đánh giá lại có thực sự cần `use_raptor` + `use_graphrag` trên KB này
 - [ ] Thêm instrumentation latency cho tầng retrieval (RAGFlow không log) — để lần sau không phải đo
       tách tầng thủ công như phiên này
