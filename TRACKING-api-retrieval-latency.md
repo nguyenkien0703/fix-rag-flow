@@ -1315,6 +1315,74 @@ timing/trace từ chính RAGFlow.
 kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- env | grep -iE "log_level|debug"
 ```
 
+### 🔴 MANH MỐI MỚI từ Postman (2026-08-18 12:06) — nội dung chunk là văn bản DO LLM SINH
+
+**Quan sát:** Postman gọi cùng endpoint/body, `Status: 200 OK`, **`Time: 17.40 s`**,
+**`Size: 264.6 KB`** (khớp 270KB đã đo ở 3.7). Nhưng **nội dung response** tiết lộ điều mới:
+
+```
+"content": "Document: Về việc bổ sung, thống nhất một số quy định về điều lệnh, nghi lễ\nVăn bản
+được cung cấp có tên là \"Cong van ve viec bo sung, dieu chinh dieu lenh, nghi le.pdf\". Tuy nhiên,
+nội dung cụ thể của văn bản này hiện đang ở trạng thái file trống, nghĩa là không có bất kỳ thông
+tin, điều khoản hay quy định nào được ghi nhận trong tài liệu đính kèm. Do đó, việc xây dựng một
+bản tóm tắt chi tiết về các nội dung cụ thể như các điều khoản bổ sung, các quy định mới về điều
+lệnh ... là không thể thực hiện được dựa trên dữ liệu hiện có.\nTrong bối cảnh hành chính và văn
+bản quy phạm pháp luật, một văn bản có tiêu đề như \"Về việc bổ sung, thống nhất một số quy định
+về điều lệnh, nghi lễ\" thường sẽ đóng vai trò là một công văn hướng dẫn, quyết định hoặc thông
+báo của cơ quan có thẩm quyền (thường là Bộ Quốc phòng, Tổng cục Chính trị hoặc các cơ quan quản
+lý nhà nước liên quan đến lực lượng vũ trang) nhằm mục đích hoàn thiện hệ thống quy định hiện
+hành. Thông thường, các văn bản thuộc loại này sẽ giải quyết các vấn đề phát sinh trong quá trình
+thực hiện điều lệnh, nghi lễ, hoặc thống nhất các cách hiểu, cách làm chưa đồng bộ giữa các đơn
+vị, các cấp. Nội dung dự kiến của một văn bản như vậy, nếu không bị trống, thường sẽ bao gồm các
+phần chính sau:\nThứ nhất, phần mở đầu thường nêu rõ căn cứ pháp lý để ban hành văn bản ...
+Thứ hai, phần nội dung chính sẽ tập trung vào việc liệt kê cụ thể các điểm cần bổ sung hoặc điều
+chỉnh. Đối với lĩnh vực điều lệnh ..."
+```
+
+**Đọc được gì:**
+
+1. 🔴 **Đây KHÔNG phải nội dung tài liệu gốc — đây là văn bản DO LLM SINH RA.** Bằng chứng nội tại:
+   - Tự thuật về file: *"nội dung cụ thể của văn bản này hiện đang ở trạng thái file trống"*
+   - Tự thừa nhận không làm được: *"việc xây dựng một bản tóm tắt chi tiết ... là không thể thực hiện được"*
+   - Suy đoán chứ không trích: *"thường sẽ đóng vai trò là"*, *"Nội dung dự kiến của một văn bản như vậy"*
+   ⟹ Đây là **output của RAPTOR** (`use_raptor: true`, xác nhận ở log 3.6) — bản tóm tắt phân cấp
+   do `qwen3-32b` sinh lúc ingest.
+2. ⟹ **Chunk trong KB này rất dài** (mỗi cái là một đoạn văn LLM sinh, dài gấp nhiều lần chunk gốc).
+   Giải thích vì sao response 270KB cho chỉ 10 chunk. ❓ Có ảnh hưởng tới `search.py:299` (tokenize
+   lại từng chunk) — nhưng CPU chỉ 10–20% nên **khó là thủ phạm chính**.
+3. 🔴 **NGHI PHẠM MỚI, ĐÍCH I/O THỨ BA CHƯA ĐO: LLM `qwen3-32b`.** Đã đo embedding (150ms, vô can),
+   đã đo ES (<1ms, vô can) — nhưng **chưa bao giờ đo LLM**. `search.py:515`
+   `rerank_mdl.similarity(query, docs)` và các đường liên quan tới RAPTOR có thể gọi LLM
+   **trong luồng retrieval**, không chỉ lúc ingest.
+   **Vì sao khớp:** một lời gọi `qwen3-32b` mất **nhiều giây** và **dao động mạnh** theo độ dài
+   output ⟹ giải thích được ĐỒNG THỜI: CPU thấp (chờ LLM), I/O wait, dao động 2s↔28s không theo
+   query, và 1.7–26.3s không thuộc ES/embedding.
+   ⚠️ **Vẫn là giả thuyết** — theo Bài học 0d, **phải đo trực tiếp `qwen3-32b` trước khi kết luận.**
+
+**Lệnh cần chạy (đo LLM qua cùng gateway):**
+
+```
+for i in 1 2 3; do curl -s -o /dev/null -w "llm_chat run=$i total=%{time_total}\n" -X POST 'http://10.208.137.53:8992/v1/chat/completions' -H 'Authorization: Bearer <REDACTED>' -H 'Content-Type: application/json' -d '{"model":"qwen3-32b","messages":[{"role":"user","content":"xin chào"}],"max_tokens":50}'; done
+```
+
+**Lệnh xác định "đang chờ ai" mà KHÔNG cần py-spy** — đếm connection tới gateway trong lúc retrieval chạy.
+Terminal 1 bắn retrieval, Terminal 2 chạy đồng thời:
+
+```
+for i in 1 2 3 4 5 6 7 8 9 10; do echo "t=$i conn_8992=$(kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'grep -c 2320 /proc/net/tcp' 2>/dev/null)"; done
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `grep -c 2320` | `/proc/net/tcp` ghi port dạng **hex**. `8992` thập phân = **`0x2320`** ⟹ đếm số connection đang mở tới LiteLLM gateway |
+| `-c` | chỉ in SỐ dòng khớp |
+| Chạy 10 vòng | lấy chuỗi thời gian trong lúc retrieval 17s đang chạy, thấy được connection **tăng rồi giữ** hay **bằng 0** |
+| **Cách đọc** | connection tới 8992 **tăng và giữ** trong lúc retrieval chậm ⟹ retrieval đang chờ gateway (LLM/embedding). **Bằng 0 / không đổi** ⟹ không gọi gateway ⟹ thủ phạm ở nơi khác |
+
+⟹ Đây là cách xác định **process đang chờ ai** mà không cần `py-spy` (đã loại vì không cài được).
+
+---
+
 ### Nghi phạm chưa được kiểm tra (liệt kê để không quên, KHÔNG phải kết luận)
 
 Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — không được xây fix lên bất kỳ cái nào trước khi đo:
@@ -1322,6 +1390,7 @@ Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — khô
 | Nghi phạm | Vì sao đáng nghi | Cách kiểm |
 |---|---|---|
 | **Async event loop bị block** | RAGFlow là Quart/ASGI, chạy `app.run()` = **single process**. Một coroutine gọi hàm sync nặng sẽ block **toàn bộ** event loop ⟹ mọi request khác đứng chờ. Khớp hoàn hảo với: CPU thấp, I/O wait, dao động theo thời điểm, và việc ingest API (`/documents`, `/chunks`) cùng process | `py-spy dump` khi chậm; hoặc đo latency 1 request **khi không có ingest** |
+| 🔴 **LLM `qwen3-32b`** (đích I/O thứ 3, CHƯA ĐO) | Response chứa văn bản **do LLM sinh** (RAPTOR output — xem manh mối Postman ở trên). Một lời gọi LLM mất **nhiều giây**, dao động mạnh theo độ dài output ⟹ khớp đồng thời CPU thấp + I/O wait + dao động 2s↔28s + phần 1.7-26.3s chưa giải thích | Đo `/v1/chat/completions` model `qwen3-32b`; đếm connection tới port 8992 lúc retrieval chậm |
 | **Rerank model** (khác embedding) | `search.py:515` `rerank_mdl.similarity(query, docs)`, `:615` `if rerank_mdl and sres.total > 0`. **Chưa kiểm** rerank model có được cấu hình không, và nếu có thì gọi tới đâu | `select * from tenant_model;` xem có rerank model; đo endpoint đó |
 | **MySQL** | `document_keyword`/`docnm_kwd` có thể query MySQL cho từng chunk. **Chưa đo MySQL** | `SHOW PROCESSLIST` khi request chậm; hoặc bật slow query log |
 | **MinIO** | Chưa đo. Retrieval có thể fetch gì từ object storage | log/metrics MinIO |
