@@ -793,8 +793,43 @@ for gap in 0 0 5 5 15 15 30 30 60 60; do
 done
 ```
 
-**Output:**
+**Output — ✅ ĐÃ CHẠY 2026-08-18 14:00–14:04, pod `ragflow-b68585df9-2dhbz`** (biến thể có đếm CLOSE_WAIT):
 
 ```
-⏳ CHỜ OUTPUT
+gap=0s   latency=9.104s   CLOSE_WAIT_now=269  at=14:00:53
+gap=5s   latency=25.921s  CLOSE_WAIT_now=280  at=14:01:24
+gap=30s  latency=1.806s   CLOSE_WAIT_now=296  at=14:01:56
+gap=60s  latency=15.206s  CLOSE_WAIT_now=322  at=14:03:11
+gap=90s  latency=10.188s  CLOSE_WAIT_now=340  at=14:04:51
 ```
+
+### ❌ KẾT LUẬN Đ9 — phủ định CẢ HAI giả thuyết cùng lúc
+
+1. ❌ **LOẠI "nguội khi rảnh" (D5).** Latency **không** tăng theo `gap`:
+   `gap=30s` cho **1.806s** (nhanh nhất toàn phiên) trong khi `gap=5s` cho **25.921s** (chậm nhất).
+   Nghỉ 90s lại nhanh hơn nghỉ 5s. **Không có quan hệ đơn điệu nào.**
+   ⟹ **D5 ở Đ2 chỉ là ngẫu nhiên do cỡ mẫu nhỏ** — đúng bài học "ảo giác cỡ mẫu nhỏ" đã dính ở 3.20.
+   ⟹ ⚠️ **Lần thứ 2 trong phiên một "quy luật" thấy ở 5–10 mẫu tan biến khi kiểm bằng biến khác.**
+2. ❌ **LOẠI connection leak LẦN THỨ HAI, bằng biến ĐỘC LẬP với 3.20.**
+   `CLOSE_WAIT` tăng đơn điệu 269→280→296→322→340, latency nhảy 9.1→25.9→**1.8**→15.2→10.2.
+   Ở CLOSE_WAIT thấp (280) thì **chậm nhất**; ở CLOSE_WAIT cao hơn (296) thì **nhanh nhất**.
+   ⟹ 3.20 kết luận đúng. Leak là bug thật nhưng **vô can với latency** — xác nhận 2 lần độc lập.
+
+### 🔴 HỆ QUẢ QUAN TRỌNG NHẤT: đã HẾT biến ngoại sinh để thử
+
+Cùng một query, cùng pod, cùng khung vài phút ⟹ latency **1.806s → 25.921s (14×)**.
+**Không biến quan sát được từ ngoài nào dự báo được nó:**
+
+| Biến đã thử | Có dự báo được latency không? |
+|---|---|
+| Tải đồng thời (1 vs 5 request) | ❌ không (Đ2 — song song 5.78×) |
+| Khoảng nghỉ trước request (0–90s) | ❌ không (Đ9) |
+| Uptime của pod | ❌ không (Đ2 — pod 13 phút vẫn 23.8s) |
+| Số CLOSE_WAIT | ❌ không (3.20 + Đ9, 2 lần độc lập) |
+| `topk`, `metadata_condition` | ❌ không (3.9/3.11/3.12) |
+| Tải ingest | ❌ chưa loại hẳn, nhưng CPU 10–20% ⟹ không phải tranh CPU |
+
+⟹ **Kết luận phương pháp luận: thứ gây chậm là TRẠNG THÁI BÊN TRONG process, không quan sát
+được từ ngoài.** Mọi phép đo từ ngoài — dù thiết kế khéo đến đâu — sẽ tiếp tục cho ra nhiễu.
+**PHẢI nhìn từ bên trong (Đ3 — bật DEBUG log).** Đây là việc còn lại duy nhất có khả năng kết thúc
+issue, và nó KHÔNG cần cài thêm công cụ (code đã instrument sẵn ở `search.py:590/606`).
