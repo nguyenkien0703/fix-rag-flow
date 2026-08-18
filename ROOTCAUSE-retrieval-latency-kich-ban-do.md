@@ -1496,3 +1496,47 @@ Chỉ khi grep rộng hơn trên log bắt trực tiếp mới lộ ra 44 dòng 
 > (ở đây là thông điệp của cơ chế retry mà tôi đang giả thuyết) — hãy grep theo **tầng**
 > (`ERROR|WARNING` toàn bộ, rồi `uniq -c`), vì cơ chế thật có thể khác cơ chế mình hình dung.
 > Giả thuyết backoff SAI, nhưng tầng DB thì ĐÚNG.
+
+---
+
+# 13. Q&A — "làm sao biết là deadlock? deadlock ở chỗ nào?"
+
+**Ngày 2026-08-19. Kiên hỏi, ghi nguyên văn giải thích để tra lại sau.**
+
+> Câu hỏi tốt — trả lời cụ thể bằng bằng chứng đã thu thập, không suy diễn.
+
+## Dựa vào đâu biết là deadlock?
+
+**Đọc trực tiếp log của RAGFlow.** Khi bắt log lúc chạy 5 request retrieval chậm, thấy 44 dòng y hệt:
+
+```
+ERROR  DB execution failure: (1213, 'Deadlock found when trying to get lock; try restarting transaction')
+```
+
+Mã lỗi `1213` là mã lỗi **chuẩn của MySQL** dành riêng cho deadlock — không phải tôi đoán, đây là MySQL tự báo. Và các dòng này xuất hiện đúng vào khoảng thời gian request đang chạy chậm (17:04:35 → 17:04:42, trùng khớp).
+
+## Deadlock ở đâu?
+
+Hỏi thẳng MySQL "lần deadlock gần nhất là gì" bằng lệnh `SHOW ENGINE INNODB STATUS` — đây là lệnh chẩn đoán tiêu chuẩn của MySQL, nó lưu sẵn chi tiết deadlock cuối cùng xảy ra. Kết quả trả về:
+
+```
+DELETE FROM pipeline_operation_log
+WHERE kb_id = '...' AND id NOT IN ('a351af8e...', ... 1000 id ...)
+```
+
+Và khi liệt kê các transaction đang chạy lúc đó (`information_schema.innodb_trx` — bảng hệ thống của MySQL cho biết ai đang làm gì), thấy:
+
+```
+TRX 1: LOCK WAIT | DELETE FROM pipeline_operation_log WHERE kb_id=... AND ...
+TRX 2: RUNNING   | DELETE FROM pipeline_operation_log WHERE kb_id=... AND ... (giống hệt)
+```
+
+**Hai transaction đang chạy đúng một câu DELETE giống hệt nhau, một cái đang phải chờ cái kia.** Đó là deadlock: hai worker (task_executor) cùng lúc dọn log cho cùng một `kb_id`, giành khoá lẫn nhau.
+
+`★ Insight ─────────────────────────────────────`
+Ba nguồn bằng chứng độc lập khớp nhau: (1) mã lỗi `1213` trong log ứng dụng, (2) chi tiết deadlock từ `SHOW ENGINE INNODB STATUS`, (3) hai transaction giống hệt đang giành lock trong `innodb_trx`. Đây không phải một phép đo đơn lẻ có thể trùng hợp — ba góc nhìn khác nhau của MySQL đều chỉ về cùng một câu SQL.
+
+Sau đó tôi tìm trong source code RAGFlow xem câu DELETE đó nằm ở dòng nào — thấy nó nằm trong hàm dọn log tự động chạy sau mỗi lần parse xong 1 document (`pipeline_operation_log_service.py`), dùng cú pháp `NOT IN (danh sách 1000 id)` — cú pháp này khiến MySQL không dùng được index, phải quét và khoá cả một dải lớn của bảng thay vì chỉ khoá đúng hàng cần xoá. Đó là lý do khoá bị chồng lấn và gây deadlock.
+`─────────────────────────────────────────────────`
+
+Nói ngắn gọn: **không đoán** — hỏi thẳng MySQL "vừa deadlock ở đâu" bằng lệnh chẩn đoán tích hợp sẵn, MySQL trả lời chính xác câu SQL và bảng liên quan.
