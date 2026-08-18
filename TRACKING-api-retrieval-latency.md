@@ -28,8 +28,8 @@ query, lúc trả về **~2s**, lúc **>20s**.
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
 | 1 | Query tiếng Việt build ra clause OR chứa hư từ (thiếu stopword) → match rộng ES | Cao | ⚠️ **WORKAROUND** (giảm nhẹ, chưa xác nhận hết) | Đã custom image v0.26 (anh Cường), latency giảm 15-20s → 1.2-5s @ 141k. **Chưa đo lại số liệu chính xác sau upgrade** |
-| 2 | Patch cũ `minimum_should_match` (initContainer, từ Issue #4) có thể THỪA/conflict với code v0.26 upstream đã có sẵn tham số này | Trung bình | ❓ chưa xác minh | Verify bằng lệnh 3.1 dưới |
-| 3 | Latency tại scale MỚI (1.9M doc) chưa từng được đo — nghi bottleneck mới (index/shard/HNSW/GC) khác root cause cũ | Cao | 🔶 **OPEN** | Đo lại theo `investigate_issue_4/measure3.sh` trên KB hiện tại |
+| 2 | Patch cũ `minimum_should_match` (initContainer, từ Issue #4) có thể THỪA/conflict với code v0.26 upstream đã có sẵn tham số này | Trung bình | ✅ **LOẠI TRỪ** — xem lệnh 3.1, code trong pod khớp đúng gốc v0.26, không bị đè | — |
+| 3 | Latency tại scale MỚI (1.9M doc) chưa từng được đo — nghi bottleneck mới (index/shard/HNSW/GC, **hoặc load-balance không đều giữa 3 pod ragflow phát hiện ở 3.1**) khác root cause cũ | Cao | 🔶 **OPEN** | Đo lại theo `investigate_issue_4/measure3.sh` trên KB hiện tại, đo riêng từng pod |
 
 ## 3. Lệnh đã chạy
 
@@ -76,9 +76,37 @@ theo tracking cũ) → code sạch, patch cũ không đè gì thêm (không tăn
 format). Nếu thấy **4 dòng** hoặc nội dung có 2 lần `minimum_should_match` lồng nhau trong 1 dòng
 → patch cũ đã ghi đè/nhân đôi lên code gốc → cần gỡ patch cũ trong `values.yaml` trước khi đo tiếp.
 
-**Output:** _(dán nguyên văn kết quả 2 lệnh trên vào đây)_
+**Output:**
 
-**Đọc được gì:** _(điền sau khi có output)_
+```
+[app@vrp-kubeengine04 ~]$ kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- grep -n minimum_should_match /ragflow/rag/nlp/query.py
+92:            return MatchTextExpr(self.query_fields, query, 100, {"minimum_should_match": min_match, "original_query": original_query}), keywords
+165:            return MatchTextExpr(self.query_fields, query, 100, {"minimum_should_match": min_match, "original_query": original_query}), keywords
+229:            return MatchTextExpr(self.query_fields, " ".join(keywords), 100, {"minimum_should_match": min(3, round(len(keywords) / 10)), "original_query": " ".join(origin_keywords)})
+[app@vrp-kubeengine04 ~]$ kubectl get pods -n ragflow -o wide
+NAME                        READY   STATUS    RESTARTS   AGE     IP             NODE
+ragflow-57d9856dff-5kgvd    1/1     Running   0          4d5h    172.16.83.16   vrp-kubeengine06
+ragflow-57d9856dff-pljxz    1/1     Running   0          4d5h    172.16.83.15   vrp-kubeengine06
+ragflow-57d9856dff-q9kz2    1/1     Running   0          15h     172.16.78.26   vrp-kubeengine05
+ragflow-minio-0             1/1     Running   0          3d15h   172.16.93.71   vrp-kubeengine07
+ragflow-mysql-0             1/1     Running   0          4d9h    172.16.83.7    vrp-kubeengine06
+ragflow-redis-0             1/1     Running   0          3d15h   172.16.93.75   vrp-kubeengine07
+```
+
+**Đọc được gì:**
+- Đúng **3 dòng** khớp (92/165/229) — trùng khớp CHÍNH XÁC số dòng và nội dung đã ghi nhận trong
+  `TRACKING-ragflow-v0.26.4-upgrade.md` mục Issue 10 ("Code v0.26 đã có sẵn `minimum_should_match`
+  dòng 92/165/229"). Không có dòng thứ 4, không có `minimum_should_match` lồng đôi trong 1 dòng.
+- ⟹ **Loại trừ được Issue 2**: patch cũ (initContainer sed từ Issue #4) **KHÔNG đang ghi đè/nhân
+  đôi lên code gốc v0.26**. Code hiện tại trong pod khớp đúng với code gốc upstream v0.26 — sed
+  patch cũ (nếu còn bật trong `values.yaml`) đang ở trạng thái **no-op an toàn** (chuỗi cần khớp
+  để patch có thể đã không còn tồn tại dạng cũ trong file v0.26, nên sed không có gì để sửa, không
+  gây lỗi, không tăng dòng). Không cần gỡ patch cũ gấp — nó không gây nhiễu số liệu đo sắp tới.
+- ⟹ Cluster có **3 pod ragflow** (không phải 1 như baseline cũ lúc điều tra Issue #4/#10) — trải
+  trên 2 node (`vrp-kubeengine05`, `vrp-kubeengine06`). Đây là thông tin MỚI, chưa từng ghi nhận
+  trước — cần cân nhắc khi đo latency: có thể latency dao động do **load-balance không đều giữa
+  3 pod** (ví dụ 1 pod mới restart 15h AGE, còn 2 pod khác 4d5h AGE — không đồng nhất tuổi/trạng
+  thái) chứ không chỉ do ES/tokenizer. Đây là hướng nghi phạm MỚI, thêm vào Issue 3.
 
 ---
 
