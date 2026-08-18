@@ -31,7 +31,8 @@ query, lúc trả về **~2s**, lúc **>20s**.
 |---|---|---|---|---|
 | 1 | Query tiếng Việt build ra clause OR chứa hư từ (thiếu stopword) → match rộng ES | Cao | ⚠️ **WORKAROUND KHÔNG ĐỦ** — xem 3.2, workaround v0.26 giảm nhẹ nhưng KHÔNG giữ ổn định ở scale 1.9M (30 mẫu: min 1.98s, max 28.2s, chỉ 37% dưới 5s) | Đã custom image v0.26 (anh Cường). Cần đo tiếp xem còn dư địa cải thiện ở tầng tokenizer/query hay đã hết, chuyển hướng sang Issue 3 |
 | 2 | Patch cũ `minimum_should_match` (initContainer, từ Issue #4) có thể THỪA/conflict với code v0.26 upstream đã có sẵn tham số này | Trung bình | ✅ **LOẠI TRỪ** — xem lệnh 3.1, code trong pod khớp đúng gốc v0.26, không bị đè | — |
-| 3 | Latency tại scale MỚI (1.9M doc) dao động mạnh 1.98s-28.2s (30 mẫu thật, 3.2) — nghi bottleneck mới (index/shard/HNSW/GC, **hoặc load-balance không đều giữa 3 pod ragflow**) khác root cause cũ | Cao | 🔶 **OPEN**, đang đo | Đối chiếu log 3 pod theo timestamp (lệnh 3.3, chờ output) để xác nhận/loại giả thuyết lệch tải |
+| 3 | Latency tại scale MỚI (1.9M doc) dao động mạnh 1.98s-28.2s (30 mẫu thật, 3.2) — nghi bottleneck mới (index/shard/HNSW/GC, **hoặc load-balance không đều giữa 3 pod ragflow**) khác root cause cũ | Cao | 🔶 **OPEN**, đang đo | Đối chiếu log 3 pod theo timestamp (lệnh 3.3/3.4) để xác nhận/loại giả thuyết lệch tải |
+| 4 | 🔴 **GIẢ THUYẾT MỚI, ĐANG DẪN ĐẦU (Kiên nêu, xác nhận 1 phần qua log 3.3):** retrieval API tranh tài nguyên (worker/CPU/connection ES) với luồng **ingest liên tục** (`/documents`, `/chunks`) từ bên đẩy tài liệu, chạy CÙNG pod, CÙNG 1 worker process | Cao | ❓ **1 bằng chứng, chưa đủ để chốt** — 1 request retrieval log được mất 270.8s đúng lúc ingest traffic dồn dập, nhưng thời điểm đó KHÔNG khớp chính xác với bất kỳ `run=N` nào ở 3.2 | Lệnh 3.4: lấy log đầy đủ đúng khung giờ 3.2, đối chiếu retrieval-chậm với mật độ ingest ngay trước đó |
 
 ## 3. Lệnh đã chạy
 
@@ -283,7 +284,100 @@ kubectl -n ragflow logs ragflow-57d9856dff-q9kz2 -c ragflow --since-time=2026-08
 log với `time=` ở bảng 3.2 để biết pod nào xử lý run nào, rồi đối chiếu latency cao (>15s) có rơi
 tập trung vào 1 pod cụ thể không.
 
-**Output:** _(dán nguyên văn cả 3 lần chạy, ghi rõ log của pod nào)_
+**Output (pod `ragflow-57d9856dff-5kgvd`, TRÍCH — Kiên chỉ chụp được 1 đoạn, log dài hơn):**
+
+```
+[app@vrp-kubeengine04 ~]$ kubectl -n ragflow logs ragflow-57d9856dff-5kgvd -c ragflow --since-time=2026-08-18T09:47:00+0800 | grep -E "retrieval|POST /api/v1"
+[2026-08-18 10:47:03 +0800] [48] [INFO] 127.0.0.1:38754 POST /api/v1/datasets/73932b965e5e11f192725fd51894c519/documents 1.1 200 1436 45844
+[2026-08-18 10:47:03 +0800] [48] [INFO] 127.0.0.1:38758 POST /api/v1/datasets/73932b965e5e11f192725fd51894c519/chunks 1.1 200 1430 48831
+[2026-08-18 10:47:03 +0800] [48] [INFO] 127.0.0.1:38764 POST /api/v1/datasets/73932b965e5e11f192725fd51894c519/documents 1.1 200 1430 43026
+... (trích, lược nhiều dòng documents/chunks liên tục, tần suất cao, gần như không ngừng)
+[2026-08-18 10:49:07 +0800] [48] [INFO] 127.0.0.1:42370 POST /api/v1/retrieval 1.1 200 270774 2290443
+[2026-08-18 10:49:08 +0800] [48] [INFO] 127.0.0.1:42428 POST /api/v1/datasets/73932b965e5e11f192725fd51894c519/chunks 1.1 200 1430 49938
+... (tiếp tục documents/chunks liên tục tới 10:49:32+ theo ảnh chụp)
+```
+
+**Đọc được gì:**
+- **Format log:** `[timestamp] [PID_worker] [INFO] IP:PORT METHOD PATH HTTP_VER STATUS DURATION_MS SIZE_BYTES`.
+  Cột áp út là **duration tính bằng MILLISECOND** (không phải giây) — dòng
+  `POST /api/v1/retrieval 1.1 200 270774 2290443` ⟹ **duration = 270,774ms = 270.8 GIÂY**,
+  size response = 2,290,443 bytes (~2.2MB, khớp việc trả về nhiều chunk kết quả).
+- **PID worker `[48]` giống nhau ở MỌI dòng** trong log trích — toàn bộ traffic hiển thị đi qua
+  1 worker process trong pod này (Quart/Gunicorn 1 worker, khớp ghi nhận cũ *"Web/API dùng
+  app.run() single-process"* ở `TRACKING-ragflow-v0.26.4-upgrade.md`).
+- ⟹ **XÁC NHẬN đúng lưu ý của Kiên**: log cho thấy hàng loạt request
+  `POST /api/v1/datasets/.../documents` và `.../chunks` chạy **LIÊN TỤC, tần suất cao** (nhiều
+  request/giây, từ 10:47:03 kéo dài không ngừng tới ít nhất 10:49:32 theo ảnh chụp) — đây là
+  API của bên **đẩy tài liệu lên** (ingest/upload), không phải retrieval. Request
+  `/api/v1/retrieval` (lúc 10:49:07) chạy **CÙNG THỜI ĐIỂM** với luồng ingest dồn dập này.
+- 🔴 **GIẢ THUYẾT MỚI, MẠNH HƠN mọi giả thuyết trước (tokenizer/stopword/ES scale):** retrieval
+  API đang phải **cạnh tranh tài nguyên (CPU/worker/connection pool tới ES) với luồng ingest
+  liên tục chạy trên CÙNG pod, CÙNG 1 worker process**. Nếu 1 request retrieval rơi vào đúng lúc
+  worker đang bận xử lý dồn dập request ingest, nó phải đợi tới lượt → giải thích trực tiếp
+  pattern "cùng query, lúc 2s lúc 20s" tốt hơn: không liên quan gì đến kích thước KB hay
+  minimum_should_match — liên quan đến **THỜI ĐIỂM gọi trùng với tải ingest** đang chạy trên
+  CÙNG pod. Đây khớp với quan sát ở 3.2: dao động run-kế-run mạnh không theo xu hướng thời gian
+  (không phải warm-up/GC theo lịch, mà theo tải ingest THAY ĐỔI liên tục tại từng thời điểm gọi).
+- **Verify timezone (đã tính, KHÔNG còn nghi ngờ):** log hiển thị `+0800` nhưng là do container
+  set timezone khác Việt Nam — quy đổi UTC xác nhận `10:49:07 +0800` == `09:49:07 +0700`, **cùng
+  1 thời điểm thực**, không lệch giờ thật, chỉ lệch cách hiển thị con số. Log dòng
+  `10:49:07 +0800 POST /api/v1/retrieval ... 270774ms` ⟹ retrieval này **BẮT ĐẦU lúc 09:49:07
+  giờ VN, kết thúc lúc 09:49:07 + 270.8s ≈ 09:53:38 giờ VN**.
+  So với bảng 3.2: KHÔNG có `run=N` nào bắt đầu đúng `09:49:07` (run=6 lúc 09:49:39, run=7 lúc
+  09:49:42 — gần nhưng không khớp giây) ⟹ **dòng log retrieval 270.8s này KHÔNG PHẢI do loop 3.2
+  gây ra** — là một request retrieval KHÁC, từ nguồn khác (ai đó/hệ thống khác đang gọi retrieval
+  song song với lúc Kiên chạy loop) ⟹ xác nhận thêm: **có traffic retrieval + ingest chạy đồng
+  thời từ nhiều nguồn**, không chỉ riêng loop test — môi trường đang có tải thật, không phải môi
+  trường sạch để đo. Điều này làm giả thuyết "tranh tài nguyên với ingest" MẠNH LÊN (có thật một
+  request retrieval mất 270s trong lúc ingest chạy dồn dập) nhưng cũng nghĩa là **số liệu 3.2 đo
+  được cũng bị ảnh hưởng bởi tải thật đang chạy nền, không phải baseline "sạch"**.
+- ❓ **Còn cần làm để chốt chắc chắn:**
+  1. Lấy log retrieval ĐẦY ĐỦ (không chỉ 1 dòng trích) trong đúng khung giờ 09:48:34-09:53:53 VN
+     (= 10:48:34-10:53:53 theo giờ hiển thị log +0800) để map từng `run=N` ở 3.2 với dòng log
+     tương ứng — lệnh 3.4 dưới.
+  2. Đếm/đo tương quan: có phải MỌI lần retrieval chậm đều trùng thời điểm ingest traffic cao?
+     Hay có lần retrieval chậm dù không có ingest chạy song song (sẽ loại giả thuyết này)?
+  3. Hỏi bên đẩy tài liệu: có đang chạy batch ingest liên tục 24/7 không, hay chỉ theo lịch/đợt —
+     nếu 24/7 liên tục, đây gần như chắc chắn là root cause chính, không phải ES/tokenizer.
+
+### 3.4 Lấy log retrieval ĐẦY ĐỦ đúng khung giờ đã đo ở 3.2 + đếm mật độ ingest cùng lúc — ⏳ CHỜ OUTPUT
+
+**Vì sao cần lệnh này:** 3.3 mới cho 1 dòng log retrieval trích ngẫu nhiên, không nằm đúng khung
+giờ loop 3.2 (09:48:34-09:53:53 giờ VN = 10:48:34-10:53:53 theo giờ hiển thị log +0800). Cần lấy
+**toàn bộ** dòng `/api/v1/retrieval` VÀ đếm số dòng `/documents`+`/chunks` (ingest) xảy ra ngay
+trước mỗi dòng retrieval, để so khớp trực tiếp: request retrieval nào chậm có đúng là lúc ingest
+đang dồn dập không.
+
+Chạy trên `vrp-kubeengine04`, dùng khung giờ hiển thị log (+0800, đã verify tương đương giờ VN
+loop 3.2 đã chạy):
+
+```
+kubectl -n ragflow logs ragflow-57d9856dff-5kgvd -c ragflow --since-time=2026-08-18T10:48:00+08:00 --until-time=2026-08-18T10:54:30+08:00 > /tmp/log_5kgvd_window.txt
+```
+
+```
+grep "POST /api/v1/retrieval" /tmp/log_5kgvd_window.txt
+```
+
+```
+grep -c "POST /api/v1" /tmp/log_5kgvd_window.txt
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `--since-time=...T10:48:00+08:00` | Bắt đầu lấy log — dùng giờ HIỂN THỊ trong log (+0800) đã verify tương đương `09:48:00` giờ VN (+0700) lúc `run=1` bắt đầu, trừ lùi 34 giây cho tròn phút |
+| `--until-time=...T10:54:30+08:00` | **CỜ MỚI so với lệnh 3.3** — giới hạn điểm KẾT THÚC lấy log (3.3 chỉ có `--since-time`, không chặn trên nên lấy tới hiện tại, log quá dài). `10:54:30` = sau `run=30` (09:53:53 VN = 10:53:53 +0800) khoảng 37 giây, đủ để bắt cả request nào bắt đầu cuối loop nhưng kéo dài thêm |
+| `> /tmp/log_5kgvd_window.txt` | Ghi log ra file tạm — vì bước sau cần `grep` 2 LẦN trên CÙNG dữ liệu (đếm dòng retrieval + đếm tổng dòng ingest), ghi file 1 lần tránh gọi lại `kubectl logs` 2 lần (chậm, tốn API server) |
+| `grep "POST /api/v1/retrieval"` | Lọc CHỈ dòng retrieval trong file đã lưu — không cần `-E` vì chỉ tìm 1 chuỗi cố định, không cần OR |
+| `grep -c "POST /api/v1"` | Đếm (`-c`) SỐ DÒNG khớp — dùng để biết tổng số request (ingest + retrieval) trong khung giờ, đối chiếu mật độ tải chung |
+
+**Kỳ vọng đọc được:** liệt kê được đủ dòng retrieval trong đúng khung giờ loop 3.2 (kỳ vọng ~10
+dòng nếu 30 request chia đều 3 pod). So khớp thời gian bắt đầu mỗi dòng retrieval với `run=N` ở
+3.2 — nếu request retrieval chậm (>15s) đều rơi vào giai đoạn log có nhiều dòng ingest ngay trước
+đó → xác nhận mạnh giả thuyết tranh tài nguyên. Nếu không có tương quan rõ → phải quay lại nghi
+ES/tokenizer/scale.
+
+**Output:** _(dán nguyên văn kết quả 2 lệnh grep)_
 
 **Đọc được gì:** _(điền sau khi có output)_
 
