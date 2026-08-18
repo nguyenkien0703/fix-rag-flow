@@ -1383,6 +1383,106 @@ for i in 1 2 3 4 5 6 7 8 9 10; do echo "t=$i conn_8992=$(kubectl -n ragflow exec
 
 ---
 
+### 3.17 Đo LLM `qwen3-32b` + đếm connection gateway — ✅ ĐÃ CHẠY, LLM VÔ CAN (nghi phạm thứ 4 bị loại)
+
+```
+for i in 1 2 3; do curl -s -o /dev/null -w "llm_chat run=$i total=%{time_total}\n" -X POST 'http://10.208.137.53:8992/v1/chat/completions' -H 'Authorization: Bearer <REDACTED>' -H 'Content-Type: application/json' -d '{"model":"qwen3-32b","messages":[{"role":"user","content":"xin chào"}],"max_tokens":50}'; done
+```
+
+**Output:**
+```
+llm_chat run=1 total=1.236
+llm_chat run=2 total=1.259
+llm_chat run=3 total=1.258
+```
+
+```
+for i in 1 2 3 4 5 6 7 8 9 10; do echo "t=$i conn_8992=$(kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'grep -c 2320 /proc/net/tcp' 2>/dev/null)"; done
+```
+
+**Output:**
+```
+t=1 conn_8992=67    t=6  conn_8992=67
+t=2 conn_8992=67    t=7  conn_8992=67
+t=3 conn_8992=67    t=8  conn_8992=67
+t=4 conn_8992=67    t=9  conn_8992=67
+t=5 conn_8992=67    t=10 conn_8992=67
+```
+
+**Đọc được gì:**
+
+1. ❌ **LLM `qwen3-32b` KHÔNG PHẢI THỦ PHẠM — nghi phạm thứ 4 bị loại.** 1.236 / 1.259 / 1.258s
+   ⟹ **biên độ 1.02×**, ổn định gần như tuyệt đối. (Lưu ý: `max_tokens:50`; lời gọi RAPTOR thật
+   sinh nhiều token hơn nên sẽ lâu hơn — nhưng **độ ổn định** này đã đủ cho thấy gateway/LLM không
+   phải nguồn dao động 14×.)
+2. ⚠️ **`conn_8992=67` BẤT BIẾN qua 10 lần đo — nhưng phép đo này KHÔNG VALID để kết luận về
+   retrieval.** Vòng đếm chạy **sau khi** retrieval đã xong (2 lệnh tuần tự, không đồng thời)
+   ⟹ 67 chỉ là **connection nền của ingest**, không nói gì về việc retrieval có gọi gateway hay không.
+   Phải đo lại với vòng đếm chạy **nền song song** (`&`) trước khi bắn retrieval.
+3. 🔴 **Nhưng con số 67 tự nó đáng chú ý:** pod đang giữ **67 connection mở** tới LiteLLM gateway.
+   Đây là con số lớn và **bất biến** ⟹ dấu hiệu của **connection pool** (giữ sẵn), không phải
+   connection tạo/đóng theo request.
+
+### 🔴 NGHI PHẠM MỚI (khớp chặt nhất với toàn bộ dữ kiện): CONNECTION POOL CẠN
+
+**Cơ chế giả định:** mỗi backend **đo riêng lẻ đều nhanh** — nhưng đó là khi đo **từ ngoài bằng curl,
+với connection riêng mới**. Trong pod, RAGFlow dùng **connection pool DÙNG CHUNG**. Nếu ingest
+(320 request/6.5 phút, 3.4) chiếm hết slot pool, retrieval phải **chờ để LẤY ĐƯỢC connection**
+trước khi kịp gửi request đi.
+
+**Vì sao giả thuyết này giải thích được cái nghịch lý trung tâm — "mọi tầng đo riêng đều nhanh
+nhưng tổng lại chậm":** vì thời gian chờ nằm ở **khoảng GIỮA các tầng**, không nằm TRONG tầng nào.
+Nó **vô hình** với mọi phép đo đã làm:
+
+| Phép đo đã làm | Vì sao không thấy thời gian chờ pool |
+|---|---|
+| ES `_nodes/stats` | chỉ đo từ lúc query **đã tới** ES, không đo lúc chờ lấy connection |
+| `curl` embedding/LLM từ ngoài | curl tạo **connection riêng mới**, không dùng pool của app |
+| CPU pod 10–20% | đang chờ **semaphore/lock**, không tiêu CPU |
+| `curl -w` tổng thời gian | thấy tổng chậm nhưng **không tách** được chờ-pool ra khỏi chờ-backend |
+
+⟹ Khớp **đồng thời cả 4 dữ kiện**: CPU thấp · I/O wait · mọi backend nhanh · dao động theo thời điểm
+(pool đầy hay rỗng phụ thuộc đúng lúc đó ingest đang chiếm bao nhiêu slot).
+
+⚠️ **VẪN LÀ GIẢ THUYẾT.** Theo Bài học 0d: **không xây fix lên đây trước khi đo.**
+
+**Lệnh cần chạy để kiểm:**
+
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'awk "NR>1{print \$4}" /proc/net/tcp | sort | uniq -c | sort -rn'
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| cột `$4` của `/proc/net/tcp` | **trạng thái TCP** dạng hex: `01`=ESTABLISHED, `06`=TIME_WAIT, `08`=CLOSE_WAIT, `0A`=LISTEN |
+| `sort \| uniq -c \| sort -rn` | đếm mỗi trạng thái, xếp giảm dần |
+| **Cách đọc** | nhiều **CLOSE_WAIT** ⟹ app không đóng connection đúng cách, **pool rò rỉ dần cạn**. Nhiều **TIME_WAIT** ⟹ mở/đóng liên tục thay vì tái dùng ⟹ mỗi request phải handshake lại |
+
+```
+kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'echo "gateway_8992: $(grep -c 2320 /proc/net/tcp)"; echo "ES_8051: $(grep -c 1F73 /proc/net/tcp)"; echo "mysql_3306: $(grep -c 0CEA /proc/net/tcp)"; echo "TONG: $(($(wc -l < /proc/net/tcp)-1))"'
+```
+
+| Port | Hex | Ghi chú |
+|---|---|---|
+| 8992 (LiteLLM gateway) | `2320` | đã biết = 67 |
+| 8051 (ES) | `1F73` | chưa đo |
+| 3306 (MySQL) | `0CEA` | chưa đo |
+| TỔNG | — | `wc -l` trừ 1 dòng header |
+
+**Đo lại `conn_8992` cho ĐÚNG (vòng đếm chạy NỀN trước khi bắn retrieval):**
+
+```
+(for i in $(seq 1 25); do echo "t=$i conn8992=$(kubectl -n ragflow exec ragflow-57d9856dff-5kgvd -c ragflow -- sh -c 'grep -c 2320 /proc/net/tcp' 2>/dev/null)"; done &) ; curl -s -o /dev/null -w "RETRIEVAL total=%{time_total}\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"metadata_condition":{"logic":"and","conditions":[{"name":"listuserview_useridtwo","comparison_operator":"contains","value":"900034475"}]}}' ; sleep 20
+```
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `( ... &)` đặt TRƯỚC curl | ⭐ **sửa lỗi của phép đo cũ** — vòng đếm phải chạy **nền, khởi động trước** để thực sự đồng thời với retrieval |
+| `sleep 20` | giữ shell sống cho vòng nền in hết output |
+| **Cách đọc** | `conn8992` **nhảy lên >67 rồi tụt về** ⟹ retrieval có gọi gateway. **Giữ nguyên 67 suốt** ⟹ retrieval KHÔNG gọi gateway ⟹ đang chờ chỗ khác (pool? MySQL? event loop?) |
+
+---
+
 ### Nghi phạm chưa được kiểm tra (liệt kê để không quên, KHÔNG phải kết luận)
 
 Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — không được xây fix lên bất kỳ cái nào trước khi đo:
@@ -1390,7 +1490,7 @@ Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — khô
 | Nghi phạm | Vì sao đáng nghi | Cách kiểm |
 |---|---|---|
 | **Async event loop bị block** | RAGFlow là Quart/ASGI, chạy `app.run()` = **single process**. Một coroutine gọi hàm sync nặng sẽ block **toàn bộ** event loop ⟹ mọi request khác đứng chờ. Khớp hoàn hảo với: CPU thấp, I/O wait, dao động theo thời điểm, và việc ingest API (`/documents`, `/chunks`) cùng process | `py-spy dump` khi chậm; hoặc đo latency 1 request **khi không có ingest** |
-| 🔴 **LLM `qwen3-32b`** (đích I/O thứ 3, CHƯA ĐO) | Response chứa văn bản **do LLM sinh** (RAPTOR output — xem manh mối Postman ở trên). Một lời gọi LLM mất **nhiều giây**, dao động mạnh theo độ dài output ⟹ khớp đồng thời CPU thấp + I/O wait + dao động 2s↔28s + phần 1.7-26.3s chưa giải thích | Đo `/v1/chat/completions` model `qwen3-32b`; đếm connection tới port 8992 lúc retrieval chậm |
+| ❌ ~~LLM `qwen3-32b`~~ **ĐÃ ĐO, VÔ CAN (3.17)**: 1.236/1.259/1.258s, biên độ 1.02× | Response chứa văn bản **do LLM sinh** (RAPTOR output — xem manh mối Postman ở trên). Một lời gọi LLM mất **nhiều giây**, dao động mạnh theo độ dài output ⟹ khớp đồng thời CPU thấp + I/O wait + dao động 2s↔28s + phần 1.7-26.3s chưa giải thích | Đo `/v1/chat/completions` model `qwen3-32b`; đếm connection tới port 8992 lúc retrieval chậm |
 | **Rerank model** (khác embedding) | `search.py:515` `rerank_mdl.similarity(query, docs)`, `:615` `if rerank_mdl and sres.total > 0`. **Chưa kiểm** rerank model có được cấu hình không, và nếu có thì gọi tới đâu | `select * from tenant_model;` xem có rerank model; đo endpoint đó |
 | **MySQL** | `document_keyword`/`docnm_kwd` có thể query MySQL cho từng chunk. **Chưa đo MySQL** | `SHOW PROCESSLIST` khi request chậm; hoặc bật slow query log |
 | **MinIO** | Chưa đo. Retrieval có thể fetch gì từ object storage | log/metrics MinIO |
