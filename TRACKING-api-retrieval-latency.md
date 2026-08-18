@@ -122,26 +122,36 @@ ragflow-redis-0             1/1     Running   0          3d15h   172.16.93.75   
 latency thật (min/max/p50/p95) thay vì 1-2 lần đo cảm tính, (c) có timestamp để đối chiếu với log
 pod ở bước sau (xem pod nào trả lời request nào, verify/loại giả thuyết lệch tải giữa 3 pod).
 
-Chạy trên máy có thể gọi ra `10.208.137.54:8999` (không cần SSH vào cụm — endpoint NodePort mở
-sẵn ra ngoài theo ảnh anh gửi):
+**Lần đầu đưa lệnh (❌ FAIL, đã thử):**
+- Chạy trên **cmd.exe Windows** của anh: `for i in $(seq 1 30); do ... done` là cú pháp **bash**,
+  CMD không hiểu → lỗi `was unexpected at this time`. Bài học: không giả định shell của máy client
+  mà không hỏi trước.
+- Chạy trên **bash trong cụm** (`vrp-kubeengine04`): lỗi `curl: option --data-raw: is unknown`.
+  `curl` trong môi trường này là bản tối giản (có thể BusyBox curl hoặc build rút gọn), không có
+  cờ `--data-raw` (chỉ được thêm vào curl từ bản 7.43.0/2015) — dù shell là bash nên vòng `for` +
+  `$(seq...)` chạy đúng, chỉ riêng cờ curl bị thiếu. Khớp với bài học đã ghi trong
+  `TRACKING-ragflow-v0.26.4-upgrade.md`: *"Image tối giản không có netstat/ss/curl — đừng phụ
+  thuộc vào chúng"* — ở đây là bastion/cluster tool, không phải image RAGFlow, nhưng cùng chung
+  đặc điểm môi trường air-gapped tối giản hoá tool.
+
+**Lệnh sửa lại (dùng `-d` thay `--data-raw`, chạy bash trong cụm — anh đã chọn môi trường này vì
+gần network với RAGFlow nhất, latency đo được sát thực tế hơn so với gọi từ máy Windows ra xa):**
 
 ```
-for i in $(seq 1 30); do echo "run=$i time=$(date +%H:%M:%S)"; curl -s -o /dev/null -w "http_code=%{http_code} time_total=%{time_total}s\n" --location --request POST 'http://10.208.137.54:8999/api/v1/retrieval' --header 'Authorization: Bearer ragflow-2KB-U6NBJYU62kIUtOhRv-kAL-LbhPmXaPbZfPPEaEw' --header 'Content-Type: application/json' --data-raw '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"metadata_condition":{"logic":"and","conditions":[{"name":"listuserview_useridtwo","comparison_operator":"contains","value":"900034475"}]}}'; sleep 1; done
+for i in $(seq 1 30); do echo "run=$i time=$(date +%H:%M:%S)"; curl -s -o /dev/null -w "http_code=%{http_code} time_total=%{time_total}s\n" -X POST 'http://10.208.137.54:8999/api/v1/retrieval' -H 'Authorization: Bearer ragflow-2KB-U6NBJYU62kIUtOhRv-kAL-LbhPmXaPbZfPPEaEw' -H 'Content-Type: application/json' -d '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"metadata_condition":{"logic":"and","conditions":[{"name":"listuserview_useridtwo","comparison_operator":"contains","value":"900034475"}]}}'; sleep 1; done
 ```
 
 | Cờ / Thành phần | Ý nghĩa |
 |---|---|
 | `for i in $(seq 1 30); do ... done` | Lặp 30 lần — đủ để thấy phân phối latency (min/max), không quá nhiều để tránh làm phiền hệ thống đang phục vụ thật |
 | `echo "run=$i time=$(date +%H:%M:%S)"` | In số lần chạy + giờ:phút:giây NGAY TRƯỚC khi gọi — để đối chiếu với log pod ở bước 3.3 (biết request nào ứng với dòng log nào) |
-| `curl -s` | Chế độ "silent" — ẩn progress bar của curl (thanh `%`, tốc độ tải...), CHỈ giữ lại output do `-w` định nghĩa — nếu bỏ `-s`, output sẽ rất rối vì lẫn progress bar |
-| `-o /dev/null` | Vứt bỏ BODY response (không cần xem nội dung JSON trả về, chỉ cần đo thời gian) — nếu không có cờ này, toàn bộ JSON kết quả sẽ in ra màn hình lẫn với số liệu thời gian |
-| `-w "http_code=%{http_code} time_total=%{time_total}s\n"` | Định dạng output tự viết: `%{http_code}` là mã HTTP trả về (200 = OK, để phát hiện nếu có request lỗi/timeout lẫn trong loop), `%{time_total}` là tổng thời gian round-trip tính bằng giây — đây là con số latency cần thu thập |
-| `--location` | Anh đã biết — tự động follow redirect (3xx), giữ nguyên như curl gốc anh dùng |
-| `--request POST` | Anh đã biết — phương thức HTTP POST |
-| `--header 'Authorization: Bearer ...'` | Anh đã biết — token xác thực API |
-| `--header 'Content-Type: application/json'` | Anh đã biết — báo cho server biết body là JSON |
-| `--data-raw '{...}'` | Anh đã biết — body JSON gửi lên, giữ NGUYÊN request mẫu anh đã cung cấp (không đổi câu hỏi/dataset, để đo đúng CÙNG 1 query như triệu chứng anh Cường báo) |
-| `sleep 1` | Nghỉ 1 giây giữa các lần gọi — tránh gọi dồn dập gây tải giả tạo làm sai lệch kết quả đo (không muốn latency cao là do TỰ mình gây tải, phải giống pattern sử dụng thật) |
+| `curl -s` | Chế độ "silent" — ẩn progress bar của curl, CHỈ giữ lại output do `-w` định nghĩa |
+| `-o /dev/null` | Vứt bỏ BODY response (không cần xem JSON trả về, chỉ cần đo thời gian) |
+| `-w "http_code=%{http_code} time_total=%{time_total}s\n"` | Định dạng output tự viết: `%{http_code}` là mã HTTP (200 = OK, phát hiện request lỗi/timeout lẫn trong loop), `%{time_total}` là tổng thời gian round-trip — con số latency cần thu thập |
+| `-X POST` | **THAY `--request POST`** — cùng ý nghĩa (chỉ định phương thức HTTP POST), dùng dạng viết tắt `-X` vì tương thích rộng hơn trên curl tối giản |
+| `-H '...'` | **THAY `--header '...'`** — cùng ý nghĩa (gắn HTTP header), viết tắt để tương thích |
+| `-d '{...}'` | **THAY `--data-raw '{...}'`** — đây là điểm SỬA CHÍNH gây lỗi lần trước. `-d`/`--data` là cờ gửi body CƠ BẢN NHẤT của curl, có từ bản đầu tiên, chắc chắn có trên mọi bản curl (kể cả BusyBox). Khác biệt duy nhất với `--data-raw`: `-d` coi chuỗi bắt đầu bằng `@` là tên file cần đọc — JSON của mình không bắt đầu bằng `@` nên hành vi giống hệt `--data-raw` trong trường hợp này, an toàn để đổi |
+| `sleep 1` | Nghỉ 1 giây giữa các lần gọi — tránh gọi dồn dập gây tải giả tạo làm sai lệch kết quả đo |
 
 **Kỳ vọng đọc được:** nếu thấy `time_total` dao động rõ giữa các lần (ví dụ vài dòng ~2s xen với
 vài dòng ~15-20s) → xác nhận lại được symptom, tiến hành bước 3.3 đối chiếu log pod. Nếu MỌI lần
