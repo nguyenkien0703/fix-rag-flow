@@ -1621,6 +1621,70 @@ for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null -w "sau_restart run=$i to
 
 ---
 
+### 3.19 🎯 CHỐT VỊ TRÍ LEAK: 227 CLOSE_WAIT tới LiteLLM gateway — nhưng KHÔNG cạn fd
+
+**Output:**
+
+```
+=== 1. ulimit + fd PID 48 ===
+1048576
+45
+=== 2. CLOSE_WAIT noi toi dau ===
+    227 3589D00A:2320
+      8 3FD510AC:2328
+      1 0100007F:83A2
+      1 0100007F:8392
+      1 0100007F:835E
+      1 0100007F:835C
+      1 0100007F:8354
+      1 0100007F:834C
+      1 0100007F:8338
+      1 0100007F:8336
+=== 3. theo doi CLOSE_WAIT tang khong ===
+t=1 tong=488 close_wait=245
+t=2 tong=488 close_wait=245
+t=3 tong=488 close_wait=245
+t=4 tong=488 close_wait=245
+t=5 tong=489 close_wait=246
+=== 4. rerank model ===
+| model_name                      | model_type | status | extra                                  |
+| qwen3-8b-embedding              | embedding  | active | {"max_tokens": 256000}                 |
+| qwen3.5-35b-a3b                 | chat       | active | {"max_tokens": 256000, "is_tools": true} |
+| openai/qwen3-5-27b-v1           | chat       | active | {"max_tokens": ...}                    |
+| qwen3-8b-embedding___OpenAI-API | embedding  | active | {"is_tools": false, "max_tokens": 200000} |
+```
+
+**Giải mã địa chỉ hex (little-endian):**
+
+| Hex | Giải mã | Là gì |
+|---|---|---|
+| `3589D00A:2320` | `0A.D0.89.35` = **10.208.137.53** : `0x2320`=**8992** | 🔴 **LiteLLM gateway** — 227 CLOSE_WAIT |
+| `3FD510AC:2328` | `AC.10.D5.3F` = **172.16.213.63** : `0x2328`=**9000** | **MinIO** — 8 CLOSE_WAIT |
+| `0100007F:83xx` | **127.0.0.1** : port cao | localhost nội bộ, lẻ tẻ 1 cái mỗi port |
+
+**Đọc được gì:**
+
+1. 🎯 **CHỐT VỊ TRÍ LEAK: 227/245 CLOSE_WAIT (93%) đi tới `10.208.137.53:8992` = LiteLLM gateway.**
+   ⟹ Leak nằm ở **HTTP client gọi LiteLLM** (embedding + chat), **một chỗ duy nhất**, không rải rác.
+   MinIO leak nhẹ (8 cái) — bug thật nhưng nhỏ.
+2. ❌ **BỎ lập luận "cạn file descriptor".** `ulimit -n` = **1,048,576** (cực cao), fd PID 48 chỉ **45**
+   ⟹ **không hề cạn fd**. Cơ chế "retrieval chờ vì hết fd" mà tôi nêu ở 3.18 điểm 4: **SAI**.
+3. ⚠️ **Giải mâu thuẫn "fd=45 nhưng close_wait=245":** `/proc/net/tcp` liệt kê socket của **cả network
+   namespace** (mọi process trong pod, gồm `task_executor` PID 445), còn `/proc/48/fd` chỉ đếm của
+   **riêng PID 48**. ⟹ Phần lớn 245 CLOSE_WAIT thuộc **`task_executor`**, không phải API process.
+4. **CLOSE_WAIT đã TĂNG so với lần đo trước** (3.18: **104/283** → giờ **245/488**), nhưng trong 5 lần
+   đo liền nhau thì **đứng yên** (245→246, chỉ +1). ⟹ Leak tăng **theo mỗi request**, không theo
+   thời gian trôi. Khớp: giữa 2 lần đo có nhiều request ingest + retrieval chạy.
+5. **KHÔNG có model nào `model_type = rerank`** ⟹ rerank dùng **đường local**
+   (`search.py:634` `self.rerank()`), **không gọi model ngoài**. ⟹ Loại nghi phạm "rerank model".
+6. 🔴 **Giả thuyết leak PHẢI ĐỔI CƠ CHẾ:** không phải "client cạn fd", mà có thể là
+   **phía LiteLLM gateway bị cạn** — 227 connection nửa-đóng treo trên gateway có thể làm nó hết
+   worker/connection slot, **dù gateway vẫn trả lời curl đơn lẻ nhanh** (curl mở connection mới,
+   được phục vụ ngay; còn RAGFlow tái dùng pool đã đầy connection chết).
+   ❓ **Vẫn là giả thuyết** — phép thử restart sẽ phân định.
+
+---
+
 ### Nghi phạm chưa được kiểm tra (liệt kê để không quên, KHÔNG phải kết luận)
 
 Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — không được xây fix lên bất kỳ cái nào trước khi đo:
@@ -1629,7 +1693,7 @@ Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — khô
 |---|---|---|
 | **Async event loop bị block** | RAGFlow là Quart/ASGI, chạy `app.run()` = **single process**. Một coroutine gọi hàm sync nặng sẽ block **toàn bộ** event loop ⟹ mọi request khác đứng chờ. Khớp hoàn hảo với: CPU thấp, I/O wait, dao động theo thời điểm, và việc ingest API (`/documents`, `/chunks`) cùng process | `py-spy dump` khi chậm; hoặc đo latency 1 request **khi không có ingest** |
 | ❌ ~~LLM `qwen3-32b`~~ **ĐÃ ĐO, VÔ CAN (3.17)**: 1.236/1.259/1.258s, biên độ 1.02× | Response chứa văn bản **do LLM sinh** (RAPTOR output — xem manh mối Postman ở trên). Một lời gọi LLM mất **nhiều giây**, dao động mạnh theo độ dài output ⟹ khớp đồng thời CPU thấp + I/O wait + dao động 2s↔28s + phần 1.7-26.3s chưa giải thích | Đo `/v1/chat/completions` model `qwen3-32b`; đếm connection tới port 8992 lúc retrieval chậm |
-| **Rerank model** (khác embedding) | `search.py:515` `rerank_mdl.similarity(query, docs)`, `:615` `if rerank_mdl and sres.total > 0`. **Chưa kiểm** rerank model có được cấu hình không, và nếu có thì gọi tới đâu | `select * from tenant_model;` xem có rerank model; đo endpoint đó |
+| ❌ ~~Rerank model~~ **ĐÃ KIỂM (3.19): KHÔNG có model_type=rerank** ⟹ rerank chạy local, không gọi model ngoài | `search.py:515` `rerank_mdl.similarity(query, docs)`, `:615` `if rerank_mdl and sres.total > 0`. **Chưa kiểm** rerank model có được cấu hình không, và nếu có thì gọi tới đâu | `select * from tenant_model;` xem có rerank model; đo endpoint đó |
 | **MySQL** | `document_keyword`/`docnm_kwd` có thể query MySQL cho từng chunk. **Chưa đo MySQL** | `SHOW PROCESSLIST` khi request chậm; hoặc bật slow query log |
 | **MinIO** | Chưa đo. Retrieval có thể fetch gì từ object storage | log/metrics MinIO |
 | 🔴🔴 **CONNECTION LEAK (CLOSE_WAIT) — ĐÃ CÓ BẰNG CHỨNG, xem 3.18** | Nếu pool tới ES/MySQL nhỏ và ingest chiếm hết ⟹ retrieval chờ **lấy connection**, không phải chờ query. ES query nhanh nhưng **chờ pool** thì không hiện trong ES stats | đếm connection trong `/proc/net/tcp`; tìm config pool size |
