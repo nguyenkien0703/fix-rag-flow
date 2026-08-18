@@ -16,12 +16,14 @@ query, lúc trả về **~2s**, lúc **>20s**.
 
 | Thành phần | Giá trị | Nguồn |
 |---|---|---|
-| RAGFlow version | v0.26.4, image đã custom bởi anh Cường | Kiên xác nhận 2026-08-18 |
+| RAGFlow version | v0.26.4, image custom `10.60.10.184:8083/vmlp/lfnovo/ragflow:v2-latest` — build từ v0.26.x, "đã sửa phần build query cho tiếng Việt" (comment values.yaml) | Screenshot values.yaml 2026-08-18 |
 | Search engine | Elasticsearch (external, ngoài cụm k8s RAGFlow) | `investigate_issue_4/04-root-cause.md` |
-| ES endpoint (env test cũ) | `10.211.145.107:8051`, user `aihub_prod` | `investigate_issue_4/03-measurements.md` |
+| ES endpoint THẬT (values.yaml `service_conf.es.hosts`) | `https://10.211.145.107:8051`, user `aihub_prod` | Screenshot values.yaml 2026-08-18 — khớp env test cũ, có `https://` (tracking cũ ghi thiếu scheme) |
 | KB test cũ (lúc chốt root cause) | `voffice-docs-sum`, **141,978** doc | `investigate_issue_4/04-root-cause.md` |
-| KB hiện tại | **1,899,860** doc (~13.4x so với lúc điều tra), tiếp tục tăng | Kiên xác nhận 2026-08-18 |
-| RAGFlow retrieval API test endpoint | `http://10.208.137.54:8999/api/v1/retrieval` (Bearer token riêng) | Kiên xác nhận 2026-08-18 |
+| KB hiện tại | dataset **Voffice-doc-sum**, **1,901,802 files** (UI RAGFlow, 2026-08-18 09:28) — tăng liên tục, khớp con số ~1.9M đã báo trước | Screenshot UI RAGFlow 2026-08-18 |
+| RAGFlow retrieval API test endpoint | `http://10.208.137.54:8999/api/v1/retrieval` (Bearer token riêng, NodePort 8999) | Kiên xác nhận 2026-08-18 |
+| **Số pod RAGFlow (Web/API)** | `replicas: 3` trong values.yaml — **CHỦ Ý thiết kế**, không phải bất thường | Screenshot values.yaml, khớp `kubectl get pods` (3.1) |
+| Kiến trúc pod | 1 container/pod chạy CHUNG Web/API + `task_executor`. Theo comment values.yaml: *"An toàn để scale: task_executor dùng Redis Stream Consumer Group nên mỗi task chỉ giao cho đúng 1 consumer (không bao giờ 1 file bị 2 pod). Xử lý Web/API stateless theo request"* | Screenshot values.yaml 2026-08-18 |
 
 ## 2. Tổng quan issue
 
@@ -36,7 +38,7 @@ query, lúc trả về **~2s**, lúc **>20s**.
 > Nguyên tắc: mọi lệnh dưới đây PHẢI có output thật kèm theo trước khi coi là "đã chạy".
 > Lệnh chưa có output chỉ là **đề xuất**, đánh dấu `⏳ CHỜ OUTPUT`.
 
-### 3.1 Verify patch `minimum_should_match` cũ có còn tồn tại / có conflict với code v0.26 gốc không — ⏳ CHỜ OUTPUT
+### 3.1 Verify patch `minimum_should_match` cũ có còn tồn tại / có conflict với code v0.26 gốc không — ✅ ĐÃ CHẠY, xem output dưới
 
 **Vì sao cần chạy trước tiên:** code v0.26 upstream đã tự có sẵn `minimum_should_match` ở
 `rag/nlp/query.py` (dòng 92/165/229, theo `TRACKING-ragflow-v0.26.4-upgrade.md` mục Issue 10).
@@ -103,10 +105,52 @@ ragflow-redis-0             1/1     Running   0          3d15h   172.16.93.75   
   để patch có thể đã không còn tồn tại dạng cũ trong file v0.26, nên sed không có gì để sửa, không
   gây lỗi, không tăng dòng). Không cần gỡ patch cũ gấp — nó không gây nhiễu số liệu đo sắp tới.
 - ⟹ Cluster có **3 pod ragflow** (không phải 1 như baseline cũ lúc điều tra Issue #4/#10) — trải
-  trên 2 node (`vrp-kubeengine05`, `vrp-kubeengine06`). Đây là thông tin MỚI, chưa từng ghi nhận
-  trước — cần cân nhắc khi đo latency: có thể latency dao động do **load-balance không đều giữa
-  3 pod** (ví dụ 1 pod mới restart 15h AGE, còn 2 pod khác 4d5h AGE — không đồng nhất tuổi/trạng
-  thái) chứ không chỉ do ES/tokenizer. Đây là hướng nghi phạm MỚI, thêm vào Issue 3.
+  trên 2 node (`vrp-kubeengine05`, `vrp-kubeengine06`). Ban đầu nghi là bất thường, NHƯNG đã xác
+  minh ở values.yaml: `replicas: 3` là **chủ ý thiết kế**, không phải lỗi/pod restart bất thường.
+  ❓ **Giả thuyết cần đo, KHÔNG kết luận vội**: comment values.yaml khẳng định Web/API xử lý
+  "stateless theo request" và task_executor tách riêng qua Redis Consumer Group — nếu đúng, mọi
+  pod API về lý thuyết PHẢI xử lý cùng 1 request giống nhau, không có lý do 1 pod nặng hơn pod
+  khác. Giả thuyết "lệch tải giữa 3 pod gây latency dao động" do đó YẾU hơn dự đoán ban đầu —
+  cần đo trực tiếp (map response time với pod nào trả lời) để xác nhận hoặc loại, không suy diễn
+  từ comment code.
+
+### 3.2 Build feedback loop — gọi retrieval API N lần liên tục, đo latency mỗi lần, ghi timestamp — ⏳ CHỜ OUTPUT
+
+**Vì sao cần script này (không phải gọi curl 1 lần rồi đoán):** issue là "cùng query, lúc 2s lúc
+>20s" — non-deterministic theo thời gian. Cần loop đủ số lần (khuyến nghị 30-50 lần liên tục) để:
+(a) xác nhận lại được symptom (tránh trường hợp giờ đã hết mà chỉ nhớ nhầm), (b) có phân phối
+latency thật (min/max/p50/p95) thay vì 1-2 lần đo cảm tính, (c) có timestamp để đối chiếu với log
+pod ở bước sau (xem pod nào trả lời request nào, verify/loại giả thuyết lệch tải giữa 3 pod).
+
+Chạy trên máy có thể gọi ra `10.208.137.54:8999` (không cần SSH vào cụm — endpoint NodePort mở
+sẵn ra ngoài theo ảnh anh gửi):
+
+```
+for i in $(seq 1 30); do echo "run=$i time=$(date +%H:%M:%S)"; curl -s -o /dev/null -w "http_code=%{http_code} time_total=%{time_total}s\n" --location --request POST 'http://10.208.137.54:8999/api/v1/retrieval' --header 'Authorization: Bearer ragflow-2KB-U6NBJYU62kIUtOhRv-kAL-LbhPmXaPbZfPPEaEw' --header 'Content-Type: application/json' --data-raw '{"question":"quy tắc quy trình quy định về điều lệnh","dataset_ids":["73932b965e5e11f192725fd51894c519"],"similarity_threshold":0.3,"vector_similarity_weight":0.6,"metadata_condition":{"logic":"and","conditions":[{"name":"listuserview_useridtwo","comparison_operator":"contains","value":"900034475"}]}}'; sleep 1; done
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `for i in $(seq 1 30); do ... done` | Lặp 30 lần — đủ để thấy phân phối latency (min/max), không quá nhiều để tránh làm phiền hệ thống đang phục vụ thật |
+| `echo "run=$i time=$(date +%H:%M:%S)"` | In số lần chạy + giờ:phút:giây NGAY TRƯỚC khi gọi — để đối chiếu với log pod ở bước 3.3 (biết request nào ứng với dòng log nào) |
+| `curl -s` | Chế độ "silent" — ẩn progress bar của curl (thanh `%`, tốc độ tải...), CHỈ giữ lại output do `-w` định nghĩa — nếu bỏ `-s`, output sẽ rất rối vì lẫn progress bar |
+| `-o /dev/null` | Vứt bỏ BODY response (không cần xem nội dung JSON trả về, chỉ cần đo thời gian) — nếu không có cờ này, toàn bộ JSON kết quả sẽ in ra màn hình lẫn với số liệu thời gian |
+| `-w "http_code=%{http_code} time_total=%{time_total}s\n"` | Định dạng output tự viết: `%{http_code}` là mã HTTP trả về (200 = OK, để phát hiện nếu có request lỗi/timeout lẫn trong loop), `%{time_total}` là tổng thời gian round-trip tính bằng giây — đây là con số latency cần thu thập |
+| `--location` | Anh đã biết — tự động follow redirect (3xx), giữ nguyên như curl gốc anh dùng |
+| `--request POST` | Anh đã biết — phương thức HTTP POST |
+| `--header 'Authorization: Bearer ...'` | Anh đã biết — token xác thực API |
+| `--header 'Content-Type: application/json'` | Anh đã biết — báo cho server biết body là JSON |
+| `--data-raw '{...}'` | Anh đã biết — body JSON gửi lên, giữ NGUYÊN request mẫu anh đã cung cấp (không đổi câu hỏi/dataset, để đo đúng CÙNG 1 query như triệu chứng anh Cường báo) |
+| `sleep 1` | Nghỉ 1 giây giữa các lần gọi — tránh gọi dồn dập gây tải giả tạo làm sai lệch kết quả đo (không muốn latency cao là do TỰ mình gây tải, phải giống pattern sử dụng thật) |
+
+**Kỳ vọng đọc được:** nếu thấy `time_total` dao động rõ giữa các lần (ví dụ vài dòng ~2s xen với
+vài dòng ~15-20s) → xác nhận lại được symptom, tiến hành bước 3.3 đối chiếu log pod. Nếu MỌI lần
+đều ổn định (~2-5s) → có thể symptom đã giảm/không còn tái hiện ở thời điểm đo này — cần đo thêm
+tại giờ cao điểm hoặc hỏi anh Cường thời điểm chính xác xảy ra >20s.
+
+**Output:** _(dán nguyên văn — 30 dòng `run=... time_total=...`)_
+
+**Đọc được gì:** _(điền sau khi có output)_
 
 ---
 
