@@ -29,9 +29,9 @@ query, lúc trả về **~2s**, lúc **>20s**.
 
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
-| 1 | Query tiếng Việt build ra clause OR chứa hư từ (thiếu stopword) → match rộng ES | Cao | ⚠️ **WORKAROUND** (giảm nhẹ, chưa xác nhận hết) | Đã custom image v0.26 (anh Cường), latency giảm 15-20s → 1.2-5s @ 141k. **Chưa đo lại số liệu chính xác sau upgrade** |
+| 1 | Query tiếng Việt build ra clause OR chứa hư từ (thiếu stopword) → match rộng ES | Cao | ⚠️ **WORKAROUND KHÔNG ĐỦ** — xem 3.2, workaround v0.26 giảm nhẹ nhưng KHÔNG giữ ổn định ở scale 1.9M (30 mẫu: min 1.98s, max 28.2s, chỉ 37% dưới 5s) | Đã custom image v0.26 (anh Cường). Cần đo tiếp xem còn dư địa cải thiện ở tầng tokenizer/query hay đã hết, chuyển hướng sang Issue 3 |
 | 2 | Patch cũ `minimum_should_match` (initContainer, từ Issue #4) có thể THỪA/conflict với code v0.26 upstream đã có sẵn tham số này | Trung bình | ✅ **LOẠI TRỪ** — xem lệnh 3.1, code trong pod khớp đúng gốc v0.26, không bị đè | — |
-| 3 | Latency tại scale MỚI (1.9M doc) chưa từng được đo — nghi bottleneck mới (index/shard/HNSW/GC, **hoặc load-balance không đều giữa 3 pod ragflow phát hiện ở 3.1**) khác root cause cũ | Cao | 🔶 **OPEN** | Đo lại theo `investigate_issue_4/measure3.sh` trên KB hiện tại, đo riêng từng pod |
+| 3 | Latency tại scale MỚI (1.9M doc) dao động mạnh 1.98s-28.2s (30 mẫu thật, 3.2) — nghi bottleneck mới (index/shard/HNSW/GC, **hoặc load-balance không đều giữa 3 pod ragflow**) khác root cause cũ | Cao | 🔶 **OPEN**, đang đo | Đối chiếu log 3 pod theo timestamp (lệnh 3.3, chờ output) để xác nhận/loại giả thuyết lệch tải |
 
 ## 3. Lệnh đã chạy
 
@@ -158,7 +158,132 @@ vài dòng ~15-20s) → xác nhận lại được symptom, tiến hành bước
 đều ổn định (~2-5s) → có thể symptom đã giảm/không còn tái hiện ở thời điểm đo này — cần đo thêm
 tại giờ cao điểm hoặc hỏi anh Cường thời điểm chính xác xảy ra >20s.
 
-**Output:** _(dán nguyên văn — 30 dòng `run=... time_total=...`)_
+**Output:**
+
+```
+run=1 time=09:48:34
+http_code=200 time_total=14.263s
+run=2 time=09:48:49
+http_code=200 time_total=14.278s
+run=3 time=09:49:05
+http_code=200 time_total=2.298s
+run=4 time=09:49:08
+http_code=200 time_total=9.902s
+run=5 time=09:49:19
+http_code=200 time_total=19.369s
+run=6 time=09:49:39
+http_code=200 time_total=1.983s
+run=7 time=09:49:42
+http_code=200 time_total=11.078s
+run=8 time=09:49:54
+http_code=200 time_total=28.194s
+run=9 time=09:50:23
+http_code=200 time_total=2.165s
+run=10 time=09:50:27
+http_code=200 time_total=9.243s
+run=11 time=09:50:37
+http_code=200 time_total=18.116s
+run=12 time=09:50:56
+http_code=200 time_total=3.952s
+run=13 time=09:51:01
+http_code=200 time_total=4.884s
+run=14 time=09:51:07
+http_code=200 time_total=26.249s
+run=15 time=09:51:34
+http_code=200 time_total=2.011s
+run=16 time=09:51:37
+http_code=200 time_total=6.192s
+run=17 time=09:51:44
+http_code=200 time_total=10.564s
+run=18 time=09:51:56
+http_code=200 time_total=2.623s
+run=19 time=09:52:00
+http_code=200 time_total=6.516s
+run=20 time=09:52:07
+http_code=200 time_total=17.843s
+run=21 time=09:52:26
+http_code=200 time_total=4.985s
+run=22 time=09:52:32
+http_code=200 time_total=11.161s
+run=23 time=09:52:44
+http_code=200 time_total=15.784s
+run=24 time=09:53:01
+http_code=200 time_total=2.265s
+run=25 time=09:53:04
+http_code=200 time_total=10.118s
+run=26 time=09:53:15
+http_code=200 time_total=19.207s
+run=27 time=09:53:35
+http_code=200 time_total=2.300s
+run=28 time=09:53:39
+http_code=200 time_total=4.868s
+run=29 time=09:53:45
+http_code=200 time_total=7.471s
+run=30 time=09:53:53
+http_code=200 time_total=16.713s
+```
+
+**Đọc được gì:**
+- **30/30 lần `http_code=200`** — không có request nào lỗi/timeout, mọi lần dao động là do
+  THỜI GIAN XỬ LÝ, không phải lỗi kết nối/retry. Loại trừ nghi ngờ "một số request bị lỗi rồi
+  retry gây delay giả" — mọi lần đều thành công, chỉ khác thời gian.
+- **Phân phối latency (30 mẫu, tính bằng script, không ước lượng):**
+  min=1.983s, max=28.194s (**~14.2x chênh lệch**), mean=10.22s, median=9.57s.
+  Chia khoảng: <5s: 11/30, 5-10s: 5/30, 10-20s: 12/30, ≥20s: 2/30.
+- ⟹ **Symptom KHÔNG phải bimodal** (2 cụm tách biệt "nhanh" và "chậm") mà là **phân phối liên
+  tục, trải đều** từ 2s đến 28s — nhìn theo timeline (`time=`) không thấy pattern rõ theo giờ
+  (ví dụ không phải "phút đầu nhanh, phút sau chậm dần"): run=3 (2.3s) ngay sau run=1,2 (14.2s,
+  14.3s), rồi run=5 lại 19.4s, run=6 lại 1.98s — **dao động run-kế-run rất mạnh, không có xu
+  hướng tăng/giảm dần theo thời gian đo (không phải warm-up hay degradation dần)**.
+- ⟹ **QUAN TRỌNG — mâu thuẫn với lời kể ban đầu:** anh Cường báo "lúc 2s lúc >20s" và Kiên kể lại
+  workaround v0.26 đã giảm về "1.2s-5s @ KB 141k" — nhưng số liệu THẬT ở KB 1.9M hiện tại cho
+  thấy **latency KHÔNG hề ổn định quanh vùng thấp**: chỉ 11/30 (~37%) dưới 5s, còn lại (~63%)
+  từ 5s đến 28s. Tức là workaround tokenizer có thể vẫn còn tác dụng MỘT PHẦN (vẫn có nhiều lần
+  <5s), nhưng **không đủ để giữ ổn định ở scale 1.9M** — khớp với nghi vấn đã ghi ở Issue 3
+  (mục 4): bottleneck có thể đã chuyển từ "match quá rộng do thiếu stopword" sang "cost tăng
+  theo kích thước index/segment ở quy mô triệu-document", vì ngay cả khi query build tốt, ES
+  vẫn phải quét/score trên tập dữ liệu lớn hơn 13x so với lúc đo 141k.
+- ❓ **Chưa xác nhận được liệu dao động run-kế-run mạnh (2s rồi ngay 14s) có tương quan với POD
+  nào trả lời không** — đây là lý do bước 3.3 (đối chiếu log pod theo timestamp `time=` ở trên)
+  vẫn cần làm, để loại hoặc xác nhận giả thuyết lệch tải giữa 3 pod đã nêu ở Issue 3.
+
+### 3.3 Đối chiếu log 3 pod ragflow trong đúng khoảng thời gian đã đo (09:48:34 → 09:53:53) — ⏳ CHỜ OUTPUT
+
+**Vì sao cần lệnh này:** số liệu 3.2 cho thấy dao động MẠNH giữa các request liên tiếp (không
+theo xu hướng thời gian, không phải warm-up/degradation dần) — gợi ý nguyên nhân thay đổi theo
+TỪNG request, ví dụ pod nào trả lời. Cần map mỗi `run=N time=HH:MM:SS` (đã có ở 3.2) với dòng log
+tương ứng trên từng pod để biết: (a) 30 request có chia đều cho 3 pod không, (b) latency cao có
+rơi tập trung vào 1 pod cụ thể không.
+
+Chạy trên `vrp-kubeengine04` (hoặc máy có `kubectl` context), lấy log CẢ 3 pod, giới hạn đúng
+khung giờ đã đo (thêm đệm phía trước để không bỏ sót request biên):
+
+```
+kubectl -n ragflow logs ragflow-57d9856dff-5kgvd -c ragflow --since-time=2026-08-18T09:47:00+07:00 | grep -E "retrieval|POST /api/v1"
+```
+
+```
+kubectl -n ragflow logs ragflow-57d9856dff-pljxz -c ragflow --since-time=2026-08-18T09:47:00+07:00 | grep -E "retrieval|POST /api/v1"
+```
+
+```
+kubectl -n ragflow logs ragflow-57d9856dff-q9kz2 -c ragflow --since-time=2026-08-18T09:47:00+07:00 | grep -E "retrieval|POST /api/v1"
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `-n ragflow` | Namespace, đã dùng ở 3.1 |
+| `logs POD_NAME` | Xem log của pod cụ thể — chạy 3 LẦN, mỗi lần 1 tên pod trong 3 pod đã biết từ 3.1 (`5kgvd`, `pljxz`, `q9kz2`) — **không dùng `-l app=ragflow` gộp 3 pod vì log sẽ trộn lẫn không phân biệt được pod nào**, phải tách riêng để so sánh |
+| `-c ragflow` | Container, giống 3.1 — pod này chỉ có 1 container nhưng vẫn nên ghi rõ để chắc chắn |
+| `--since-time=2026-08-18T09:47:00+07:00` | Chỉ lấy log TỪ thời điểm này — định dạng ISO 8601 kèm timezone `+07:00` (giờ Việt Nam) vì `kubectl logs` mặc định hiểu UTC nếu không ghi rõ offset, ghi sai timezone sẽ lấy nhầm log của giờ khác. Chọn `09:47:00` (sớm hơn `run=1` lúc `09:48:34` khoảng 1.5 phút) để chắc chắn không bỏ lỡ dòng log đầu |
+| `\| grep -E "retrieval\|POST /api/v1"` | Lọc chỉ giữ dòng log liên quan tới request retrieval — `-E` cho phép dùng `\|` (OR) trong pattern; nếu log RAGFlow không có đúng 2 từ khóa này, cần đổi pattern sau khi xem thử log thô (`kubectl logs ... \| tail -50` không lọc) |
+
+**Kỳ vọng đọc được:** đếm số dòng match ở mỗi pod — nếu 3 pod có số lượng request gần bằng nhau
+(~10 mỗi pod) → xác nhận traffic được chia đều (round-robin/LB hoạt động đúng). Ghép timestamp
+log với `time=` ở bảng 3.2 để biết pod nào xử lý run nào, rồi đối chiếu latency cao (>15s) có rơi
+tập trung vào 1 pod cụ thể không.
+
+**Output:** _(dán nguyên văn cả 3 lần chạy, ghi rõ log của pod nào)_
 
 **Đọc được gì:** _(điền sau khi có output)_
 
