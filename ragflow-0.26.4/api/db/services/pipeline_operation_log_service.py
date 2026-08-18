@@ -207,16 +207,58 @@ class PipelineOperationLogService(CommonService):
         with DB.atomic():
             obj = cls.save(**log)
 
-            limit = int(os.getenv("PIPELINE_OPERATION_LOG_LIMIT", 1000))
-            total = cls.model.select().where(cls.model.kb_id == document.kb_id).count()
-
-            if total > limit:
-                keep_ids = [m.id for m in cls.model.select(cls.model.id).where(cls.model.kb_id == document.kb_id).order_by(cls.model.create_time.desc()).limit(limit)]
-
-                deleted = cls.model.delete().where(cls.model.kb_id == document.kb_id, cls.model.id.not_in(keep_ids)).execute()
-                logging.info(f"[PipelineOperationLogService] Cleaned {deleted} old logs, kept latest {limit} for {document.kb_id}")
+        cls._trim_logs(document.kb_id)
 
         return obj
+
+    @classmethod
+    def _trim_logs(cls, kb_id):
+        """Drop old logs for a dataset, keeping the newest PIPELINE_OPERATION_LOG_LIMIT rows.
+
+        Runs outside the log-insert transaction and only once the row count exceeds the
+        limit by a slack factor, so the delete is amortised over many ingest tasks instead
+        of firing for every parsed document. A MySQL advisory lock keeps concurrent task
+        executors from issuing overlapping deletes over the same kb_id range.
+        """
+        limit = int(os.getenv("PIPELINE_OPERATION_LOG_LIMIT", 1000))
+        if limit <= 0:
+            return
+
+        slack = float(os.getenv("PIPELINE_OPERATION_LOG_TRIM_SLACK", 1.5))
+        total = cls.model.select().where(cls.model.kb_id == kb_id).count()
+        if total <= limit * slack:
+            return
+
+        lock_name = f"ragflow_pipeline_log_trim_{kb_id}"
+        if not cls._try_advisory_lock(lock_name):
+            # Another executor is already trimming this dataset.
+            return
+
+        try:
+            cutoff = cls.model.select(cls.model.create_time).where(cls.model.kb_id == kb_id).order_by(cls.model.create_time.desc()).limit(1).offset(limit - 1).scalar()
+            if cutoff is None:
+                return
+
+            deleted = cls.model.delete().where(cls.model.kb_id == kb_id, cls.model.create_time < cutoff).execute()
+            logging.info(f"[PipelineOperationLogService] Cleaned {deleted} old logs, kept latest {limit} for {kb_id}")
+        finally:
+            cls._release_advisory_lock(lock_name)
+
+    @classmethod
+    def _try_advisory_lock(cls, name):
+        try:
+            return DB.execute_sql("SELECT GET_LOCK(%s, 0)", (name,)).fetchone()[0] == 1
+        except Exception:
+            # Backends without GET_LOCK (PostgreSQL, OceanBase variants) fall back to
+            # trimming unguarded; the slack factor already makes collisions rare.
+            return True
+
+    @classmethod
+    def _release_advisory_lock(cls, name):
+        try:
+            DB.execute_sql("SELECT RELEASE_LOCK(%s)", (name,))
+        except Exception:
+            pass
 
     @classmethod
     @DB.connection_context()
