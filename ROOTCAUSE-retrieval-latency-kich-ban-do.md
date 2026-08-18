@@ -1317,3 +1317,182 @@ kubectl -n ragflow exec "$POD" -c ragflow -- sh -c 'kill -ABRT 25'
 | Chèn timing `rag/nlp/search.py` | 🔽 **Hạ ưu tiên** — Đ14 có thể kết luận mà không cần build image |
 | Thêm `py-spy` vào image | 🔽 Hạ ưu tiên — chỉ cần nếu Đ14 + Đ15 đều âm tính |
 | **Log duration cho Peewee** | 🔼 **MỚI, ưu tiên cao** — đây là lỗ hổng quan sát gốc rễ khiến 5 phiên không kết luận được |
+
+---
+
+# 9. 🎯 ROOT CAUSE — ĐÃ XÁC ĐỊNH (2026-08-18, phiên 6)
+
+Sau 6 phiên và 24 tầng bị loại, root cause được xác định **tới dòng code**, có bằng chứng
+trực tiếp từ MySQL (không phải suy luận từ source — xem "Bài học 0d").
+
+## 9.1. Bằng chứng đo được
+
+**Đ17 — grep log RAGFlow trong lúc chạy 5 request retrieval:**
+
+```
+5 request: TONG = 9.115 / 10.096 / 7.846 / 12.513 / 9.272  (trung binh 9.8s)
+```
+
+Trong cùng cửa sổ ~10 giây đó, log chứa:
+
+```
+44 dòng: ERROR  42 DB execution failure:
+         (1213, 'Deadlock found when trying to get lock; try restarting transaction')
+```
+
+Timestamp dày đặc 17:04:35 → 17:04:42 — **trùng khớp thời điểm request chậm**.
+
+> ⚠️ Lưu ý phương pháp: grep hẹp `"Database connection issue"` trả về **0** →
+> cơ chế `RetryingPooledMySQLDatabase` exponential backoff (1/2/4/8/16s) **KHÔNG** kích hoạt.
+> Giả thuyết backoff bị loại. Chỉ grep rộng `"DB execution"` mới lộ ra deadlock.
+
+**Đ18 — `SHOW ENGINE INNODB STATUS`, mục LATEST DETECTED DEADLOCK:**
+
+```sql
+*** (1) TRANSACTION:
+TRANSACTION 201568384, ACTIVE 1 sec starting index read
+mysql tables in use 1, locked 1
+LOCK WAIT 3 lock struct(s), heap size 1128, 2 row lock(s), undo log entries 1
+
+DELETE FROM `pipeline_operation_log`
+WHERE ((`pipeline_operation_log`.`kb_id` = '73932b965e5e11f192725fd51894c519')
+   AND (`pipeline_operation_log`.`id` NOT IN ('a351af8e...', 'a2fb891a...', ... ~1000 ids ...)))
+```
+
+**Đ19 — `information_schema.innodb_trx` ngay thời điểm đó:**
+
+| trx_state | wait_s | rows_locked | query |
+|---|---|---|---|
+| RUNNING | - | 0 | `SELECT COUNT(t1.id) FROM task INNER JOIN document ON ...` |
+| RUNNING | - | 0 | `SELECT COUNT(t1.id) FROM task INNER JOIN document ON ...` |
+| RUNNING | - | 0 | `SELECT COUNT(t1.id) FROM task INNER JOIN document ON ...` |
+| **LOCK WAIT** | 0 | 1 | `DELETE FROM pipeline_operation_log WHERE kb_id=... AND ...` |
+| RUNNING | - | 8 | `DELETE FROM pipeline_operation_log WHERE kb_id=... AND ...` |
+
+⟹ **Hai câu DELETE giống hệt nhau đang giành lock lẫn nhau.**
+Không phải ingest-vs-retrieval như giả thuyết ban đầu — mà là **ingest tự deadlock với chính nó**.
+
+**Đ20 — quy mô bảng:**
+
+```
+KB| 73932b965e5e11f192725fd51894c519  →  1000    ← đúng kb trong deadlock
+KB| 3c534ac24a8011f1ac9749e86cfe939a  →  1000
+KB| 1f5b090e5f3011f1a22d4f88f6ea65d6  →   900
+KB| c7d2ec5c7b3a11f198e53d33b00035ba  →   170
+KB| 1fea65067c2f11f198e53d33b00035ba  →   166
+TOTAL| 3913
+```
+
+Bảng chỉ **3913 dòng** — cực nhỏ. Chi phí **không** nằm ở khối lượng dữ liệu,
+mà nằm hoàn toàn ở **tần suất + kiểu lock**. Không fix được bằng thêm index.
+
+## 9.2. Code gây ra — `api/db/services/pipeline_operation_log_service.py:207-217`
+
+```python
+with DB.atomic():                                          # ① transaction MỞ
+    obj = cls.save(**log)                                  # ② INSERT log mới
+
+    limit = int(os.getenv("PIPELINE_OPERATION_LOG_LIMIT", 1000))
+    total = cls.model.select().where(cls.model.kb_id == document.kb_id).count()   # ③ COUNT
+
+    if total > limit:
+        keep_ids = [m.id for m in cls.model.select(cls.model.id)                  # ④ 1000 ids
+                    .where(cls.model.kb_id == document.kb_id)
+                    .order_by(cls.model.create_time.desc()).limit(limit)]
+
+        deleted = cls.model.delete().where(                                       # ⑤ DELETE
+            cls.model.kb_id == document.kb_id,
+            cls.model.id.not_in(keep_ids)).execute()
+```
+
+**Caller:** `PipelineOperationLogService.create(...)` tại
+`rag/svr/task_executor.py:774, 804, 846, 896` ⟹ chạy **mỗi document parse xong**.
+
+## 9.3. Bốn khiếm khuyết cộng dồn
+
+| # | Khiếm khuyết | Hậu quả |
+|---|---|---|
+| 1 | `DB.atomic()` bọc cả COUNT + SELECT + DELETE | Transaction giữ mở suốt 3 query, lock không nhả tới cuối |
+| 2 | `id NOT IN (1000 ids)` | MySQL **không dùng được index** cho `NOT IN`; quét toàn range `kb_id` và khoá mọi hàng đi qua (kèm gap lock ở REPEATABLE READ) |
+| 3 | `COUNT(*)` không điều kiện thời gian | Tự nó đã là full range scan trên `kb_id` |
+| 4 | Chạy mỗi document, nhiều worker song song **cùng `kb_id`** | N worker chạy cùng câu DELETE trên cùng range, thứ tự quét khác nhau → chu trình wait-for → **deadlock là tất yếu, không phải xui** |
+
+## 9.4. 🔴 Trạng thái tệ nhất — và hệ đang ở đúng đó
+
+`total` của 2 kb đứng **chính xác ở 1000** = đúng `limit` mặc định. Nghĩa là mỗi document parse xong:
+
+```
+INSERT 1 dòng  →  total = 1001  →  total > limit LUÔN TRUE
+              →  SELECT lấy 1000 id
+              →  DELETE ... NOT IN (1000 id)  →  xoá ĐÚNG 1 DÒNG
+```
+
+⟹ Hệ thống trả giá bằng **một range lock toàn bộ `kb_id` + truyền 1000 id qua wire,
+để xoá một hàng duy nhất** — lặp lại cho từng document trong 1.9M.
+Đây không phải "thỉnh thoảng dọn log"; đây là **vòng lặp khoá-bảng vĩnh viễn**.
+
+## 9.5. Vì sao retrieval dao động 2s ↔ 22s
+
+Retrieval **không** là nạn nhân trực tiếp của câu DELETE. Nó là nạn nhân của **hệ quả**:
+
+1. Các transaction DELETE ôm range lock + deadlock rollback + retry ⟹ MySQL nghẽn
+2. Retrieval cần **5–7 query SQL** (`KnowledgebaseService.accessible` trong vòng lặp,
+   `get_by_ids`, `get_by_id`, `get_model_config_from_provider_instance`,
+   và `_prune_deleted_chunks` → `DocumentService.get_by_ids()` với `IN (~90)`)
+3. Mỗi query phải xếp hàng sau các transaction đang ôm lock
+4. Rơi trúng lúc deadlock+rollback+retry → **20s**. Lọt vào khe trống → **2s**
+
+⟹ Đúng bản chất **ngẫu nhiên/lưỡng cực** đã quan sát suốt 6 phiên.
+
+## 9.6. Khớp toàn bộ dấu vân tay đã thu thập
+
+| Dấu vân tay đo được (phiên 1-6) | Deadlock/lock-wait giải thích? |
+|---|---|
+| CPU 11%, `nr_throttled 0` khi request 22s | ✅ Chờ lock = không tiêu CPU |
+| Không dòng log HTTP nào trong khoảng trống | ✅ Không đi qua HTTP |
+| ES `_search` chỉ 1.37s trong request 22.29s | ✅ ES thực sự vô can |
+| Dao động 12× (3.3s → 22.3s), anti-correlated với ES | ✅ Contention ngẫu nhiên theo bản chất |
+| Chỉ chậm **khi ingest chạy** | ✅ Ingest là bên sinh ra câu DELETE |
+| Embedding 150ms, rerank A/B không phân biệt | ✅ Đều vô can, đúng như đã loại |
+| Peewee không log duration → 5 phiên không thấy | ✅ Đây là tầng duy nhất chưa từng đo được |
+
+**Nghịch lý trung tâm được giải:** "mọi backend đo được đều nhanh nhưng tổng lại chậm"
+— vì backend chậm nhất chính là backend **không đo được**.
+
+## 9.7. Fix — 2 tầng
+
+### Tầng 1 — mitigation tức thì, KHÔNG cần build image
+
+Đặt `PIPELINE_OPERATION_LOG_LIMIT` rất lớn ⟹ `total > limit` thành **false** ⟹ khối DELETE không bao giờ chạy.
+
+```bash
+kubectl -n ragflow set env deployment/ragflow PIPELINE_OPERATION_LOG_LIMIT=100000000
+```
+
+- ⚠️ Gây **rolling restart 3 pod** — cần xác nhận trước vì đang production + ingest chạy
+- Đánh đổi: bảng log phình ra. Chấp nhận được (hiện mới 3913 dòng);
+  dọn thủ công định kỳ bằng `DELETE ... WHERE create_time < X LIMIT 1000`
+- Deployment: chỉ có **một** deployment `ragflow` (3/3, 95d) — API server + task_executor chung
+
+### Tầng 2 — fix code (bàn giao anh Cường, cần build image)
+
+Sửa `api/db/services/pipeline_operation_log_service.py:207-217`. Ba phương án:
+
+| PA | Nội dung | Ưu | Nhược |
+|---|---|---|---|
+| (a) | Trim theo thời gian: `DELETE WHERE kb_id=X AND create_time < (now - N ngày) LIMIT 1000` | Dùng được index, khoá ít hàng | Số log giữ lại không cố định |
+| **(b)** ⭐ | Chỉ trim khi `total > limit * 1.5`; xoá bằng `create_time < (create_time của hàng thứ limit)` thay vì `NOT IN`; đưa DELETE **ra ngoài** `DB.atomic()` | Giữ đúng ngữ nghĩa cũ, sửa đúng cơ chế lock, chạy thưa hơn nhiều | Vẫn nằm trên đường ingest |
+| (c) | Bỏ hẳn trim khỏi đường ingest → cron job riêng | Sạch nhất | Thêm thành phần phải vận hành |
+
+**Khuyến nghị: (b)** — giữ nguyên hành vi kỳ vọng, sửa đúng cơ chế gây lock, không thêm thành phần mới.
+
+## 9.8. Bài học 0f — grep hẹp suýt giết chết kết luận đúng
+
+Lệnh grep đầu tiên dùng chuỗi hẹp `"Database connection issue|Lost connection|DB execution failure|Failed to reconnect"`
+với `--since=30m` trả về **0**, gần như dẫn tới kết luận "DB vô can".
+Chỉ khi grep rộng hơn trên log bắt trực tiếp mới lộ ra 44 dòng deadlock.
+
+> **Rút ra:** khi kiểm chứng một tầng nghi ngờ, **đừng grep theo chuỗi mình dự đoán**
+> (ở đây là thông điệp của cơ chế retry mà tôi đang giả thuyết) — hãy grep theo **tầng**
+> (`ERROR|WARNING` toàn bộ, rồi `uniq -c`), vì cơ chế thật có thể khác cơ chế mình hình dung.
+> Giả thuyết backoff SAI, nhưng tầng DB thì ĐÚNG.
