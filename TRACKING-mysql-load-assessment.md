@@ -1,9 +1,10 @@
 # TRACKING — Đánh giá tải MySQL của RagFlow
 
-**Phiên:** 05/08/2026
+**Phiên:** 05/08/2026 (chẩn đoán ban đầu) + 06-07/08/2026 (bổ sung: node06/08, đối tác báo chậm, đánh giá hướng xử lý)
 **Đối tượng:** pod `ragflow-mysql-0`, namespace `ragflow`, node `vrp-kubeengine07`
-**Trạng thái phiên:** 🔶 ĐANG DỞ — đã hoàn tất chẩn đoán, **chưa thực thi bất kỳ thay đổi nào**
+**Trạng thái phiên:** 🔶 ĐANG DỞ — đã hoàn tất chẩn đoán + đánh giá hướng xử lý + lên plan migrate chi tiết, **chưa thực thi bất kỳ thay đổi nào**.
 **Lệnh tham khảo (kèm giải nghĩa cờ):** `commands/mysql-load-assessment.md`
+**Plan thực thi ngắn hạn (đã duyệt, chưa chạy):** `PLAN-mysql-migrate-node06.md`
 
 ---
 
@@ -30,14 +31,23 @@ Kiểm tra tải của pod MySQL phục vụ RagFlow, xác định xem MySQL có
 
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
-| 1 | Query list document 11.1s, quét 953,020 dòng cho `LIMIT 50` | 🔴 Cao | 🔶 OPEN | Tạo composite index `(kb_id, create_time DESC)` |
+| 1 | Query list document 11.1s, quét 953,020 dòng cho `LIMIT 50` | 🔴 Cao | ✅ FIXED (07/08) | Đã tạo `idx_document_kb_create`; đo thực tế 0.02s (giảm ~500 lần). Nợ nhỏ: optimizer mặc định vẫn không tự chọn index này, xem chi tiết Issue 1 |
+| 1b | `duplicate_name(kb_id, name)` — nghi ngờ ban đầu (07/08) là thiếu index, đã `EXPLAIN` xác minh và **bác bỏ** | ⚪ Không phải issue | ✅ ĐÃ XÁC MINH KHÔNG CÓ VẤN ĐỀ (07/08) | Không cần làm gì — xem chi tiết bên dưới |
 | 2 | `innodb_buffer_pool_size`=128MB / working set 1.85GB → 6,200 lần đọc đĩa/giây | 🔴 Cao | 🔶 OPEN | Tăng lên 3G, cần restart pod |
 | 3 | PV `hostPath` khai báo 5Gi nhưng thực tế ghi vào `/dev/vda1` 99G đã dùng 74%, chung với MinIO/Redis/containerd | 🔴 Cao | 🔶 OPEN | Dọn image + PV rác; dài hạn tách đĩa riêng |
 | 4 | Pod MySQL `resources: {}` → QoS BestEffort | 🟡 TB | 🔶 OPEN | Đặt requests/limits |
+| 4b | 18 pod bị **Evicted** trên node07 (tuổi 25h/33h) — hệ quả trực tiếp của Issue 4 đang **thực sự xảy ra**, không còn là rủi ro lý thuyết | 🔴 Cao | 🔶 OPEN — mới phát hiện 06/08 | Cùng lượt xử lý Issue 4 (đặt resources); dọn pod Evicted rác |
 | 5 | `slow_query_log` OFF + `long_query_time`=10s → mù quan sát | 🟡 TB | ⚠️ WORKAROUND | Đã bật bằng `SET GLOBAL` (mất khi restart) → cần đưa vào ConfigMap |
 | 6 | Chưa có metrics-server → `kubectl top` không dùng được | 🟡 TB | 🔶 OPEN | Cài metrics-server |
+| 7 | `get_filter_by_kb_id()` (API filter panel) kéo TOÀN BỘ document của KB về Python để đếm tay thay vì `GROUP BY` SQL — 39s với KB 394k doc | 🔴 Cao | 🔶 OPEN — phát hiện 07/08, root cause **là code RagFlow**, không phải DB | Ngoài phạm vi dự án (chỉ sửa qua values.yaml/helm) — cần báo đội phát triển app/team quản lý source RagFlow |
 
-**Kết luận chung:** tải thực tế **không lớn** (~93 QPS, 184/1000 connection). Nút thắt đến từ việc **toàn bộ tham số MySQL để nguyên mặc định của chart demo**, chưa tune cho dữ liệu thật 239k document.
+**Kết luận chung (phiên 05/08):** tải thực tế **không lớn** (~93 QPS, 184/1000 connection). Nút thắt đến từ việc **toàn bộ tham số MySQL để nguyên mặc định của chart demo**, chưa tune cho dữ liệu thật 239k document.
+
+**Cập nhật 06-07/08 (đối tác báo chậm 55s/vb khi upload document):**
+- node06, node08 xác nhận **gần như rảnh** (CPU 2-3% và 0.4%, load avg ~1 và ~0.2) — loại trừ khả năng cả cụm quá tải, khoanh đúng vào node07/MySQL
+- node07 tại thời điểm đo: CPU 80% user, `mysqld` chiếm 666.7% (~6.7/8 core), load avg 19.52 trên node 8 core — **CPU-bound, không phải I/O-bound** (`wa`=0.0%, xem điều chỉnh Issue 2 bên dưới)
+- Bước "Upload document" (25s trong 55s/vb đối tác báo) khớp với kiến trúc code: mỗi upload có **≥4 round-trip MySQL tuần tự + 3 round-trip MinIO tuần tự + 1 tác vụ CPU** (thumbnail), không cái nào chạy song song → một bước chậm (query thiếu index) kéo dài cả chuỗi (xem Issue 1b)
+- Đã đánh giá feasibility 4 hướng xử lý (xem mục 9) — **chốt ngắn hạn: đánh index + chuyển MySQL sang node06**, KHÔNG dùng read replica (bị chặn cứng bởi chart, xem mục 9)
 
 ---
 
@@ -104,6 +114,11 @@ kubectl -n ragflow get pod ragflow-mysql-0 -o jsonpath='{.spec.containers[0].res
 - memory: 168857600 (1%) requests / 500M (3%) limits
 
 → Node ≈ 8 core / 16GB, còn trống ~97%. **Không thiếu tài nguyên node.**
+
+⚠️ **Lưu ý (bổ sung 11/08)**: con số **8 core / 16GB** này là của **node07** — nơi MySQL chạy tại
+thời điểm đo. **node06 (nơi MySQL chạy sau khi migrate) có 16 core / 32GB** — cấu hình khác hẳn.
+Bằng chứng: `top` trên node06 ghi `KiB Mem: 32778180 total` ≈ 32GB.
+Đừng mang số 8 core sang node06 khi tính `load average ÷ số core` (đã mắc lỗi này một lần).
 
 `kubectl -n ragflow top pod ragflow-mysql-0` → `metrics API not available` (chưa cài metrics-server).
 
@@ -211,7 +226,22 @@ Composite index giải quyết cả hai việc: nhảy thẳng vào vùng của 
    - `rows` giảm mạnh
    - `Extra` **không còn** `Using where` (lọc đã do index đảm nhận)
 
-3. ❓ **Chưa xác minh**: chi phí thời gian và dung lượng của lệnh CREATE INDEX trên bảng 1GB / 239k dòng. Ước tính vài chục giây và ~15-20MB, nhưng **chưa đo thực tế**.
+3. ✅ **Đã đo thực tế (07/08)**: `CREATE INDEX` mất **8.77 giây** trên bảng ~1GB/239k dòng — không đáng lo như ước tính ban đầu.
+
+**✅ ĐÃ THỰC HIỆN (07/08/2026, trong `PLAN-mysql-migrate-node06.md` Bước 1)**
+
+```sql
+CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DESC);
+-- Query OK, 0 rows affected (8.77 sec)
+```
+
+Xác minh bằng `EXPLAIN` + đo thời gian thật:
+- Đo thời gian thực tế của đúng query gây chậm (chỉ `SELECT t1.id` để tránh tốn công truyền dữ liệu, giữ nguyên WHERE/JOIN/ORDER BY): **50 rows in set (0.02 sec)** — so với baseline 11.1s, giảm **~500 lần**.
+- ⚠️ **Phát hiện phụ, chưa giải quyết**: `EXPLAIN` mặc định (không ép index) **vẫn chọn** `key: document_kb_id` (không phải `idx_document_kb_create`) dù đã `ANALYZE TABLE` cập nhật thống kê — optimizer đang đánh giá sai chi phí, không tự nhận ra index mới tốt hơn.
+- Dùng `FORCE INDEX (idx_document_kb_create)` để xác nhận dứt khoát index hoạt động đúng: `Extra` từ `Using temporary; Using filesort` (khi dùng key sai) chuyển thành **trống hoàn toàn** — bằng chứng rõ ràng index đã loại bỏ đúng cả filesort lẫn temporary table.
+- **Quyết định (đã hỏi ý kiến, chốt "không sửa"):** không sửa code RagFlow để thêm `FORCE INDEX` — nằm ngoài phạm vi (dự án chỉ deploy qua values.yaml/helm, không sửa code app), và 0.02s đã đủ nhanh cho mục tiêu thực tế. Giữ nguyên là **nợ kỹ thuật nhỏ**, xem mục 6.
+
+**Trạng thái cuối: ✅ FIXED** — root cause (thiếu composite index) đã xử lý, có bằng chứng đo thực tế. Không còn là 🔶 OPEN.
 
 ---
 
@@ -398,6 +428,73 @@ du -sh /data/ragflow/* /var/lib/containerd
 5. **Ngắn hạn** — xoá PVC rác `ragflow-es-data`.
 6. **Dài hạn** — tách `/data/ragflow` sang đĩa/LVM riêng, hoặc ít nhất tách MySQL khỏi MinIO. Việc này **quan trọng hơn cả HA**: hiện tại một image lớn hoặc một đợt upload file bất kỳ có thể hạ gục DB.
 
+**Rủi ro này KHÔNG biến mất sau khi migrate sang node06 (07-08/08/2026)** — PV mới
+`pv-ragflow-mysql-node06.yaml` giữ nguyên y hệt cơ chế `hostPath` + `storageClassName: local-mysql`
+(no-provisioner) + `capacity: 5Gi` như PV cũ, cố ý để nhất quán với ràng buộc "chỉ deploy qua
+values.yaml/helm" của dự án. Node06 hiện có 75G trống (61% used, dư dả hơn node07 lúc chỉ còn
+25G/74% used) nên rủi ro ngắn hạn thấp hơn, nhưng bản chất vấn đề — MySQL có thể ghi vượt xa 5Gi
+tới khi hết cả đĩa node — vẫn y nguyên, chỉ là chuyển từ node07 sang node06. Xem Q&A chi tiết ngay
+bên dưới.
+
+---
+
+#### ❓ Hỏi & Đáp — `capacity: 5Gi` trong PV nghĩa là gì, tại sao MySQL lại ghi gần hết cả đĩa node?
+
+> **Kiên hỏi (08/08/2026)**: PV cho MySQL khai `capacity: 5Gi` — vậy dung lượng lưu trữ chỉ tối
+> đa 5GB, không thể hơn được à? Và tại sao trước đó khi MySQL ở node07, PV cũng khai 5GB nhưng
+> sau đó lại lưu gần hết cả đĩa?
+
+**Trả lời:**
+
+`capacity: 5Gi` trong PV này **không phải giới hạn thật** — MySQL có thể ghi vượt xa con số này,
+cho tới khi hết sạch dung lượng của **toàn bộ ổ đĩa node**, không phải 5Gi. Bằng chứng cụ thể đã
+đo được trên node07: `df -h /var/lib/mysql` bên trong pod ra `99G total, 70G used` — đó là dung
+lượng cả ổ đĩa `/dev/vda1` của node, không liên quan gì tới số `5Gi` khai trong PV.
+
+Có 2 loại PersistentVolume trong Kubernetes, khác nhau về việc `capacity` có được enforce hay không:
+
+| Loại | Ví dụ | `capacity` có phải giới hạn thật không? |
+|---|---|---|
+| Có provisioner thật | Cloud disk (EBS, PD), LVM, Ceph | **Có** — hệ thống lưu trữ tạo ra 1 volume đúng kích thước khai báo, ghi vượt sẽ bị chặn/báo lỗi |
+| `hostPath` + `no-provisioner` (trường hợp của MySQL ở đây) | `local-mysql`, `local-minio`, `local-redis` | **Không** — chỉ là con số khai báo, không có cơ chế vật lý nào chặn |
+
+Với `hostPath`, PV thực chất chỉ là **1 thư mục thường** (`/data/ragflow/mysql`) nằm trên
+filesystem gốc của node — không có "kho chứa ảo" riêng biệt như ổ đĩa cloud. MySQL ghi vào thư
+mục đó cũng giống như ghi vào bất kỳ thư mục nào khác trên node, dùng chung dung lượng với mọi
+thứ khác (containerd, log hệ thống, MinIO, Redis...). `capacity: 5Gi` chỉ tồn tại để Kubernetes
+scheduler **so khớp lúc PVC bind vào PV** (kiểm tra PV có đủ điều kiện logic cho PVC yêu cầu hay
+không) — sau bước bind đó, vai trò của con số này kết thúc, không ai theo dõi hay chặn ghi thêm.
+
+> **Kiên hỏi tiếp**: chỗ "PVC yêu cầu 5GB thì PV đã có 5GB nên khớp" — vậy sau đó ứng dụng ghi
+> nhiều hơn 5GB cũng không sao, lý do là vì PV này là loại `hostPath` + `no-provisioner`. Nhưng
+> nhìn vào file YAML của PV thì làm sao biết được `storageClassName` là `no-provisioner`? Trong
+> PV chỉ ghi `storageClassName: local-mysql`, không thấy chữ `no-provisioner` ở đâu cả.
+
+**Trả lời**: Đúng — bản thân file YAML của **PV** không ghi trực tiếp chữ `no-provisioner`.
+`storageClassName: local-mysql` trong PV chỉ là **cái tên**, giống như biến tham chiếu — nó
+**trỏ tới** một object khác trong cluster tên là `StorageClass`, và chính object `StorageClass`
+đó (không phải PV) mới là nơi khai báo `provisioner: kubernetes.io/no-provisioner`. Phải tra
+riêng object `StorageClass` mới biết được cơ chế thật:
+
+```
+kubectl get storageclass
+```
+```
+NAME                 PROVISIONER                    RECLAIMPOLICY  VOLUMEBINDINGMODE     ALLOWVOLUMEEXPANSION
+local-minio          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+local-mysql          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+local-path (default) rancher.io/local-path          Delete         WaitForFirstConsumer  false
+local-redis          kubernetes.io/no-provisioner   Retain         WaitForFirstConsumer  false
+```
+
+Cột `PROVISIONER` của dòng `local-mysql` chính là bằng chứng — `kubernetes.io/no-provisioner`.
+Đây là lệnh đã chạy thật trong phiên chẩn đoán 05/08 (ghi ở mục "Bằng chứng" của Issue 3, gần đầu
+mục này) — không phải suy đoán từ nhìn PV, mà từ việc tra thêm object `StorageClass` liên kết.
+
+**Cách nhớ ngắn gọn**: PV nói "tôi thuộc nhóm `local-mysql`" — muốn biết nhóm đó có "luật enforce
+dung lượng" hay không, phải hỏi riêng định nghĩa của nhóm (`kubectl get storageclass`), không thể
+biết chỉ từ nhìn cái tên trong PV.
+
 ---
 
 ### 🟡 Issue 4 — Pod MySQL QoS BestEffort — 🔶 OPEN
@@ -493,6 +590,183 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 
 ---
 
+### 🔴 Issue 7 — API filter panel kéo toàn bộ document của KB về Python để đếm tay — 🔶 OPEN (root cause ở code app, không phải DB)
+
+**Triệu chứng**
+
+Phát hiện trong lúc Bước 4 (xác minh sau migrate) của `PLAN-mysql-migrate-node06.md`: test upload 1 document qua UI xong, quan sát tab Network thấy request `documents?type=filter` và `documents?page=1&page_size=...` mất **39.14s** và **39.11s** — chậm hơn nhiều so với ngưỡng chấp nhận được, dù MySQL vừa migrate xong và Issue 1 (composite index) đã fix.
+
+**Điều tra**
+
+Bật lại `slow_query_log` (giống cách đã làm ở Issue 5), trigger lại request, soi `mysql.slow_log`:
+
+```sql
+SELECT start_time, query_time, rows_examined, rows_sent, CONVERT(sql_text USING utf8) AS query
+FROM mysql.slow_log ORDER BY start_time DESC LIMIT 5;
+```
+
+Bắt được 2 dạng câu chậm, cùng KB (`kb_id='73932b965e5e11f192725fd51894c519'`, KB lớn nhất, giờ có ~153,268-394,310 document — đã tăng nhiều so với ~141k lúc chẩn đoán 05/08):
+
+| query_time | rows_examined | Query |
+|---|---|---|
+| 19.86s | 1,182,930 | `SELECT COUNT(1) FROM (SELECT 1 FROM document t1 JOIN file2document t2 ... JOIN file t3 ... WHERE t1.kb_id = ?) AS _wrapped` |
+| 9.40s | 1,182,930 | `SELECT t1.run, t1.suffix, t1.id FROM document t1 JOIN file2document t2 ... JOIN file t3 ... WHERE t1.kb_id = ?` (không LIMIT) |
+
+`EXPLAIN` câu thứ 2 cho thấy **mỗi bảng đều dùng đúng index** (`document_kb_id`, `file2document_document_id`, PRIMARY trên `file`), không có `Using temporary`/`Using filesort` — **không phải vấn đề thiếu index**. `SHOW INDEX` trên `file2document` và `file` cũng xác nhận đầy đủ index cho path JOIN này. Vấn đề nằm ở việc `t1: rows 153,268` — query đang cố JOIN và trả về **toàn bộ document của KB cùng lúc, không giới hạn**.
+
+**Root cause (xác nhận bằng đọc trực tiếp source code RagFlow, không suy đoán)**
+
+`ragflow-0.24.0/api/db/services/document_service.py`, hàm `get_filter_by_kb_id()` (dòng 187-273):
+
+```python
+query = cls.model.select(*fields).join(File2Document, ...).join(File, ...).where(cls.model.kb_id == kb_id)
+...
+rows = query.select(cls.model.run, cls.model.suffix, cls.model.id)   # dòng 229 — KHÔNG có .limit()
+total = rows.count()                                                  # dòng 230 — khớp câu COUNT(1) chậm ở trên
+...
+doc_ids = [row.id for row in rows]                                    # dòng 237 — duyệt TOÀN BỘ ORM object
+...
+for row in rows:                                                      # dòng 245 — đếm suffix/run_status THỦ CÔNG trong Python
+    suffix_counter[row.suffix] = suffix_counter.get(row.suffix, 0) + 1
+    run_status_counter[str(row.run)] = run_status_counter.get(str(row.run), 0) + 1
+    ...
+```
+
+Gọi từ `ragflow-0.24.0/api/apps/document_app.py:390`:
+```python
+filter, total = DocumentService.get_filter_by_kb_id(kb_id, keywords, run_status, types, suffix)
+return get_json_result(data={"total": total, "filter": filter})
+```
+
+→ Đây chính là API đứng sau request `documents?type=filter` — dùng để tính bộ đếm hiển thị ở filter panel (theo suffix, run_status, metadata) trên UI. Thiết kế hiện tại: **mỗi lần cần con số thống kê, code kéo hết danh sách document của cả KB về tầng ứng dụng rồi đếm tay bằng vòng lặp Python**, thay vì để MySQL `GROUP BY`/`COUNT` làm việc đó ở tầng SQL. Với KB nhỏ thì không sao, nhưng ở quy mô 394k document, đây là nghẽn cổ chai thực sự — và sẽ **ngày càng chậm hơn** khi KB tiếp tục phình to, không có ngưỡng chặn nào.
+
+⚠️ Lưu ý version: source code tra được là `ragflow-0.24.0` (có sẵn trong repo), trong khi production đang chạy chart `helm_ragflow_v0.26.4` — **chưa xác minh** hàm `get_filter_by_kb_id` có đổi giữa 2 version hay không, nhưng hành vi quan sát được qua slow log trên production hoàn toàn khớp với logic đọc được ở bản 0.24.0.
+
+**Kết luận: đây là bug/giới hạn thiết kế trong code RagFlow (backend), không phải vấn đề MySQL/database.** MySQL đã trả lời đúng và nhanh nhất có thể cho query được yêu cầu (mỗi JOIN đều dùng đúng index) — cái chậm là do query yêu cầu quá nhiều dữ liệu không cần thiết. **Đánh thêm index không giải quyết được** — không có index nào giúp giảm được việc phải đọc/truyền hết 150k-390k dòng.
+
+**Phạm vi xử lý**
+
+Ngoài phạm vi dự án hiện tại (ràng buộc: chỉ deploy/sửa qua `values.yaml` + Helm, không sửa code app — xem memory `ragflow-deploy-constraints.md`). Không xử lý trong đợt migrate MySQL này.
+
+**Hướng xử lý tiếp**
+
+1. Báo lại cho đội phát triển RagFlow / team quản lý source — đây là việc sửa code, không phải vận hành hạ tầng.
+2. Đề xuất kỹ thuật (để tham khảo khi báo, không tự làm): thay đếm thủ công trong Python bằng SQL `GROUP BY suffix`/`GROUP BY run` trực tiếp trên DB — MySQL tính aggregate nhanh hơn nhiều so với kéo hết dữ liệu về rồi đếm tay, và tránh phải truyền 150k-390k dòng qua network.
+3. Ngắn hạn (tạm thời, không sửa gốc): nếu team dev chưa xử lý kịp, có thể cân nhắc ẩn/tắt tính năng filter panel cho các KB quá lớn (ví dụ >50k document) từ phía UI, để tránh trigger query này — nhưng đây vẫn là thay đổi code, không phải việc hạ tầng.
+
+---
+
+### ⚪ Issue 1b — `duplicate_name(kb_id, name)` — nghi ngờ thiếu index đã bị BÁC BỎ bằng EXPLAIN — ✅ ĐÃ XÁC MINH
+
+**Nghi ngờ ban đầu (07/08, trước khi đo)**
+
+Từ phân tích flow upload (`file_service.py:514-604`), mỗi file đi qua tuần tự:
+
+1. `get_root_folder` / `init_knowledgebase_docs` / `get_kb_folder` — mỗi cái 1 SELECT trên bảng `file`
+2. `duplicate_name(DocumentService.query, name=..., kb_id=...)` — query `document` theo `(kb_id, name)` — **nghi ngờ ban đầu**: cùng lớp vấn đề với Issue 1, có index đơn `kb_id` nhưng không có composite `(kb_id, name)`
+3. `STORAGE_IMPL.obj_exist(...)` — 1 HEAD request MinIO
+4. `STORAGE_IMPL.put(...)` — PUT file gốc lên MinIO
+5. `thumbnail_img(...)` — CPU-bound, nặng với PDF
+6. `STORAGE_IMPL.put(...)` lần 2 — PUT thumbnail
+7. `DocumentService.insert(doc)` — INSERT MySQL
+
+→ Giả thuyết ban đầu: ≥4 round-trip MySQL + 3 round-trip MinIO + 1 tác vụ CPU, không cái nào song song, cộng dồn thành 25s bước Upload đối tác báo (55s/vb: check 6s, LLM tóm tắt 10s, upload 25s, update metadata 8s, parse chunk 6s).
+
+**Đã `EXPLAIN` trực tiếp (07/08, trong lúc thực thi Bước 1 của `PLAN-mysql-migrate-node06.md`) — kết quả BÁC BỎ nghi ngờ**
+
+```sql
+EXPLAIN SELECT * FROM document WHERE kb_id = '73932b965e5e11f192725fd51894c519' AND name = 'test.pdf';
+```
+```
+key: document_name | rows: 1 | filtered: 50.00 | Extra: Using where
+```
+
+Không có `Using temporary`, không có `Using filesort`, `rows` ước tính chỉ **1** — hoàn toàn không giống bệnh của Issue 1.
+
+**Root cause thật (khác với nghi ngờ ban đầu)**
+
+`SHOW INDEX FROM rag_flow.document WHERE Key_name = 'document_name'` cho thấy đây là index **đơn cột** trên `name` (không phải composite `(kb_id, name)` như suy luận ban đầu), nhưng `Cardinality = 347,033` trên tổng ~239k dòng — tên file gần như **duy nhất** (độ chọn lọc cực cao). Vì vậy MySQL tra `name` trước là đủ để thu hẹp gần như về 1 dòng ngay lập tức, sau đó check `kb_id` trên phần còn lại gần như miễn phí.
+
+Khác với Issue 1, nơi cột lọc chính (`kb_id`, chỉ 18 giá trị phân biệt) có độ chọn lọc **thấp** nên buộc phải kết hợp với sort mới hiệu quả — đây chính là lý do 2 query cùng dạng `WHERE kb_id = ? AND ...` lại có 2 kết cục khác hẳn nhau.
+
+**Bài học**: suy luận "cùng shape query = cùng bệnh" từ đọc code là **không đủ** — độ chọn lọc (cardinality) của từng cột quyết định index nào thật sự cần, phải `EXPLAIN` trực tiếp mới kết luận được, không suy diễn từ cấu trúc SQL.
+
+**Kết luận**: không cần tạo thêm index cho `duplicate_name`. 25s ở bước Upload trong báo cáo đối tác **không** đến từ query này — nguyên nhân thật (nếu còn tồn tại sau khi đánh index Issue 1 + migrate node) nhiều khả năng nằm ở các bước MinIO/CPU thumbnail hoặc cộng dồn độ trễ khi nhiều pod cùng lúc đập vào MySQL/MinIO trên node07 quá tải — chưa đo lại sau khi xử lý Issue 1, cần đo lại 55s/vb sau khi hoàn tất migrate để biết còn treo ở đâu.
+
+---
+
+### 🟡 Issue 4b — 18 pod Evicted trên node07 (hệ quả thực tế của Issue 4) — 🔶 OPEN
+
+**Triệu chứng**
+
+`kubectl get pods -n ragflow` cho thấy 18 pod ở trạng thái **Evicted** (tuổi 25h và 33h), 2 pod `ContainerStatusUnknown`, 1 `Init:ImagePullBackOff`. `ragflow-minio-0`, `ragflow-mysql-0`, `ragflow-redis-0` vẫn `Running`.
+
+**Root cause**
+
+Chính là Issue 4 (`resources: {}` → QoS BestEffort) nhưng **đã xảy ra thật**, không còn là rủi ro lý thuyết — khi node07 gặp áp lực tài nguyên (khớp với giai đoạn CPU 80%/load 19.5), kubelet evict các pod BestEffort trước.
+
+**Bằng chứng**
+
+Lệnh tra `.status.message`/`.status.reason` của 1 pod tuổi 33h — xem `commands/mysql-load-assessment.md` mục 3.
+
+**Còn tồn đọng**
+
+18 pod Evicted vẫn tồn tại trong `kubectl get pods` cho tới khi bị xoá thủ công (Kubernetes không tự dọn) — gây nhiễu khi đọc trạng thái cluster, và là bằng chứng cho thấy node07 đã thực sự chạm ngưỡng resource pressure ít nhất 1 lần trong 25-33h qua.
+
+**Hướng xử lý tiếp**
+
+1. Dọn 18 pod Evicted rác (không ảnh hưởng dữ liệu, chỉ là pod object cũ):
+```
+kubectl get pods -n ragflow --field-selector=status.phase=Failed -o name | xargs kubectl delete -n ragflow
+```
+2. Xử lý gốc: đặt `resources` cho **toàn bộ** pod RagFlow đang BestEffort, không chỉ MySQL — cần rà lại `values.yaml` xem còn service nào bỏ trống `resources`.
+3. Việc chuyển MySQL sang node06 (mục 9) sẽ giảm áp lực trực tiếp lên node07, gián tiếp giảm khả năng evict tái diễn — nhưng không thay thế được việc đặt resources.
+
+---
+
+### 🔵 Điều chỉnh Issue 2 — cơ chế là CPU-bound, không phải I/O-bound (kết luận không đổi)
+
+**Bằng chứng mới (06/08)**
+
+`top -bn1 -o %CPU` trên node07 lúc `mysqld` chiếm 666.7% CPU: `%Cpu(s): 80.0 us, 4.0 sy, 16.0 id, 0.0 wa` — iowait = 0%, và `buff/cache` ~8.6GB dù `innodb_buffer_pool_size` chỉ 128MB.
+
+**Diễn giải**
+
+Phần lớn trong 2.6 tỷ lần "đọc đĩa" của InnoDB (Issue 2) thực chất được **OS page cache hấp thụ** — không phải chờ đĩa vật lý thật. Chi phí thật nằm ở **CPU overhead**: syscall, copy trang nhớ từ page cache vào buffer pool, decode InnoDB — không phải iowait.
+
+**Kết luận**: hướng xử lý **không đổi** (vẫn phải tăng `innodb_buffer_pool_size` lên 3G) — nhưng cơ chế lợi ích thì khác: tăng buffer pool sẽ **giảm CPU** (bớt việc copy/decode lặp lại), không phải giảm chờ I/O như suy đoán ban đầu.
+
+---
+
+## 9. Đánh giá feasibility các hướng xử lý (06-07/08/2026)
+
+Bối cảnh: sếp hỏi có thể tận dụng node06/node08 đang rảnh để tăng tốc RagFlow/MySQL không. Đã đọc trực tiếp `helm_ragflow_v0.26.4/templates/mysql.yaml` và `mysql-config.yaml` trước khi kết luận (không suy đoán).
+
+| # | Hướng | Feasibility | Bằng chứng |
+|---|---|---|---|
+| A | Đánh composite index (Issue 1, 1b) | ✅ Khả thi cao, không downtime | `ALGORITHM=INPLACE` MySQL 8.0 |
+| B | Chuyển MySQL sang node06 (đổi node chạy, giữ MinIO/Redis ở node07) | ✅ Khả thi, cần downtime ngắn để migrate data | `nodeSelector` (dòng 49-52 `mysql.yaml`) **đã templated** từ `.Values.mysql.deployment.nodeSelector` — đúng cơ chế deploy-qua-values.yaml hiện tại. **Nhưng** PV là `hostPath` + `nodeAffinity` gắn cứng vào node07 (`ragflow-target=true`, xem `local-pv.yaml` Issue 3) → đổi `nodeSelector` của pod **không tự di chuyển dữ liệu** — bắt buộc phải tạo PV mới trên node06 + copy/migrate data thủ công |
+| C | Tách MySQL ra server riêng hoàn toàn | ✅ Khả thi, là việc dài hạn | Xử lý gốc: hiện MySQL đang dùng chung `/dev/vda1` với MinIO/Redis/containerd (Issue 3) |
+| D | Dùng node06/08 làm MySQL read replica | ❌ **KHÔNG khả thi ngắn hạn** | 2 rào cản cứng: (1) `mysql.yaml` dòng 31 `replicas: 1` **hardcode**, không đọc từ values — chart không hỗ trợ multi-replica; (2) dòng 82 `args: --disable-log-bin` **hardcode** — binlog là điều kiện bắt buộc để replication chạy, đang bị tắt cứng. Ngoài ra RagFlow dùng Peewee ORM với 1 connection string duy nhất (`service_conf.yaml`), chưa có cơ chế route read/write — phải sửa cả code ứng dụng. Đây là dự án riêng, không làm trong đợt này. |
+
+**Đã chốt — Ngắn hạn (plan chi tiết đã duyệt: `PLAN-mysql-migrate-node06.md`):**
+1. Đánh composite index `idx_document_kb_create` (Issue 1) — và đánh giá thêm cho `duplicate_name` (Issue 1b)
+2. Chuyển MySQL từ node07 sang node06, **giữ nguyên MinIO/Redis ở node07** để giảm tải node07 mà không dồn hết sang node06
+
+**Dài hạn (chưa lên plan):**
+- Tách MySQL ra server/đĩa riêng hoàn toàn (Issue 3, hướng C)
+- Đánh giá MySQL HA (cần sửa chart bỏ `--disable-log-bin` + `replicas`, và sửa code app để route read/write — không làm trong đợt ngắn hạn)
+
+**Ý kiến sếp (Nguyễn Chí Đông, 07/08 08:34, qua chat) — ràng buộc bắt buộc cho plan migrate node06:**
+> "Ủa, tác động thì báo thôi" — chỉ cần báo trước khi tác động, không cần xin duyệt từng bước.
+> "thế phải lên plan chi tiết từ sáng, chuyển mysql liên quan đến migrate dữ liệu, mà migrate thì có 2 kiểu, 1 là copy data rồi mount lại, 2 là dump DB rồi restore. Tạm thế"
+> "nếu làm dc cách 1 thì anh nghĩ là nhàn" — ưu tiên cách 1 (copy hostPath data + mount lại PV mới) nếu khả thi, vì đỡ việc hơn cách 2 (mysqldump/restore).
+> "tránh sai sót về user/pass, các constrain,..." — lưu ý rủi ro cụ thể cần kiểm tra kỹ khi migrate.
+
+→ Plan chi tiết đã soạn và duyệt tại `PLAN-mysql-migrate-node06.md`, ưu tiên **Cách 1 (copy hostPath + mount lại PV qua rsync)**, giữ Cách 2 (dump/restore) làm fallback bằng văn bản nếu Cách 1 vướng lỗi giữa chừng.
+
+---
+
 ## 5. Bài học
 
 ### Đọc số liệu MySQL
@@ -549,6 +823,7 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 | Bộ PV `pv-ragflow-custom-*` (8d) từ lần test, `Retain` + `Bound`, cùng node07 | Phiên 31/07 | Chiếm đĩa vô ích trên chính đĩa đang 74%; `Retain` nên xoá PV không tự giải phóng |
 | PVC `ragflow-es-data` Pending 69 ngày | Tắt `elasticsearch.enabled` để dùng ES ngoài | Rác, gây nhiễu khi đọc trạng thái cluster |
 | Không có backup MySQL ❓ | chưa kiểm tra trong phiên | Kết hợp với 3 dòng trên → mất dữ liệu không khôi phục được |
+| Optimizer không tự chọn `idx_document_kb_create` dù đã tạo + ANALYZE TABLE, chỉ dùng đúng khi `FORCE INDEX` | Issue 1 — xác nhận 07/08 sau khi tạo index | Hiện tại đủ nhanh (167k rows filtered vẫn nhanh hơn baseline nhiều) nhưng khi KB tiếp tục phình to hơn nữa, khoảng cách hiệu năng giữa 2 key sẽ ngày càng lớn — cần theo dõi, có thể phải `FORCE INDEX` trong code hoặc `ANALYZE TABLE` định kỳ về sau |
 | Chưa có metrics-server / giám sát MySQL | Issue 6 | Không phát hiện được suy thoái, chỉ biết khi user kêu |
 
 ❓ **Chưa xác minh**: có backup MySQL hay không — không kiểm tra trong phiên này. **Nên kiểm tra sớm**, vì đây là nợ nguy hiểm nhất trong bảng.
@@ -559,22 +834,22 @@ Không đo được CPU/RAM thực tế của pod MySQL. Toàn bộ đánh giá 
 
 ### Ngay lập tức (không downtime)
 
-- [ ] Tạo composite index:
+- [x] ~~Tạo composite index~~ → ✅ **Đã làm 07/08**, mất 8.77s, xem Issue 1
 ```sql
 CREATE INDEX idx_document_kb_create ON rag_flow.document (kb_id, create_time DESC);
 ```
-- [ ] Chạy lại `EXPLAIN` query cũ, xác nhận `key` = `idx_document_kb_create` và `rows` giảm mạnh
-- [ ] Đo lại thời gian query thực tế sau khi có index
-- [ ] Dọn image cũ trên node07:
+- [x] ~~Chạy lại `EXPLAIN` query cũ~~ → ✅ Đã xác minh bằng `FORCE INDEX`: `Extra` sạch, không còn filesort/temporary
+- [x] ~~Đo lại thời gian query thực tế sau khi có index~~ → ✅ **0.02s** (từ 11.1s, giảm ~500 lần)
+- [x] ~~Dọn image cũ trên node07~~ → đã làm tương đương trên **node06** (07/08, gỡ ~28G rác gồm image RagFlow cũ, xem `PLAN-mysql-migrate-node06.md` Bước 0.5). Node07 vẫn **chưa dọn**, còn trong danh sách việc tiếp theo.
 ```
 crictl rmi --prune
 ```
 - [x] ~~Xem thư mục nào ăn đĩa nhiều nhất trên node07~~ → **containerd 27G**, `/data/ragflow` chỉ 5.8G
-- [ ] Truy ~37G còn lại chưa xác định (70G `df` − 32.8G đã đếm):
+- [ ] Truy ~37G còn lại chưa xác định trên **node07** (70G `df` − 32.8G đã đếm) — lưu ý: đã làm việc tương tự trên **node06** (07/08) và tìm ra `/var/lib/containerd`=63G là thủ phạm, nên rất có thể node07 cũng cùng nguyên nhân, nhưng **chưa đo lại trên chính node07** để xác nhận:
 ```
 du -sh /var/* 2>/dev/null | sort -h | tail -10
 ```
-- [ ] Xem containerd đang giữ image gì:
+- [ ] Xem containerd đang giữ image gì trên **node07** (đã làm trên node06/node08 07/08, chưa làm trên node07):
 ```
 crictl images
 ```
@@ -583,7 +858,7 @@ crictl images
 kubectl -n ragflow exec ragflow-mysql-0 -- df -h /var/lib/mysql
 ```
 - [ ] Kiểm tra xem có backup MySQL không
-- [ ] Xác minh namespace `ragflow-custom` còn dùng không (bộ PV `pv-ragflow-custom-*` đang chiếm đĩa)
+- [x] ~~Xác minh namespace `ragflow-custom` còn dùng không~~ → ✅ Xác nhận là môi trường test cũ, không còn dùng — đã `helm uninstall` (07/08). PV/PVC vẫn còn (giữ theo resource-policy), **chưa xoá hẳn**, xem `PLAN-mysql-migrate-node06.md` Bước 0.5 mục "còn treo"
 
 ### Ngắn hạn (cần 1 lần restart pod, ~2 phút)
 
