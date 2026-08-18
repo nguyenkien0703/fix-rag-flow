@@ -1779,6 +1779,109 @@ timeout cái gì.
 
 ---
 
+### 3.21 🔴 25 MẪU: phân bố LIÊN TỤC (không lưỡng cực) + phát hiện `timeout="600s"` và patch cũ TRƯỢT
+
+**Output — 25 mẫu (đã sắp xếp tăng dần để thấy phân bố):**
+
+```
+2.07  2.09  2.15  2.16  2.18  2.99  3.11  3.16  3.86  4.15
+5.09  6.97  7.56  7.80  11.12  22.03  27.09  30.56  31.23  34.99
+35.04  35.36  36.38  37.06  48.41
+```
+
+Nguyên văn theo thứ tự chạy:
+```
+run=1  connect=0.001 start=48.403 total=48.411
+run=2  connect=0.001 start=35.356 total=35.362
+run=3  connect=0.001 start=2.172  total=2.179
+run=4  connect=0.001 start=6.967  total=6.971
+run=5  connect=0.001 start=4.140  total=4.148
+run=6  connect=0.001 start=30.560 total=30.566
+run=7  connect=0.001 start=7.554  total=7.558
+run=8  connect=0.001 start=2.980  total=2.986
+run=9  connect=0.001 start=22.033 total=22.039
+run=10 connect=0.001 start=2.154  total=2.160
+run=11 connect=0.001 start=34.991 total=34.997
+run=12 connect=0.001 start=3.856  total=3.862
+run=13 connect=0.001 start=31.226 total=31.232
+run=14 connect=0.001 start=7.798  total=7.804
+run=15 connect=0.001 start=2.065  total=2.072
+run=16 connect=0.001 start=27.088 total=27.094
+run=17 connect=0.001 start=11.116 total=11.121
+run=18 connect=0.001 start=2.081  total=2.088
+run=19 connect=0.001 start=3.110  total=3.114
+run=20 connect=0.001 start=2.151  total=2.157
+run=21 connect=0.001 start=36.382 total=36.388
+run=22 connect=0.001 start=37.057 total=37.064
+run=23 connect=0.001 start=3.152  total=3.157
+run=24 connect=0.001 start=5.085  total=5.091
+run=25 connect=0.001 start=35.034 total=35.040
+```
+
+**Output — grep code:**
+```
+=== timeout trong es_conn.py ===
+68:   return self.es.search(index=index_names, body=query, timeout="600s", track_total_hits=track_total_hits)
+285:          self.logger.exception("ES request timeout")
+296:      self.logger.error(f"ESConnection.search timeout for {ATTEMPT_TIME} times!")
+297:      raise Exception("ESConnection.search timeout.")
+316:      r = self.es.bulk(index=index_name, operations=operations, refresh="wait_for", timeout="60s")
+326:          self.logger.exception("ES request timeout")
+446:          self.logger.exception("ES request timeout")
+472:              retry_on_conflict=3,
+492:          self.logger.exception("ES request timeout")
+556:          self.logger.exception("ES request timeout")
+=== timeout trong settings === (RỖNG)
+=== env ===
+UV_HTTP_TIMEOUT=200
+```
+
+**Đọc được gì:**
+
+1. ❌ **PHỦ ĐỊNH giả thuyết "phân bố lưỡng cực / timeout cố định" của chính tôi ở 3.20.**
+   Khoảng trống 5–27s **KHÔNG CÓ THẬT** — với 25 mẫu thì vùng đó đầy: **5.09, 6.97, 7.56, 7.80,
+   11.12, 22.03**. Phân bố **LIÊN TỤC**, lấp kín từ 2.07s tới 48.41s.
+   ⟹ **Bài học: khoảng trống ở cỡ mẫu 10 là ẢO GIÁC do cỡ mẫu nhỏ.** Không kết luận hình dạng phân
+   bố từ 10 mẫu.
+2. ⟹ **KHÔNG phải timeout/retry cố định.** Phân bố liên tục là chữ ký của **tranh chấp tài nguyên /
+   xếp hàng**, nơi thời gian chờ phụ thuộc **liên tục** vào tải tại thời điểm đó.
+3. **Max mới: 48.411s** (cao hơn mọi lần đo trước: 28.2s → 33.2s → **48.4s**). Biên độ **48.4/2.07 = 23×**.
+4. `connect=0.001` ở **cả 25 mẫu**, `total − start` ≈ **6ms** ⟹ TCP handshake tới RAGFlow tức thời,
+   truyền dữ liệu tức thời. **100% thời gian ở trong server.** Xác nhận lại 3.7.
+5. 🔴 **PHÁT HIỆN: `es_conn.py:68` có `timeout="600s"`** — patch từ phiên trước
+   (`05-FIX.md` mục 3: `sed -i 's/timeout=600/timeout=30/g'`) **KHÔNG KHỚP và đã TRƯỢT ÂM THẦM**:
+   code thật là `timeout="600s"` (**có dấu ngoặc kép và chữ `s`**), sed tìm `timeout=600` (không
+   ngoặc kép) ⟹ không match ⟹ **sed exit 0, không cảnh báo gì**.
+   ⟹ **Đúng y bài học đã ghi trong nợ kỹ thuật:** *"Sed patch không khớp vẫn exit 0 → patch trượt
+   âm thầm"*. Đây là lần thứ hai bài học này thành hiện thực.
+   ⚠️ Nhưng `600s` **không giải thích** được 48s (chưa tới trần), nên đây là **nợ kỹ thuật**, chưa
+   phải root cause.
+6. **`es_conn.py:296` có `ATTEMPT_TIME`** ⟹ ES client **CÓ retry loop**. Cần đọc xem mỗi attempt
+   chờ bao lâu.
+7. `UV_HTTP_TIMEOUT=200` — của `uv` (package manager), **không liên quan** runtime.
+8. `common/settings.py` grep timeout/retry/pool ⟹ **RỖNG**, không có config pool ở đó.
+
+### 🔴 NGHI PHẠM MỚI (khớp phân bố liên tục): HÀNG ĐỢI TRONG PROCESS (thread pool / semaphore)
+
+**Vì sao khớp toàn bộ dữ kiện — đây là cấu trúc duy nhất còn lại giải thích được mọi thứ:**
+
+| Dữ kiện | Hàng đợi trong process giải thích thế nào |
+|---|---|
+| Phân bố **liên tục** 2→48s | latency = xử lý (2s) + **chờ hàng đợi** (0→46s tuỳ số việc phía trước) ⟹ liên tục, không lưỡng cực |
+| **CPU 10–20%** | chờ trong hàng đợi **không tiêu CPU** |
+| Mọi backend đo riêng **đều nhanh** | ES/embedding/LLM chỉ được gọi **sau khi** đã tới lượt; bản thân chúng nhanh |
+| `connect=1ms` | hàng đợi ở **tầng ứng dụng**, không ở TCP |
+| Dao động **theo thời điểm** chứ không theo query | phụ thuộc lúc đó ingest đang đẩy bao nhiêu việc vào cùng hàng đợi |
+| **Xấu dần theo thời gian** | tải ingest tích tụ |
+
+**Cơ sở trong code:** `search.py:56` `qv, _ = await thread_pool_exec(emb_mdl.encode_queries, txt)`
+⟹ có hàm `thread_pool_exec`. RAGFlow chạy **Quart/ASGI một process** (`app.run()`). Nếu pool đó có
+`max_workers` nhỏ, **mọi** request retrieval + ingest API xếp hàng qua nó.
+
+❓ **Chưa verify** — phải đọc `thread_pool_exec` xem pool bao nhiêu worker (lệnh 3.22).
+
+---
+
 ### Nghi phạm chưa được kiểm tra (liệt kê để không quên, KHÔNG phải kết luận)
 
 Tất cả đều ở mức **giả thuyết chưa có bằng chứng** — không được xây fix lên bất kỳ cái nào trước khi đo:
