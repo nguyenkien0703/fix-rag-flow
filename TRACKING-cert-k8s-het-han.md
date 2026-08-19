@@ -1,8 +1,13 @@
 # TRACKING — Cert K8s control-plane hết hạn
 
 > File sống. Cập nhật ngay sau mỗi lệnh chạy, không đợi cuối phiên.
-> Bắt đầu: 2026-08-19. Trạng thái tổng: 🔶 **OPEN — chẩn đoán XONG, quy trình renew đã soạn,
-> chưa thao tác sửa.**
+> Bắt đầu: 2026-08-19. Trạng thái tổng: ✅ **CLUSTER ĐÃ KHÔI PHỤC** (12:00 +07 cùng ngày).
+>
+> Cả 3 master đã renew cert + restart + verify. `kubectl get nodes` → **8/8 node Ready**.
+> `curl` qua endpoint LB thành công. Đã dựng systemd timer cảnh báo cert sắp hết hạn.
+>
+> **Còn tồn đọng:** kubeconfig user `app` trên worker (cert client hết hạn → `Unauthorized`);
+> kênh gửi cảnh báo ra ngoài; `helm upgrade ragflow` chưa chạy lại.
 >
 > **➡️ Vào thẳng mục 7 → "⭐ QUY TRÌNH RENEW ĐẦY ĐỦ" để thực hiện.**
 > Mọi ẩn số chặn việc renew đã được giải (xem bảng "Điều kiện tiên quyết" ở đó).
@@ -69,11 +74,11 @@ hỏng nặng hơn hiện tại).
 
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
-| 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | 🔶 **OPEN — đang thực hiện GĐ0** | `kubeadm certs renew all` **`--config /root/cluster-config-renew.yaml`** (file TÁCH ở GĐ0-ter, không phải file gốc) → so SAN → restart. Lần lượt 48→49→50 |
+| 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | ✅ **FIXED** — cả 3 master renew + restart + verify xong (output 3.25→3.30) | `kubeadm certs renew all` **`--config /root/cluster-config-renew.yaml`** (file TÁCH ở GĐ0-ter, không phải file gốc) → so SAN → restart. Lần lượt 48→49→50 |
 | 2 | `kubectl` không chạy được dưới **`vt_admin`** (thiếu kubeconfig). `root` CÓ file nhưng cert bên trong đã hết hạn | 🟡 TB | 🔶 **OPEN** | ✅ Output 3.27 làm rõ: root có sẵn `/root/.kube/config`. Backup rồi ghi đè bằng `admin.conf` vừa renew |
 | 3 | ~~Toàn bộ PKI etcd báo `!MISSING!`~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.4: không có `etcd.yaml` ⇒ **etcd external** ⇒ `!MISSING!` chỉ là cosmetic |
 | 4 | `kubeadm` fallback default config → cert mới mất SAN | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | ✅ Output 3.6 xác nhận `kubeadm-config.yaml` còn đúng ⇒ renew **kèm `--config /etc/kubernetes/kubeadm-config.yaml`**. Cấm lệnh trần |
-| 5 | Không có cảnh báo trước khi cert hết hạn | 🟡 TB | 🔶 **OPEN** | Dựng `x509-certificate-exporter` + alert trước 30 ngày |
+| 5 | Không có cảnh báo trước khi cert hết hạn | 🟡 TB | ⚠️ **WORKAROUND** | ✅ Output 3.31: systemd timer chạy hàng ngày trên cả 3 master, ngưỡng 30 ngày. **Nhưng chỉ ghi journald, chưa có kênh gửi ra ngoài** ⇒ cảnh báo yếu |
 | 6 | RAGFlow `v0.26.4` chưa upgrade được (việc gốc ban đầu) | 🟢 Thấp | 🔶 **OPEN** — bị chặn bởi #1 | Chạy lại `helm upgrade` sau khi cluster khôi phục |
 | 7 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.6: `certSANs` khớp cert đang chạy ⇒ **dùng được `--config`** |
 | 9 | 🔴 **File `kubeadm-config.yaml` có 4 YAML document — v1.23 không parse được cho `--config`** | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | Output 3.11. Tách file chỉ chứa `ClusterConfiguration` → GĐ0-ter |
@@ -1894,6 +1899,256 @@ notAfter=Aug 19 04:31:40 2027 GMT
   Nó chỉ có ý nghĩa **sau khi xong CẢ 3 node**. Đặt sau node 48 thì chắc chắn fail 2/3 số lần,
   gây hiểu nhầm là renew hỏng. Xem Bài học #19.
 - ⇒ ✅ **Node 48 ĐẠT. Đủ điều kiện sang node 49.**
+
+---
+
+### 3.29 — [Node 49, 50 / GĐ2-5] ✅ Renew + restart — làm ĐỒNG THỜI 2 node
+
+**📍 Node 49 (`vrp-kubeengine02`) và node 50 (`vrp-kubeengine03`) — user `root`, ~11:52–12:02 +07**
+
+> 📌 **Kiên đề xuất làm đồng thời 49 và 50 thay vì tuần tự.** Chấp nhận được vì:
+> etcd **external** (output 3.4) ⇒ không có quorum trên master để mất; node 48 **đã xong**
+> và đang phục vụ ⇒ cluster luôn còn ít nhất 1 master lành.
+> ⇒ Nguyên tắc tuần tự ban đầu đặt ra khi **chưa biết** kiến trúc etcd. Sau khi xác định
+> etcd external, ràng buộc này nới được. **Ghi lại quyết định, không phải vi phạm quy trình.**
+
+**a) Tách + verify file config trên node 49** (file `/root/cluster-config-renew.yaml` chỉ có
+trên node 48 — mỗi node filesystem riêng)
+
+```
+sed -n '14,119p' /etc/kubernetes/kubeadm-config.yaml > /root/cluster-config-renew.yaml
+```
+
+Verify — kết quả **giống hệt node 48** (output 3.15): `1` document, `18` certSANs,
+`tail -3` kết thúc `readOnly: true`.
+
+**b) Renew trên cả 49 và 50**
+
+```
+kubeadm certs renew all --config /root/cluster-config-renew.yaml
+```
+
+**Output (cả 2 node, giống hệt node 48 ở output 3.24):** 6 cert renewed, **không có dòng etcd**.
+
+```
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
+```
+
+**Output:** `18` trên cả 2 node.
+
+**c) Restart control-plane**
+
+**Output `crictl ps` sau restart:**
+
+Node 49:
+```
+5a64dc51d36e4   6114d758d6d16   About a minute ago   Running   kube-scheduler             0
+3928485568dfc   4783639ba7e03   About a minute ago   Running   kube-controller-manager    0
+bc1ddbaf586aa   8a0228dd6a683   About a minute ago   Running   kube-apiserver           252
+```
+
+Node 50:
+```
+5f247b1a7378f   8a0228dd6a683   14 seconds ago   Running   kube-apiserver           229
+4b604b5db85ea   4783639ba7e03   14 seconds ago   Running   kube-controller-manager  419
+f2997b9339ee5   6114d758d6d16   14 seconds ago   Running   kube-scheduler           390
+```
+
+**d) Cert đang phục vụ**
+
+```
+echo | openssl s_client -connect 10.208.137.49:6443 2>/dev/null | openssl x509 -noout -dates
+```
+
+```
+notBefore=Jul  6 08:11:45 2023 GMT
+notAfter=Aug 19 04:54:11 2027 GMT
+```
+
+```
+echo | openssl s_client -connect 10.208.137.50:6443 2>/dev/null | openssl x509 -noout -dates
+```
+
+```
+notBefore=Jul  6 08:11:45 2023 GMT
+notAfter=Aug 19 04:54:13 2027 GMT
+```
+
+**Đọc được gì:**
+
+- ✅ **Cả 3 pod lên trên cả hai node**, AGE reset (`14 seconds` / `About a minute`).
+- ✅ **`notAfter = Aug 19 2027`** trên cả 49 và 50 ⇒ đã nạp cert mới vào bộ nhớ.
+- ⚠️ **ATTEMPT của node 50 rất cao:** apiserver `229`, controller-manager `419`, scheduler `390`.
+  Node 49: apiserver `252`.
+  ⇒ Cùng hiện tượng với node 48 (`216`, output 3.26) nhưng **nặng hơn nhiều** ở node 50.
+  ⇒ ❓ **Ngoài phạm vi renew cert**, nhưng củng cố nợ kỹ thuật: control-plane restart rất nhiều
+  lần. Node 50 có controller-manager restart 419 lần — đáng điều tra riêng.
+- ⚠️ **Lỗi thao tác nhỏ:** lần đầu verify node 50, lệnh gõ nhầm IP `.49` thay vì `.50` nên
+  ra kết quả của node 49. Đã chạy lại đúng — `notAfter` node 50 là `04:54:13` (khác `04:54:11`
+  của node 49 đúng 2 giây, khớp thứ tự renew).
+
+---
+
+### 3.30 — [Node 48 / GĐ6] ✅✅ CLUSTER KHÔI PHỤC HOÀN TOÀN
+
+**📍 Node 48 — user `vt_admin`** (không cần root), ~12:00 +07
+
+```
+curl -sS --cacert /etc/kubernetes/pki/ca.crt https://lb-apiserver.kubernetes.local:6443/version
+```
+
+**Output:**
+
+```
+{
+  "major": "1",
+  "minor": "23",
+  "gitVersion": "v1.23.2",
+  ...
+}
+```
+
+```
+kubectl get nodes
+```
+
+**Output:**
+
+```
+NAME               STATUS   ROLES                  AGE     VERSION
+vrp-kubeengine01   Ready    control-plane,master   3y44d   v1.23.2
+vrp-kubeengine02   Ready    control-plane,master   3y44d   v1.23.2
+vrp-kubeengine03   Ready    control-plane,master   3y44d   v1.23.2
+vrp-kubeengine04   Ready    <none>                 3y44d   v1.23.2
+vrp-kubeengine05   Ready    <none>                 3y44d   v1.23.2
+vrp-kubeengine06   Ready    <none>                 3y44d   v1.23.2
+vrp-kubeengine07   Ready    <none>                 3y44d   v1.23.2
+vrp-kubeengine08   Ready    <none>                 3y44d   v1.23.2
+```
+
+**Đọc được gì:**
+
+- ✅✅ ⭐ **`curl` qua endpoint LB THÀNH CÔNG** — đúng con đường đã làm `helm` chết sáng nay
+  (output 3.0). TLS verify đạt bằng CA cluster.
+  ⇒ Cả 3 master đều phục vụ cert mới ⇒ LB đẩy sang node nào cũng hợp lệ.
+- ✅ **8/8 node `Ready`** — 3 master + 5 worker.
+- ✅ ⭐ **Chạy được dưới `vt_admin`, KHÔNG cần root** ⇒ kubeconfig của `vt_admin` cũng đã hoạt
+  động trở lại (cert nhúng trong đó được renew cùng `admin.conf`).
+- ⚠️ **Phát hiện: topology thật là `kubeengine01` → `08`**, tức **5 worker** là
+  `04, 05, 06, 07, 08` — **không phải** dải IP `.51`–`.55` như đã ghi ở đầu file.
+  ❓ Ánh xạ hostname ↔ IP của worker chưa xác minh đầy đủ.
+- ✅ **Worker `Ready` cả 5** ⇒ **kubelet client cert vẫn hợp lệ**, không cần join lại.
+  ⇒ Xác nhận điều đã dự đoán: CA không đổi (output 3.25) nên worker vẫn tin control-plane.
+
+---
+
+### 3.31 — [Cả 3 master] ✅ Dựng systemd timer cảnh báo cert sắp hết hạn (issue #5)
+
+**📍 Từng master 48, 49, 50 — user `root`, ~12:12 +07**
+
+> Kiên chọn phương án **chỉ cảnh báo, KHÔNG tự renew** — bước restart control-plane vẫn do
+> người quyết định trong cửa sổ bảo trì.
+
+**a) Script**
+
+```
+cat > /usr/local/bin/check-k8s-certs.sh <<'EOF'
+#!/bin/bash
+THRESHOLD=30
+CERT_DAYS=$(kubeadm certs check-expiration 2>/dev/null | grep -oP '\d+(?=d\s)' | sort -n | head -1)
+if [ -z "$CERT_DAYS" ]; then
+  logger -t k8s-cert-check -p user.err "LOI: khong doc duoc han cert tren $(hostname)"
+  exit 1
+fi
+if [ "$CERT_DAYS" -lt "$THRESHOLD" ]; then
+  logger -t k8s-cert-check -p user.crit "CANH BAO: cert K8s tren $(hostname) con $CERT_DAYS ngay"
+else
+  logger -t k8s-cert-check -p user.info "OK: cert K8s tren $(hostname) con $CERT_DAYS ngay"
+fi
+EOF
+```
+
+```
+chmod +x /usr/local/bin/check-k8s-certs.sh
+```
+
+**b) systemd service + timer**
+
+```
+cat > /etc/systemd/system/k8s-cert-check.service <<'EOF'
+[Unit]
+Description=Kiem tra han cert Kubernetes control-plane
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/check-k8s-certs.sh
+EOF
+```
+
+```
+cat > /etc/systemd/system/k8s-cert-check.timer <<'EOF'
+[Unit]
+Description=Chay kiem tra han cert K8s hang ngay
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+```
+
+**c) Bật và verify**
+
+```
+systemctl daemon-reload && systemctl enable --now k8s-cert-check.timer
+```
+
+**Output:**
+
+```
+Created symlink from /etc/systemd/system/timers.target.wants/k8s-cert-check.timer to /etc/systemd/system/k8s-cert-check.timer.
+```
+
+```
+systemctl start k8s-cert-check.service
+journalctl -t k8s-cert-check -n 5 --no-pager
+```
+
+**Output:**
+
+```
+Aug 19 12:12:38 vrp-kubeengine01 k8s-cert-check[46492]: OK: cert K8s tren vrp-kubeengine01 con 364 ngay
+```
+
+```
+systemctl list-timers k8s-cert-check.timer --no-pager
+```
+
+**Output:**
+
+```
+NEXT                          LEFT      LAST PASSED UNIT                    ACTIVATES
+Thu 2026-08-20 00:47:14 +07   12h left  n/a  n/a    k8s-cert-check.timer    k8s-cert-check.service
+```
+
+**Đọc được gì:**
+
+- ✅ **Script trích đúng số ngày: `364`** — khớp bảng `check-expiration` (output 3.25).
+  Regex `\d+(?=d\s)` + `sort -n | head -1` lấy **giá trị NHỎ NHẤT** ⇒ cert nào sắp hết hạn
+  nhất sẽ quyết định cảnh báo.
+- ✅ **Timer đã lên lịch**: `NEXT = Thu 2026-08-20 00:47:14`.
+  ⭐ `00:47` chứ không phải `00:00` ⇒ **`RandomizedDelaySec=1h` đang hoạt động** — tránh 3 master
+  cùng gọi apiserver một lúc.
+- ✅ **Đã chạy thử thành công**, log ra `user.info`. Mỗi lần chạy đều để lại dấu vết ⇒ biết cron
+  còn sống, không chỉ im lặng khi mọi thứ ổn.
+- ✅ **Đã cài trên cả 3 master** (Kiên xác nhận; screenshot node 48 làm đại diện).
+- ⚠️ **Chưa có kênh gửi ra ngoài.** Hiện chỉ ghi vào journald — muốn biết phải chủ động
+  `journalctl`. ❓ Cần bổ sung: mail (VDI có MTA không?), webhook, hoặc để Prometheus/promtail
+  scrape journald.
+  ⇒ **Cảnh báo chỉ ghi log là cảnh báo yếu** — nợ còn lại của issue #5.
 
 ---
 
