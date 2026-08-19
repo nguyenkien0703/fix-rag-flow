@@ -1413,7 +1413,53 @@ etc/kubernetes/ssl/front-proxy-ca.crt
 
 ---
 
-### 3.22 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.22 — [Node 48 / GĐ2.1] 🛑 Renew cert `apiserver` — CHƯA VERIFY SAN
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ngày 19/08**
+
+```
+kubeadm certs renew apiserver --config /root/cluster-config-renew.yaml
+```
+
+**Output:**
+
+```
+certificate for serving the Kubernetes API renewed
+```
+
+**Đọc được gì:**
+
+- ✅ **Lệnh chạy xong, không lỗi.** Không có `unknown kind`, `failed to unmarshal`, hay
+  `unknown flag` — khác hẳn output 3.16.
+- ✅ **Đúng MỘT cert được renew** (`apiserver`), như chủ đích. 5 cert còn lại chưa đụng tới.
+- 🔴 ⭐ **NHƯNG: dòng "renewed" KHÔNG chứng minh SAN đúng.**
+
+  Nhắc lại bẫy ở output 3.11: nếu kubeadm **im lặng** bỏ qua `--config` rồi rơi về **default
+  config**, nó **vẫn in y hệt dòng này**. Thông báo thành công **không phân biệt được** hai
+  trường hợp:
+  - (a) đọc được file → cert có đủ 18-19 SAN ✅
+  - (b) bỏ qua file → cert chỉ có SAN mặc định, **mất** `lb-apiserver.kubernetes.local`,
+    `10.208.137.68`, `172.16.128.1` 🔴
+
+  ⇒ Mất `--dry-run` (output 3.16) nên **không có cách nào biết trước**.
+  ⇒ **`diff` SAN ở GĐ3 là PHÉP KIỂM DUY NHẤT.**
+
+- ⭐ **Trạng thái hiện tại — cửa sổ CÒN CỨU ĐƯỢC:**
+
+  | Ở đâu | Cert nào |
+  |---|---|
+  | **Trên đĩa** (`/etc/kubernetes/ssl/apiserver.crt`) | 🆕 **Cert MỚI** vừa ghi |
+  | **Trong bộ nhớ** (static pod đang chạy) | 🕐 **Cert CŨ** — pod chưa restart |
+
+  ⇒ Nếu SAN sai: chỉ cần restore backup `-1118`, **không cần restart gì**, cluster không hề
+  bị ảnh hưởng. Sau khi restart ở GĐ4 thì cửa sổ này **đóng lại**.
+
+- ❓ **Chưa xác minh:** SAN của cert mới. **TUYỆT ĐỐI KHÔNG chạy 2.2 hay GĐ4** trước khi có
+  kết quả `diff`.
+
+---
+
+### 3.23 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
