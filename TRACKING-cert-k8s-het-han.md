@@ -70,7 +70,7 @@ hỏng nặng hơn hiện tại).
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
 | 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | 🔶 **OPEN — đang thực hiện GĐ0** | `kubeadm certs renew all` **`--config /root/cluster-config-renew.yaml`** (file TÁCH ở GĐ0-ter, không phải file gốc) → so SAN → restart. Lần lượt 48→49→50 |
-| 2 | `kubectl` không chạy được dưới user `root` (thiếu kubeconfig) | 🟡 TB | 🔶 **OPEN** | Copy `admin.conf` → `~/.kube/config` **sau khi** renew xong |
+| 2 | `kubectl` không chạy được dưới **`vt_admin`** (thiếu kubeconfig). `root` CÓ file nhưng cert bên trong đã hết hạn | 🟡 TB | 🔶 **OPEN** | ✅ Output 3.27 làm rõ: root có sẵn `/root/.kube/config`. Backup rồi ghi đè bằng `admin.conf` vừa renew |
 | 3 | ~~Toàn bộ PKI etcd báo `!MISSING!`~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.4: không có `etcd.yaml` ⇒ **etcd external** ⇒ `!MISSING!` chỉ là cosmetic |
 | 4 | `kubeadm` fallback default config → cert mới mất SAN | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | ✅ Output 3.6 xác nhận `kubeadm-config.yaml` còn đúng ⇒ renew **kèm `--config /etc/kubernetes/kubeadm-config.yaml`**. Cấm lệnh trần |
 | 5 | Không có cảnh báo trước khi cert hết hạn | 🟡 TB | 🔶 **OPEN** | Dựng `x509-certificate-exporter` + alert trước 30 ngày |
@@ -1754,7 +1754,45 @@ be9b87f431442   4783639ba7e03   6 seconds ago   Running   kube-controller-manage
 
 ---
 
-### 3.27 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.27 — [Node 48 / GĐ5.1] `cp: overwrite?` — câu hỏi xác nhận, KHÔNG phải lỗi
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~11:42 +07 ngày 19/08**
+
+```
+mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config
+```
+
+**Output:**
+
+```
+cp: overwrite '/root/.kube/config'? ^C
+```
+
+**Đọc được gì:**
+
+- ✅ **KHÔNG phải lỗi** — đây là **câu hỏi xác nhận**. Kiên bấm `^C` hủy
+  ⇒ **`/root/.kube/config` CHƯA bị thay đổi**, không cần rollback gì.
+- ⭐ **Vì sao `cp` lại hỏi:** lệnh `cp` trần **không hỏi** gì cả. Nó hỏi vì trên RHEL/CentOS,
+  `/root/.bashrc` thường có `alias cp='cp -i'` (interactive) — cơ chế bảo vệ mặc định của hệ
+  điều hành, chống ghi đè nhầm.
+  ⇒ Bước backup `cp -a` ở 0q.2/0q.3 **không bị hỏi** vì đích là file **mới**; ở đây đích **đã
+  tồn tại**.
+- ⭐ **Phát hiện phụ: `/root/.kube/config` ĐÃ TỒN TẠI SẴN trên node 48.**
+  Đối chiếu output 3.1: `kubectl` dưới **`vt_admin`** báo `localhost:8080 refused` (thiếu
+  kubeconfig) — nhưng đó là **user khác**. Dưới `root` thì file có sẵn.
+  ⇒ Ai đó, hoặc Kubespray lúc dựng cluster, đã đặt file này từ trước.
+  ⇒ **Điều chỉnh issue #2**: không phải "root thiếu kubeconfig" mà là "**`vt_admin` thiếu
+  kubeconfig**". Root có file nhưng cert bên trong đã hết hạn (như mọi cert khác).
+- ⚠️ **Đúng nguyên tắc backup Kiên đặt:** file sắp bị **ghi đè** thì phải backup trước.
+  Lệnh 0q.4 trong quy trình vốn để làm việc này nhưng **chưa được chạy** — vì lúc soạn 0q.4
+  đã giả định file có thể không tồn tại (dựa trên output 3.1, hoá ra là suy luận sai user).
+  ⇒ Phải backup trước khi ghi đè.
+- ❓ **Chưa xác minh:** endpoint trong file kubeconfig cũ trỏ đi đâu (`lb-apiserver` hay IP node).
+  Không chặn thao tác, nhưng đáng xem sau khi backup.
+
+---
+
+### 3.28 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
