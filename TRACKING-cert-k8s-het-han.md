@@ -1588,7 +1588,94 @@ Done renewing certificates. You must restart the kube-apiserver, kube-controller
 
 ---
 
-### 3.25 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.25 — [Node 48 / GĐ3 lần 2] ✅✅ Verify sau `renew all`: ĐẠT — sẵn sàng restart
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~11:34 +07 ngày 19/08**
+
+**a) Đếm SAN entry**
+
+```
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
+```
+
+**Output:** `18`
+
+**b) So SAN trước/sau**
+
+```
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -A3 'Alternative Name' > /root/san-sau-renewall-48.txt && diff /root/san-truoc-renew-48.txt /root/san-sau-renewall-48.txt
+```
+
+**Output:**
+
+```
+4c4
+<       a4:6f:63:3e:3a:40:63:01:ab:29:eb:2a:12:50:38:14:68:48:
+---
+>       69:eb:a4:ed:9a:d9:18:57:40:bf:f0:48:5b:5c:bb:b2:82:45:
+```
+
+**c) Kiểm hạn toàn bộ cert**
+
+```
+kubeadm certs check-expiration
+```
+
+**Output:**
+
+```
+[check-expiration] Reading configuration from the cluster...
+[check-expiration] FYI: You can look at this config file with 'kubectl -n kube-system get cm kubeadm-config -o yaml'
+[check-expiration] Error reading configuration from the Cluster. Falling back to default configuration
+
+CERTIFICATE                EXPIRES                  RESIDUAL TIME  CERTIFICATE AUTHORITY   EXTERNALLY MANAGED
+admin.conf                 Aug 19, 2027 04:31 UTC   364d           ca                      no
+apiserver                  Aug 19, 2027 04:31 UTC   364d           ca                      no
+!MISSING! apiserver-etcd-client
+apiserver-kubelet-client   Aug 19, 2027 04:31 UTC   364d           ca                      no
+controller-manager.conf    Aug 19, 2027 04:31 UTC   364d           ca                      no
+!MISSING! etcd-healthcheck-client
+!MISSING! etcd-peer
+!MISSING! etcd-server
+front-proxy-client         Aug 19, 2027 04:31 UTC   364d           front-proxy-ca          no
+scheduler.conf             Aug 19, 2027 04:31 UTC   364d           ca                      no
+
+CERTIFICATE AUTHORITY   EXPIRES                  RESIDUAL TIME  EXTERNALLY MANAGED
+ca                      Jul 03, 2033 08:11 UTC   6y             no
+!MISSING! etcd-ca
+front-proxy-ca          Jul 03, 2033 08:11 UTC   6y             no
+```
+
+**Đọc được gì:**
+
+- ✅ **`18` entry** — bằng đúng output 3.10 (trước renew) và 3.23 (sau lần ký 1).
+  ⇒ SAN nguyên vẹn qua **cả hai** lần ký.
+- ✅ **`diff` chỉ khác dòng 4 (chuỗi hex)** — không dòng `<` nào chứa `DNS:`/`IP Address:`.
+  ⭐ **Ba lần ký, ba key khác nhau** — đúng cơ chế Subject Key Identifier:
+
+  | Mốc | Chuỗi hex |
+  |---|---|
+  | Trước renew (3.10) | `a4:6f:63:3e:3a:40:...` |
+  | Sau `renew apiserver` (3.23) | `83:b5:28:99:ea:74:...` |
+  | Sau `renew all` (3.25) | `69:eb:a4:ed:9a:d9:...` |
+
+- ✅ ⭐ **MỌI cert lá: `Aug 19, 2027 04:31 UTC`, `RESIDUAL TIME 364d`.**
+  So với output 3.2 ban đầu (`Aug 18, 2026`, `<invalid>`) ⇒ **đã gia hạn thành công trên đĩa**.
+- ✅ **`ca` và `front-proxy-ca` vẫn `Jul 03, 2033 — 6y`** — CA **KHÔNG bị đụng tới**, đúng thiết kế.
+  ⇒ Đây là lý do **worker không cần join lại**: chúng tin CA, mà CA không đổi.
+- ✅ **`!MISSING! etcd-*` VẪN CÒN — đúng là phải còn.** Y hệt bảng ban đầu (output 3.2).
+  Etcd external, kubeadm không quản. **KHÔNG phải lỗi.**
+- ✅ **`Error reading configuration from the Cluster` VẪN CÒN — đúng là phải còn.**
+  Apiserver **chưa restart** nên vẫn phục vụ bằng cert cũ đã hết hạn ⇒ kubeadm vẫn không đọc
+  được ConfigMap.
+  ⭐ **Dòng này sẽ biến mất sau GĐ4.** Nếu nó biến mất *trước* khi restart thì mới là bất thường.
+  ⇒ Đây cũng là **bằng chứng gián tiếp** rằng static pod đang chạy cert CŨ — đúng như mô tả
+  trạng thái ở output 3.22.
+- ⇒ ✅✅ **ĐỦ ĐIỀU KIỆN RESTART (GĐ4).** Ba phép kiểm độc lập đều đạt: đếm SAN, `diff`, bảng hạn.
+
+---
+
+### 3.26 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
