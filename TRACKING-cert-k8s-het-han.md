@@ -14,12 +14,15 @@ cluster HA hoạt động ổn định, **không làm mất quorum etcd và khô
 
 | Hạng mục | Giá trị |
 |---|---|
-| Ngày phát hiện | 2026-08-19 |
-| Cert lá hết hạn lúc | **Aug 18, 2026 11:53 UTC** (hết hạn trước đó ~1 ngày) |
+| Ngày phát hiện | 2026-08-19, khoảng **08:49 +07** |
+| **Triệu chứng đầu tiên** | `helm upgrade ragflow` trên worker `vrp-kubeengine04` → `UPGRADE FAILED: Kubernetes cluster unreachable` |
+| Cert LB endpoint hết hạn lúc | **2026-08-18T12:02:51Z** (chính xác đến giây, từ thông báo lỗi TLS) |
+| Cert lá khác hết hạn lúc | **Aug 18, 2026 11:53 UTC** (bảng `check-expiration`, làm tròn phút) |
 | RESIDUAL TIME của mọi cert lá | `<invalid>` (đã âm) |
 | CA gốc (`ca`) hết hạn | **Jul 03, 2033 08:11 UTC** — còn `6y` |
 | `front-proxy-ca` hết hạn | **Jul 03, 2033 08:11 UTC** — còn `6y` |
-| Triệu chứng người dùng | `kubectl get nodes` → `connection to the server localhost:8080 was refused` |
+| Thời điểm phát sinh lỗi | `current time 2026-08-19T08:49:32+07:00` — node chạy **UTC+7**, đồng hồ đúng ⇒ **loại trừ lệch NTP** |
+| Phạm vi ảnh hưởng | **Toàn cụm** — cả worker (kubeconfig user `app`) lẫn master đều hỏng |
 
 ### Bối cảnh hệ thống
 
@@ -29,11 +32,14 @@ cluster HA hoạt động ổn định, **không làm mất quorum etcd và khô
 | **Master (3)** | **10.208.137.48 / .49 / .50** | Xác nhận của Kiên |
 | **Worker (5)** | **10.208.137.51 / .52 / .53 / .54 / .55** | Xác nhận của Kiên |
 | Tổng node | 8 (3 control-plane + 5 worker) | Suy ra từ trên |
+| Node phát hiện lỗi | `vrp-kubeengine04` (worker), user `app` | Output 3.0 |
 | ~~IP nghi VIP 10.208.216.4~~ | ❌ **LOẠI BỎ — thuộc cụm khác, không liên quan** | Kiên đính chính 2026-08-19 |
-| Control-plane endpoint / VIP | ❓ **chưa xác minh** — nếu có VIP thì nằm trong chính dải `10.208.137.x` | Xác định bằng lệnh 4.5 |
-| Công cụ quản trị cluster | `kubeadm` (lệnh chạy được, có `certs check-expiration`) | Output 3.2 |
+| ⭐ **Control-plane endpoint** | **`https://lb-apiserver.kubernetes.local:6443`** — là **DNS name**, không phải IP | ✅ Output 3.0 |
+| Công cụ dựng cluster | ❓ **nghi Kubespray** — `lb-apiserver.kubernetes.local` là tên mặc định của Kubespray. Bên dưới vẫn là kubeadm | Suy luận từ tên endpoint — **chưa xác minh** |
+| Công cụ quản trị cert | `kubeadm` (lệnh `certs check-expiration` chạy được) | Output 3.2 |
 | Kiến trúc etcd | ❓ **chưa xác minh** — nghi external etcd | Suy luận từ `!MISSING!`, chưa có bằng chứng trực tiếp |
-| User thao tác | `vt_admin` → `su` sang `root` | Screenshot |
+| Ứng dụng bị ảnh hưởng | RAGFlow `v0.26.4`, namespace `ragflow`, deploy bằng Helm | Output 3.0 |
+| User thao tác | worker: `app` / master: `vt_admin` → `su` sang `root` | Screenshot |
 
 ---
 
@@ -44,14 +50,72 @@ cluster HA hoạt động ổn định, **không làm mất quorum etcd và khô
 | 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | 🔶 **OPEN** | `kubeadm certs renew` bằng CA còn hạn → restart static pod. Lần lượt 48→49→50 |
 | 2 | `kubectl` không chạy được dưới user `root` (thiếu kubeconfig) | 🟡 TB | 🔶 **OPEN** | Copy `admin.conf` → `~/.kube/config` **sau khi** renew xong |
 | 3 | Toàn bộ PKI etcd báo `!MISSING!` | 🔴 Cao | 🔶 **OPEN** — chưa rõ có phải issue thật | Xác minh external vs stacked etcd (lệnh 4.1). Nếu stacked → escalate, nặng hơn issue #1 |
-| 4 | `kubeadm` không đọc được ConfigMap `kubeadm-config`, fallback default config | 🟠 Cao | 🔶 **OPEN** | Rủi ro cert mới thiếu SAN → hỏng HA. Phải chụp SAN cũ trước khi renew |
+| 4 | `kubeadm` fallback default config → **cert mới có thể mất SAN `lb-apiserver.kubernetes.local`** | 🔴 **Cao (nâng từ 🟠)** | 🔶 **OPEN** | Đã xác định cụ thể nhờ output 3.0. **BẮT BUỘC** renew kèm `--config`, cấm dùng lệnh trần |
 | 5 | Không có cảnh báo trước khi cert hết hạn | 🟡 TB | 🔶 **OPEN** | Dựng `x509-certificate-exporter` + alert trước 30 ngày |
+| 6 | RAGFlow `v0.26.4` chưa upgrade được (việc gốc ban đầu) | 🟢 Thấp | 🔶 **OPEN** — bị chặn bởi #1 | Chạy lại `helm upgrade` sau khi cluster khôi phục |
 
 ---
 
 ## 3. Lệnh đã chạy
 
 > ⚠️ Chỉ ghi lệnh **đã có output thật**. Lệnh chưa chạy nằm ở mục 7.
+> Đánh số theo **thứ tự thời gian thực tế**: 3.0 xảy ra trước 3.1.
+
+### 3.0 ⭐ Lệnh làm lộ ra sự cố — deploy RAGFlow bằng Helm
+
+**Node: `vrp-kubeengine04` (worker) — user `app`, ~08:49 +07 ngày 19/08**
+
+```
+helm upgrade ragflow . -n ragflow -f values.yaml
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `helm upgrade` | Nâng cấp release đã cài. Bước đầu tiên của nó là **gọi API server để lấy `/version`** — đây chính là chỗ chết, chưa kịp đụng tới chart |
+| `ragflow` (đối số 1) | Tên **release**, không phải tên chart |
+| `.` (đối số 2) | Chart nằm ở **thư mục hiện tại** (`helm_ragflow_v0.26.4/`), không phải chart từ repo remote |
+| `-n ragflow` | Namespace đích. Viết tắt của `--namespace` |
+| `-f values.yaml` | File values ghi đè giá trị mặc định của chart. Nhiều `-f` thì file sau đè file trước |
+
+**Output** (gõ lại từ screenshot — VDI chặn clipboard, đã lược các lần lặp giống nhau):
+
+```
+Error: UPGRADE FAILED: Kubernetes cluster unreachable: Get "https://lb-apiserver.kubernetes.local:6443/version": tls: failed to verify certificate: x509: certificate has expired or is not yet valid: current time 2026-08-19T08:49:32+07:00 is after 2026-08-18T12:02:51Z
+```
+
+Lệnh `kubectl` chạy ngay sau đó trên cùng node, cùng user:
+
+```
+kubectl get pods -n ragflow
+```
+
+```
+Unable to connect to the server: tls: failed to verify certificate: x509: certificate has expired or is not yet valid: current time 2026-08-19T08:50:14+07:00 is after 2026-08-18T12:02:51Z
+```
+
+**Đọc được gì:**
+
+- ⭐ **Control-plane endpoint là `https://lb-apiserver.kubernetes.local:6443`** — một **DNS name**,
+  không phải IP node. Đây là thông tin **quyết định** cho bước renew: SAN của cert apiserver
+  **bắt buộc** phải chứa tên này, nếu không toàn cụm sẽ hỏng sau khi renew.
+- Tên `lb-apiserver.kubernetes.local` là **giá trị mặc định của Kubespray**. Kubespray dựng HA
+  bằng nginx/HAProxy chạy cục bộ trên **mỗi** node, listen `127.0.0.1:6443` rồi map hostname này
+  vào `/etc/hosts` từng node → mỗi node tự LB sang 3 master, **không dùng VIP dùng chung**.
+  ❓ chưa xác minh, nhưng khớp với việc `kubeadm` vẫn dùng được (Kubespray dùng kubeadm làm engine).
+- **Mốc hết hạn chính xác: `2026-08-18T12:02:51Z`** — chi tiết hơn bảng `check-expiration`
+  (chỉ có `11:53 UTC`). Chênh ~10 phút là bình thường, cert được `kubeadm init` sinh tuần tự.
+- `current time 2026-08-19T08:49:32+07:00` ⇒ node chạy **UTC+7 và đồng hồ đúng**.
+  ⇒ **Loại trừ được**: không phải lệch NTP làm cert "trông như" hết hạn. Cert hết hạn **thật**.
+- ⭐ **Loại trừ được (quan trọng nhất): apiserver VẪN ĐANG CHẠY.**
+  Lỗi là `tls: failed to verify certificate` — tức đã **bắt tay được TCP** và **vào tới giai đoạn
+  TLS handshake**, chỉ thất bại ở khâu client verify cert. Nếu apiserver chết hẳn thì lỗi phải là
+  `connection refused` hoặc `i/o timeout`.
+  ⇒ Cluster **không chết**, chỉ là không client nào chịu tin nó. Chỉ cần renew + restart, **không**
+  phải kịch bản cứu cluster chết / restore snapshot.
+- Phạm vi: lỗi xảy ra trên **worker**, với kubeconfig của user `app` — chứng tỏ sự cố **toàn cụm**,
+  không riêng master 48.
+
+---
 
 ### 3.1 Kiểm tra cluster còn truy cập được không (lệnh phát hiện sự cố)
 
@@ -78,9 +142,21 @@ The connection to the server localhost:8080 was refused - did you specify the ri
 - Đây **KHÔNG phải** lỗi cert. Lỗi cert sẽ hiện `x509: certificate has expired or is not yet valid`.
 - `localhost:8080` là giá trị **fallback mặc định** khi kubectl không tìm thấy kubeconfig nào.
   Cổng `8080` là insecure-port, đã bị gỡ khỏi K8s từ v1.20 → chắc chắn không có gì lắng nghe ở đó.
-- ⇒ Kết luận trực tiếp: user đang chạy (`vt_admin`, sau đó `root`) **không có file `~/.kube/config`**.
-- ⇒ **Loại trừ được:** output này **không chứng minh** apiserver đã chết. Chưa biết apiserver
-  sống hay chết — cần `crictl` để biết (lệnh 4.4). Đây là điểm dễ kết luận nhầm nhất.
+- ⇒ Kết luận trực tiếp: user `vt_admin` trên master 48 **không có file `~/.kube/config`**.
+- ⭐ **Đối chiếu với output 3.0** — cùng là sự cố cert, nhưng hai thông báo lỗi khác hẳn nhau:
+
+  | Node / User | Thông báo | Nghĩa thật |
+  |---|---|---|
+  | worker 04 / `app` | `tls: failed to verify certificate: x509...` | **Có** kubeconfig → tới được TLS handshake → lỗi cert THẬT |
+  | master 48 / `vt_admin` | `localhost:8080 refused` | **Không có** kubeconfig → chưa từng kết nối tới apiserver |
+
+  ⇒ Bài học: `localhost:8080 refused` **không nói gì** về tình trạng cert hay cluster.
+  Nếu chỉ nhìn output này ở master 48, rất dễ kết luận nhầm "apiserver đã chết".
+  Chính output 3.0 ở worker mới chứng minh apiserver **còn sống**.
+
+**Ghi chú thao tác:** trước đó Kiên có gõ `sudo kubeadm certs check-expiration` nhưng **bấm `^C`
+hủy giữa chừng** (đang chờ nhập password sudo), nên lệnh đó **không có output** — không phải nó
+báo lỗi. Sau đó `su` sang root rồi chạy lại, ra output 3.2.
 
 ---
 
@@ -211,13 +287,28 @@ API server không truy cập được (cert hết hạn) → fallback default.
 
 **Bằng chứng:** Output 3.2, dòng `Error reading configuration from the Cluster. Falling back to default configuration`.
 
-**Rủi ro cụ thể:** Cert mới thiếu `certSANs` tùy biến. Với HA 3 master, nếu cluster dùng VIP
-hoặc DNS name làm control-plane endpoint mà cert mới không chứa entry đó → toàn bộ client đi qua
-endpoint ấy sẽ báo `x509: certificate is valid for ..., not <endpoint>`.
+**🔴 Rủi ro cụ thể — ĐÃ XÁC ĐỊNH, không còn là giả định:**
 
-❓ **Chưa xác minh cluster có VIP hay không.** Ban đầu nghi `10.208.216.4`, nhưng Kiên đính chính
-IP đó thuộc **cụm khác**. Topology thật chỉ có `10.208.137.48-50` (master) và `.51-55` (worker).
-Nếu có VIP, nó nằm trong chính dải `137.x` — xác định bằng lệnh 4.5.
+Output 3.0 chứng minh control-plane endpoint là **`lb-apiserver.kubernetes.local`** (DNS name).
+Cert apiserver hiện tại **chắc chắn** có tên này trong `certSANs` — nếu không, cluster đã không
+chạy được từ đầu.
+
+Nhưng `kubeadm` đang **fallback default config** (không đọc được ConfigMap). Default config
+**không biết** tới DNS name tùy biến này — nó chỉ sinh SAN mặc định (IP node, `kubernetes`,
+`kubernetes.default`, `kubernetes.default.svc`, `kubernetes.default.svc.cluster.local`,
+ClusterIP của svc kubernetes).
+
+⇒ **Nếu chạy `kubeadm certs renew all` trần**, cert mới **rất có thể mất** `lb-apiserver.kubernetes.local`
+→ mọi `kubectl`/`helm` trên **mọi node** (đều trỏ qua tên này) sẽ báo
+`x509: certificate is valid for ..., not lb-apiserver.kubernetes.local`
+→ **cluster hỏng nặng hơn hiện tại**, và lúc đó không còn cert cũ để rollback.
+
+**Cách gỡ bắt buộc:** chụp SAN cũ (4.3) → soạn file `kubeadm-config.yaml` khai lại đầy đủ
+`apiServer.certSANs` → renew **kèm `--config`**. Xem mục 7.
+
+❓ **Chưa xác minh:** cluster có phải dựng bằng Kubespray không. Nếu đúng, `certSANs` gốc nằm ở
+biến Ansible `supplementary_addresses_in_ssl_keys` trong repo Kubespray — **nguồn đáng tin hơn**
+để dựng lại file config, thay vì chỉ đọc ngược từ cert cũ.
 
 **Cách gỡ:** Chụp SAN của cert cũ (lệnh 4.3) → nếu có VIP thì renew phải kèm `--config <file>`
 khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
@@ -264,6 +355,33 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
    **Rút ra:** topology chỉ được lấy từ (a) người vận hành xác nhận trực tiếp, hoặc (b) file cấu
    hình trên node — `admin.conf`, manifest apiserver, `kubeadm-config`. Bằng chứng gián tiếp phải
    luôn đánh dấu `❓ chưa xác minh`, và **không được xây kịch bản rủi ro chồng lên nó** như đã làm.
+
+7. **⭐ Thông báo lỗi của ứng dụng quý hơn lệnh chẩn đoán chuyên dụng.**
+
+   Một dòng lỗi `helm upgrade` cho ra **nhiều thông tin hơn** cả `kubeadm certs check-expiration`:
+
+   | Thông tin | Lấy từ đâu |
+   |---|---|
+   | Control-plane endpoint = `lb-apiserver.kubernetes.local` | ✅ Lỗi helm — `check-expiration` **không** in ra |
+   | Nghi Kubespray (từ tên endpoint mặc định) | ✅ Lỗi helm |
+   | Mốc hết hạn chính xác đến giây `12:02:51Z` | ✅ Lỗi helm (bảng chỉ có `11:53`) |
+   | Timezone node + đồng hồ đúng → loại trừ lệch NTP | ✅ Lỗi helm |
+   | **Apiserver còn sống** | ✅ Lỗi helm (`failed to verify` ≠ `connection refused`) |
+
+   **Rút ra:** khi sự cố hạ tầng lộ ra qua ứng dụng, **đọc kỹ log gốc của ứng dụng trước**, đừng
+   vội nhảy sang lệnh chẩn đoán hạ tầng. Ở đây đã suýt bỏ qua screenshot lỗi helm và đi hỏi vòng
+   vo về VIP — trong khi câu trả lời nằm sẵn trong dòng lỗi đầu tiên.
+
+8. **Phân biệt 3 loại lỗi kết nối — mỗi loại chỉ ra một tầng khác nhau:**
+
+   | Thông báo | Tầng chết | Nghĩa |
+   |---|---|---|
+   | `connection to localhost:8080 refused` | Chưa tới tầng nào | **Thiếu kubeconfig** — client chưa biết phải gọi đi đâu |
+   | `tls: failed to verify certificate: x509...` | TCP ✔ → TLS ✘ | Server **còn sống**, chỉ là cert client không chấp nhận |
+   | `connection refused` / `i/o timeout` tới đúng endpoint | TCP ✘ | Server **thật sự chết** hoặc mạng chặn |
+
+   Trong phiên này gặp loại 1 và loại 2 cùng lúc trên hai node khác nhau — nếu chỉ nhìn loại 1
+   (ở master 48) sẽ chẩn đoán sai hoàn toàn.
 
 ---
 
@@ -344,11 +462,14 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
   │       │     └─ đọc từ file thay vì stdin
   │       └─ sub-command thao tác cert X.509
   └─ MỤC ĐÍCH: chép output ra chỗ khác TRƯỚC khi renew, để so sánh sau khi renew.
-     Kỳ vọng thấy: 10.208.137.48, 10.96.0.1 (ClusterIP của svc kubernetes),
-                   kubernetes / kubernetes.default / kubernetes.default.svc.cluster.local
-     ⚠️ SOI KỸ mọi IP/DNS NGOÀI danh sách trên — đặc biệt IP thuộc 10.208.137.x mà KHÔNG
-        phải .48 (tức không phải node này). Đó chính là VIP/endpoint HA.
-        Có entry lạ → BẮT BUỘC renew kèm --config, KHÔNG dùng lệnh renew trần
+     ⭐ BẮT BUỘC PHẢI THẤY: lb-apiserver.kubernetes.local
+        (output 3.0 chứng minh cluster dùng tên này làm endpoint)
+     Kỳ vọng thấy thêm: 10.208.137.48, 10.233.0.1 (ClusterIP svc kubernetes — Kubespray
+        mặc định dải 10.233.0.0/18, khác kubeadm thuần 10.96.0.0/12),
+        kubernetes / kubernetes.default / kubernetes.default.svc.cluster.local,
+        hostname node (vrp-kubeengine01), có thể cả IP .49 .50
+     ⚠️ CHÉP LẠI TOÀN BỘ, không bỏ sót entry nào → dùng để soạn certSANs cho --config
+        và để so sánh sau khi renew
   ```
   </details>
 
@@ -374,32 +495,62 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
   ```
   </details>
 
-- [ ] **4.5** — ⭐ Xác định control-plane endpoint (**quyết định renew có cần `--config` không**)
+- [ ] **4.5** — Xác nhận cơ chế LB và endpoint (đã biết tên, cần biết nó trỏ đi đâu)
 
   ```
-  grep 'server:' /etc/kubernetes/admin.conf
+  grep -E 'server:|lb-apiserver' /etc/kubernetes/admin.conf /etc/hosts
   ```
 
   <details>
   <summary>Giải nghĩa</summary>
 
   ```
-  grep 'server:' /etc/kubernetes/admin.conf
-  │               └─ kubeconfig admin, chứa endpoint mà kubectl gọi tới.
-  │                  ⭐ Đọc được KHÔNG cần cert còn hạn — nó chỉ là text YAML.
-  │                  Đây là lý do lệnh này chạy được ngay cả khi cluster đang chết
-  └─ ĐỌC KẾT QUẢ dòng `server: https://<host>:6443`:
-     • https://10.208.137.48:6443 → node tự trỏ chính nó, KHÔNG có VIP
-       ⇒ renew trần an toàn, không cần --config
-     • https://10.208.137.<X>:6443 với X KHÔNG thuộc 48/49/50
-       ⇒ đó là VIP (keepalived cấp VIP cùng dải) → SAN BẮT BUỘC có IP này
-     • https://<hostname>:6443     → dùng DNS name → SAN phải có DNS name đó
+  grep -E 'server:|lb-apiserver' /etc/kubernetes/admin.conf /etc/hosts
+  │    │                          │                          └─ ⭐ chỗ Kubespray map
+  │    │                          │                             lb-apiserver.kubernetes.local
+  │    │                          │                             → thường là 127.0.0.1
+  │    │                          └─ endpoint kubectl gọi tới. Đọc được KHÔNG cần cert
+  │    │                             còn hạn (chỉ là text YAML) — chạy được cả khi cluster chết
+  │    └─ -E: regex mở rộng, `|` là OR không cần escape
+  └─ grep NHIỀU FILE cùng lúc → output tự động thêm tiền tố "<tên file>:" mỗi dòng,
+     nên phân biệt được dòng nào của file nào mà không cần chạy 2 lệnh
+     ĐỌC KẾT QUẢ:
+     • /etc/hosts có "127.0.0.1 lb-apiserver.kubernetes.local"
+       ⇒ XÁC NHẬN Kubespray localhost-LB: nginx/haproxy chạy trên CHÍNH node này,
+         proxy sang 3 master. KHÔNG có VIP dùng chung
+       ⇒ Hệ quả tốt: restart từng master KHÔNG làm client trên node khác mất kết nối,
+         vì LB cục bộ tự chuyển sang master còn sống
+     • /etc/hosts trỏ tới 1 IP thật ⇒ có LB/VIP tập trung → khi restart master phải
+       kiểm tra health-check của LB có loại node đó ra không
   ```
   </details>
 
-  > 📌 Lệnh này **lên mức quan trọng nhất nhóm chẩn đoán** sau khi Kiên đính chính
-  > `10.208.216.4` thuộc cụm khác. Trước đó đã biết sẵn IP nghi là VIP nên chỉ cần xác nhận;
-  > giờ **chưa biết cluster có VIP hay không**, phải xác định từ đầu.
+  > 📌 Output 3.0 **đã trả lời** phần lớn câu hỏi này: endpoint là
+  > `lb-apiserver.kubernetes.local:6443`. Lệnh 4.5 giờ chỉ để xác nhận **cơ chế** phía sau
+  > (LB cục bộ mỗi node hay LB tập trung) — điều này quyết định mức rủi ro khi restart
+  > lần lượt từng master.
+
+- [ ] **4.6** — Xác nhận có phải Kubespray không (để tìm nguồn `certSANs` gốc)
+
+  ```
+  ls -la /etc/kubernetes/kubeadm-config.yaml /etc/kubernetes/kubespray* 2>&1
+  ```
+
+  <details>
+  <summary>Giải nghĩa</summary>
+
+  ```
+  ls -la <file1> <file2> 2>&1
+  │  ││                   └─ gộp stderr vào stdout: thông báo "No such file" hiện ra ngay
+  │  ││                      trong screenshot thay vì bị nuốt mất
+  │  │└─ -a: hiện cả file ẩn (Kubespray có thể để lại file .kubespray*)
+  │  └─ -l: long format, xem mtime để biết lần cuối cluster được dựng/nâng cấp
+  └─ ⭐ /etc/kubernetes/kubeadm-config.yaml là VÀNG nếu tồn tại:
+     Kubespray GHI file này ra đĩa khi chạy playbook, trong đó có ĐẦY ĐỦ certSANs.
+     Có file này ⇒ renew kèm --config /etc/kubernetes/kubeadm-config.yaml là chuẩn nhất,
+     không phải tự soạn lại từ việc đọc ngược cert cũ
+  ```
+  </details>
 
 ### Ngắn hạn — thao tác sửa (⚠️ chỉ chạy sau khi 4.1–4.5 xác nhận an toàn)
 
@@ -451,7 +602,7 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 
 | Rủi ro | Mức độ | Giảm thiểu |
 |---|---|---|
-| Cert mới thiếu SAN do fallback default config → HA hỏng nặng hơn hiện tại | 🟠 Cao (giảm từ 🔴) | Chụp SAN cũ (4.3) → xác định endpoint (4.5) → so sánh sau renew → renew kèm `--config` nếu có VIP/DNS name |
+| ⭐ **Cert mới mất SAN `lb-apiserver.kubernetes.local`** → **toàn cụm** hỏng nặng hơn hiện tại, không còn cert cũ để lùi | 🔴 **Cao — đã xác nhận, không còn là giả định** | Chụp SAN cũ (4.3) → tìm `kubeadm-config.yaml` trên đĩa (4.6) → renew **kèm `--config`** → so SAN trước/sau → chỉ restart khi SAN khớp |
 | **5 worker `.51-.55` chưa được kiểm tra** — kubelet client cert có thể cũng hết hạn | 🟡 TB | Sau khi control-plane xanh, kiểm `kubelet-client-current.pem` trên từng worker |
 | Là stacked etcd nhưng PKI mất thật → renew không cứu được, có thể làm hỏng thêm | 🔴 Cao | Xác minh 4.1 + 4.2 **trước khi** renew. Nếu thấy `etcd.yaml` → dừng, escalate |
 | Restart nhiều master cùng lúc → mất quorum etcd → cluster chết, phải restore snapshot | 🔴 Cao | Tuần tự 48→49→50, verify giữa mỗi bước |
@@ -466,9 +617,13 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 
 | Mục | Nguồn | Độ tin cậy |
 |---|---|---|
-| Output 3.1, 3.2 | Screenshot terminal node 48, phiên 2026-08-19 | ✅ Trực tiếp |
+| Output 3.0 | Screenshot terminal worker `vrp-kubeengine04`, 2026-08-19 ~08:49 +07 | ✅ Trực tiếp |
+| Output 3.1, 3.2 | Screenshot terminal master 48, phiên 2026-08-19 | ✅ Trực tiếp |
 | Master `137.48/49/50` + worker `137.51-55` | Kiên xác nhận trong phiên | ✅ Trực tiếp |
+| Trình tự sự cố (helm → phát hiện cert → sang master) | Kiên kể lại trong phiên | ✅ Trực tiếp |
 | ~~10.208.216.4 là VIP của cluster~~ | ~~Suy đoán từ tab SSH~~ | ❌ **SAI — đã bác bỏ**, thuộc cụm khác (Kiên đính chính). Xem Bài học #6 |
-| Cluster có VIP hay không | Chưa có dữ liệu | ❓ **Chưa xác minh** — chờ lệnh 4.5 |
+| Endpoint `lb-apiserver.kubernetes.local:6443` | Thông báo lỗi TLS của helm + kubectl | ✅ **Trực tiếp** |
+| Cluster dựng bằng Kubespray | Suy luận từ tên endpoint mặc định | ❓ **Chưa xác minh** — chờ lệnh 4.6 |
+| Cơ chế LB (cục bộ mỗi node vs tập trung) | Chưa có dữ liệu | ❓ **Chưa xác minh** — chờ lệnh 4.5 |
 | Kiến trúc etcd external | Suy luận gián tiếp từ `!MISSING!` + cluster còn sống tới 18/08 | ❓ **Chưa xác minh** |
 | Hạn cert kubeadm mặc định 1 năm | Kiến thức chung về kubeadm | ✅ Ổn định qua các version |
