@@ -42,7 +42,8 @@ cluster HA hoạt động ổn định, **không làm mất quorum etcd và khô
 | Lần sửa apiserver gần nhất | **18/09/2024** — ❓ ai sửa, sửa gì chưa rõ | ✅ Output 3.4 (mtime) |
 | Service CIDR | `172.16.128.0/x` (ClusterIP svc kubernetes = `172.16.128.1`) — **tùy biến**, không phải mặc định | ✅ Output 3.5 |
 | ✅ **VIP / LB endpoint** | **`10.208.137.68`** = `lb-apiserver.kubernetes.local`. **LB TẬP TRUNG**, không phải localhost-LB | ✅ Output 3.7 |
-| Cơ chế LB | ❓ keepalived VIP nổi trên master, hay LB ngoài? Chưa rõ | Xác định bằng lệnh A6 |
+| ✅ **Cơ chế LB** | **LB NGOÀI CỤM** — không master nào giữ VIP, không có keepalived/haproxy/nginx trên master | ✅ Output 3.8 + 3.9 |
+| Health-check của LB | ❓ **không tự xác minh được từ trong cụm** — thiết bị của đội khác | Ràng buộc phạm vi, phải hỏi |
 | Cluster CIDR (pod) | `172.16.0.0/17` | ✅ Output 3.6 |
 | Service CIDR | `172.16.128.0/17` | ✅ Output 3.6 |
 | Cluster domain | ❓ khai `.vrp` trong config nhưng cert dùng `cluster.local` | Output 3.6 — cần làm rõ |
@@ -63,7 +64,7 @@ cluster HA hoạt động ổn định, **không làm mất quorum etcd và khô
 | 5 | Không có cảnh báo trước khi cert hết hạn | 🟡 TB | 🔶 **OPEN** | Dựng `x509-certificate-exporter` + alert trước 30 ngày |
 | 6 | RAGFlow `v0.26.4` chưa upgrade được (việc gốc ban đầu) | 🟢 Thấp | 🔶 **OPEN** — bị chặn bởi #1 | Chạy lại `helm upgrade` sau khi cluster khôi phục |
 | 7 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.6: `certSANs` khớp cert đang chạy ⇒ **dùng được `--config`** |
-| 8 | **LB tập trung `.68` — chưa rõ có health-check loại node đang restart không** | 🟠 Cao | 🔶 **OPEN** | Xác minh trước khi restart master (lệnh A6/A7) |
+| 8 | LB tập trung `.68` — chưa rõ có health-check không | 🟡 **TB (hạ từ 🟠)** | 🔶 **OPEN — bị chặn bởi phạm vi** | ✅ Output 3.8: VIP **ngoài cụm**, master restart không đụng VIP. Còn lại: hỏi đội mạng về health-check port 6443 |
 
 ---
 
@@ -507,11 +508,109 @@ grep lb-apiserver /etc/hosts
   | Rủi ro | Thấp | **Nếu `.68` không health-check → 1/3 request rơi vào node đang restart** |
 
   ⇒ **Việc mới bắt buộc:** phải xác minh `.68` có health-check không **trước khi** restart master.
-- ❓ **Chưa xác minh:** `.68` là keepalived VIP (nổi trên chính 3 master) hay LB vật lý/F5 riêng.
-  Phân biệt được bằng `ip addr | grep 137.68` trên từng master — xem mục A6.
-  Khác biệt quan trọng: nếu là **keepalived VIP nổi trên master**, thì restart node đang giữ VIP
-  sẽ làm VIP nhảy sang node khác (~vài giây gián đoạn); nếu là **LB ngoài**, master restart không
-  ảnh hưởng VIP.
+- ~~❓ Chưa xác minh: `.68` là keepalived VIP nổi trên master hay LB ngoài?~~
+  ✅ **ĐÃ TRẢ LỜI ở output 3.8: LB NGOÀI CỤM.** Không master nào mang IP này.
+  ⇒ Kịch bản "VIP nhảy khi restart node đang giữ nó" **không xảy ra**. Master restart không đụng VIP.
+  ⇒ Phần lo ngại về thứ tự restart ở bảng trên **được gỡ bỏ**; chỉ còn câu hỏi health-check.
+
+---
+
+### 3.8 ⭐ Xác định VIP nằm trong hay ngoài cụm — quyết định thứ tự restart
+
+**Chạy trên CẢ 3 master: 48, 49, 50**
+
+```
+ip addr | grep 137.68
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `ip addr` | Liệt kê **mọi** địa chỉ IP trên **mọi** interface, **kể cả IP thứ cấp/VIP** do keepalived gắn thêm. Đây là lý do dùng `ip addr` chứ không phải `hostname -I` (chỉ ra IP chính) |
+| `grep 137.68` | Lọc VIP. Dùng chuỗi ngắn `137.68` thay vì IP đầy đủ để dễ gõ tay qua VDI, vẫn đủ chính xác trong ngữ cảnh này |
+| ⚠️ Đọc kết quả rỗng | **Output rỗng KHÔNG phải lệnh lỗi** — là "không có interface nào mang IP này". Đây chính là thông tin cần |
+
+**Output:**
+
+```
+[root@vrp-kubeengine01 ~]# ip addr | grep 137.68
+[root@vrp-kubeengine01 ~]#
+```
+
+```
+[root@vrp-kubeengine02 ~]# ip addr | grep 137.68
+[root@vrp-kubeengine02 ~]#
+```
+
+```
+[root@vrp-kubeengine03 ~]# ip addr | grep 137.68
+[root@vrp-kubeengine03 ~]#
+```
+
+**Rỗng trên cả 3 node.**
+
+**Đọc được gì:**
+
+- ✅ ⭐ **VIP `10.208.137.68` nằm HOÀN TOÀN NGOÀI cụm K8s.** Không master nào mang IP này.
+- ⇒ **Loại trừ được: KHÔNG phải keepalived VIP nổi trên master.** Đây là kịch bản đã lo ngại
+  ở output 3.7 — nay bác bỏ.
+- ⇒ **Loại trừ được: không có split-brain keepalived** (kịch bản nhiều node cùng giữ VIP).
+- ⭐ **Hệ quả TRỰC TIẾP — đây là kịch bản TỐT NHẤT cho việc restart:**
+
+  | Kịch bản | Ảnh hưởng khi restart master | Thực tế? |
+  |---|---|---|
+  | Keepalived VIP trên master | VIP nhảy sang node khác, gián đoạn vài giây. Node giữ VIP phải restart **sau cùng** | ❌ Không |
+  | Split-brain keepalived | Sự cố riêng, phải xử lý trước | ❌ Không |
+  | **LB ngoài cụm** | **Master restart KHÔNG đụng tới VIP.** VIP vẫn sống, vẫn phân phối | ✅ **ĐÚNG** |
+
+  ⇒ Thứ tự 48→49→50 **không còn ràng buộc "node nào phải sau cùng"**. Giữ tuần tự chỉ để còn
+  đường rollback nếu cert mới sai SAN.
+- ❓ **Chưa xác minh (và KHÔNG tự xác minh được từ trong cụm):** LB ngoài đó có **health-check**
+  port 6443 không. Nếu không có, trong lúc master 48 restart thì LB vẫn đẩy ~1/3 request vào nó.
+  ⇒ **Đây là ràng buộc phạm vi, không phải việc chưa làm** — thiết bị thuộc đội hạ tầng mạng.
+  Xem mục "Cần hỏi người khác".
+
+---
+
+### 3.9 Kiểm tra có tiến trình LB chạy trên master không
+
+**Node: 10.208.137.48 — `root`**
+
+```
+systemctl list-units --type=service --state=running | grep -Ei 'keepalived|haproxy|nginx'
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `list-units` | Liệt kê unit systemd đã nạp |
+| `--type=service` | Chỉ lấy loại `.service`, bỏ `mount`/`socket`/`timer` cho gọn output |
+| `--state=running` | **Chỉ unit ĐANG CHẠY.** Quan trọng: bỏ qua unit đã cài nhưng không bật — tránh dương tính giả |
+| `grep -Ei` | `-E` regex mở rộng (`\|` là OR không cần escape); `-i` bỏ qua hoa/thường, phòng trường hợp unit tên `HAProxy` |
+
+**Output:**
+
+```
+[root@vrp-kubeengine01 ~]# systemctl list-units --type=service --state=running | grep -Ei 'keepalived|haproxy|nginx'
+[root@vrp-kubeengine01 ~]#
+```
+
+**Rỗng.**
+
+**Đọc được gì:**
+
+- ✅ **Master 48 KHÔNG chạy keepalived, haproxy, hay nginx.** Củng cố kết luận ở 3.8: không có
+  thành phần LB nào trên master.
+- ⇒ **Câu hỏi tự nhiên: vậy cái gì phân phối request tới 3 master?**
+  Trả lời: **LB ngoài trỏ thẳng tới `10.208.137.48/49/50:6443`**. Khớp với việc **cả 3 IP master
+  đều có trong SAN cert** (output 3.5) — LB gọi trực tiếp từng master nên cert phải hợp lệ cho
+  từng IP, không chỉ cho tên `lb-apiserver.kubernetes.local`.
+- ⚠️ **Giới hạn của bằng chứng này:** chỉ chạy trên **master 48**. Chưa kiểm 49/50.
+  Rủi ro thấp (cấu hình 3 master thường đồng nhất) nhưng **chưa xác minh**.
+  ⇒ Không chặn việc renew — nếu 49/50 có haproxy thì cũng chỉ là LB dự phòng, không đổi kết luận
+  "VIP ở ngoài".
+- ❓ Nếu cụm chạy LB dạng **static pod** thay vì systemd service, lệnh này sẽ không thấy.
+  Kiểm bổ sung bằng `crictl ps | grep -Ei 'haproxy|nginx'` — nhưng output 3.4 đã cho thấy
+  `/etc/kubernetes/manifests/` chỉ có 3 file (apiserver, controller-manager, scheduler),
+  **không có manifest LB nào** ⇒ khả năng này đã bị loại trừ.
 
 ---
 
@@ -755,6 +854,41 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
     Với LB/HA, `/etc/hosts` và cấu hình proxy là nguồn sự thật — kiểm **trước** khi lập kế hoạch
     restart, không phải sau.
 
+12. **Output RỖNG là bằng chứng, không phải "lệnh chưa chạy được".**
+
+    Cả 3 master trả về rỗng cho `ip addr | grep 137.68`, và master 48 rỗng cho lệnh `systemctl`.
+    Nhìn qua dễ tưởng "chưa có thông tin gì" — thực ra đây là **kết luận dứt khoát**:
+
+    | Output | Nghĩa |
+    |---|---|
+    | Rỗng ×3 node | **Không node nào mang VIP** ⇒ VIP nằm ngoài cụm ⇒ loại trừ keepalived-trên-master **và** split-brain |
+    | Rỗng (systemctl) | Không có tiến trình LB nào trên master ⇒ củng cố kết luận trên |
+
+    **Điều kiện để tin output rỗng:** phải chắc lệnh **thực sự chạy** chứ không lỗi cú pháp.
+    Ở đây tin được vì prompt trả về sạch, không có `command not found` hay `No such file`.
+    (Đối chiếu: ở output 3.3/3.4 đã cố ý thêm `2>&1` chính là để phân biệt "rỗng vì không có"
+    với "rỗng vì lỗi bị nuốt".)
+
+    **Rút ra:** khi thiết kế lệnh chẩn đoán, hãy nghĩ trước **"nếu rỗng thì nghĩa là gì"**.
+    Lệnh mà output rỗng không kết luận được điều gì là lệnh chẩn đoán kém.
+
+13. **Phân biệt "chưa xác minh" với "không thể tự xác minh" — hai loại bí khác nhau.**
+
+    Sau output 3.8, câu hỏi "LB có health-check port 6443 không" **vẫn chưa có lời giải**, nhưng
+    nó khác hẳn các ẩn số trước:
+
+    | Loại | Ví dụ trong phiên này | Cách gỡ |
+    |---|---|---|
+    | Chưa xác minh — **tự tra được** | etcd external?, SAN cert?, VIP ở đâu? | Chạy thêm lệnh trên node |
+    | **Không thể tự xác minh** — ngoài phạm vi | LB có health-check không? LB là thiết bị gì? | **Phải hỏi đội hạ tầng mạng** |
+
+    Gộp hai loại này vào nhau sẽ dẫn tới chọn sai cách gỡ: cứ ngồi tra tiếp trong khi đáng lẽ
+    phải gửi tin nhắn hỏi đội khác — hoặc ngược lại, hỏi người khác thứ mình tự tra được trong
+    30 giây.
+
+    **Rút ra:** khi bí, hỏi ngay "cái này nằm trong tay mình hay tay người khác?" trước khi
+    quyết định chạy thêm lệnh hay đi hỏi.
+
 ---
 
 ## 6. Nợ kỹ thuật
@@ -787,84 +921,61 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 - [x] ~~A1: đối chiếu `certSANs` với SAN cert~~ → ✅ **KHỚP** (output 3.6) ⇒ dùng được `--config`
 - [x] ~~A4: xác nhận cơ chế LB~~ → 🔴 **LB TẬP TRUNG tại `10.208.137.68`** (output 3.7), không phải localhost-LB
 
-### 🔴 Việc MỚI phát sinh — phải làm trước khi restart master
+### ✅ Đã xong phần LB — không còn ràng buộc thứ tự restart
 
-> Xuất phát từ output 3.7. Với LB tập trung, restart master **không còn** là thao tác cục bộ.
+- [x] ~~A6: VIP là keepalived trên master hay LB ngoài?~~ → ✅ **LB NGOÀI CỤM** (output 3.8,
+      rỗng trên cả 3 master)
+- [x] ~~A7: có keepalived/haproxy/nginx trên master?~~ → ✅ **KHÔNG** (output 3.9)
+- ⇒ **Master restart không đụng tới VIP.** Thứ tự 48→49→50 giữ nguyên nhưng lý do đổi:
+  không còn vì "node giữ VIP phải sau cùng", mà chỉ để **còn đường rollback** nếu cert mới sai SAN.
 
-- [ ] **A6** — ⭐ VIP `.68` là keepalived nổi trên master, hay LB ngoài?
+### Còn lại trước khi renew (chỉ đọc, chạy trên 48)
 
-  **Chạy trên cả 3 master 48, 49, 50 (lần lượt):**
-
-  ```
-  ip addr | grep 137.68
-  ```
-
-  <details>
-  <summary>Giải nghĩa</summary>
+- [ ] **A8** — Đếm chính xác số SAN entry (làm rõ điểm lệch `.vrp` / `cluster.local` ở 3.6)
 
   ```
-  ip addr | grep 137.68
-  │  │      └─ lọc ra dòng chứa IP VIP. Dùng grep thay vì `ip addr show to 10.208.137.68/32`
-  │  │         vì cú pháp ngắn, dễ gõ tay qua VDI, và vẫn đủ chính xác
-  │  └─ liệt kê TẤT CẢ địa chỉ IP trên MỌI interface của node (kể cả IP thứ cấp/VIP)
-  └─ ĐỌC KẾT QUẢ — chạy đủ 3 master rồi so:
-     • ĐÚNG 1 node có IP .68 → keepalived VIP đang NỔI trên node đó
-       ⇒ 🔴 Node giữ VIP phải restart SAU CÙNG. Restart nó làm VIP nhảy sang node khác,
-         gián đoạn vài giây. Ghi rõ node nào đang giữ VIP trước khi thao tác
-     • KHÔNG node nào có → LB nằm NGOÀI cụm (F5/HAProxy riêng)
-       ⇒ master restart không ảnh hưởng VIP, nhưng phải kiểm health-check của LB đó
-     • NHIỀU node cùng có → split-brain keepalived, sự cố riêng, DỪNG và báo
-  ```
-  </details>
-
-- [ ] **A7** — Có keepalived/haproxy/nginx chạy trên master không?
-
-  ```
-  systemctl list-units --type=service --state=running | grep -Ei 'keepalived|haproxy|nginx'
+  openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
   ```
 
   <details>
   <summary>Giải nghĩa</summary>
 
   ```
-  systemctl list-units --type=service --state=running | grep -Ei 'keepalived|haproxy|nginx'
-  │         │           │              │                  │    ││
-  │         │           │              │                  │    │└─ i: bỏ qua hoa/thường
-  │         │           │              │                  │    └─ E: regex mở rộng, `|` là OR
-  │         │           │              │                  └─ lọc 3 tiến trình LB phổ biến nhất
-  │         │           │              └─ chỉ unit ĐANG CHẠY, bỏ qua unit đã cài mà không bật
-  │         │           └─ chỉ loại service, bỏ mount/socket/timer cho gọn
-  │         └─ liệt kê unit systemd
-  └─ ĐỌC KẾT QUẢ:
-     • Có keepalived → khớp kịch bản VIP nổi trên master (đối chiếu A6)
-     • Có haproxy/nginx → LB chạy ngay trên master, restart master = mất luôn 1 LB
-     • Không có gì → LB hoàn toàn ở ngoài cụm
-  Nếu node dùng container thay vì systemd: kiểm thêm bằng `crictl ps | grep -Ei 'haproxy|nginx'`
-  ```
-  </details>
-
-- [ ] **A8** — Kiểm lại SAN cert có `kubernetes.default.svc.vrp` không (làm rõ điểm lệch ở 3.6)
-
-  ```
-  openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | grep -c 'DNS:\|IP Address:'
-  ```
-
-  <details>
-  <summary>Giải nghĩa</summary>
-
-  ```
-  openssl ... | tr ',' '\n' | grep -c 'DNS:\|IP Address:'
-  │             │  │    │      │    │
-  │             │  │    │      │    └─ -c: chỉ ĐẾM số dòng khớp, không in nội dung
+  openssl ... | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
+  │             │  │    │      │    ││
+  │             │  │    │      │    │└─ E: regex mở rộng, `|` là OR không cần escape
+  │             │  │    │      │    └─ c: chỉ ĐẾM số dòng khớp, không in nội dung
   │             │  │    │      └─ khớp cả entry DNS lẫn IP
   │             │  │    └─ thay bằng ký tự xuống dòng
   │             │  └─ ký tự cần thay: dấu phẩy
-  │             └─ tr: đổi ký tự này thành ký tự khác. Ở đây tách MỘT dòng dài 18 entry
-  │                thành 18 dòng riêng → grep -c mới đếm đúng
-  └─ MỤC ĐÍCH: đếm chính xác số SAN entry, tránh sai sót do gõ lại từ screenshot.
-     • Ra 18 → khớp file config, KHÔNG có kubernetes.default.svc.vrp
-       ⇒ renew kèm --config sẽ THÊM entry này (vô hại, nhưng nên biết trước)
+  │             └─ tr: openssl in SAN thành MỘT dòng dài 18 entry; tách thành 18 dòng
+  │                riêng thì grep -c mới đếm đúng. Không có tr thì kết quả luôn là 1
+  └─ MỤC ĐÍCH: đếm chính xác, tránh sai sót do gõ lại từ screenshot qua VDI
+     • Ra 18 → khớp file config, cert KHÔNG có kubernetes.default.svc.vrp
+       ⇒ renew kèm --config sẽ THÊM entry đó (vô hại, nhưng biết trước để không hoảng)
      • Ra 19 → cert đã có sẵn, output 3.5 bị sót khi gõ tay
+  ```
+  </details>
+
+- [ ] **A9** — Xác nhận version kubeadm khớp version cluster đang chạy
+
+  ```
+  kubeadm version -o short
+  ```
+
+  <details>
+  <summary>Giải nghĩa</summary>
+
+  ```
+  kubeadm version -o short
+  │               │  └─ chỉ in chuỗi version (vd v1.28.5); bỏ cờ này sẽ ra khối JSON dài
+  │               └─ -o: chọn định dạng output
+  └─ ⚠️ VÌ SAO QUAN TRỌNG: kubeadm renew sinh cert theo logic của CHÍNH version binary đó.
+     Nếu binary đã nâng cấp mà cluster vẫn chạy version cũ (hoặc ngược lại), cert sinh ra
+     có thể khác kỳ vọng.
+     ĐỐI CHIẾU với image tag trong /etc/kubernetes/manifests/kube-apiserver.yaml:
+       grep image: /etc/kubernetes/manifests/kube-apiserver.yaml
+     Hai con số phải khớp nhau
   ```
   </details>
 
@@ -878,8 +989,12 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 - [ ] **Ai sửa `/etc/kubernetes/manifests/kube-apiserver.yaml` ngày 18/09/2024, sửa gì?**
       → quyết định `kubeadm-config.yaml` (2023) còn dùng được không
 - [x] ~~**`10.208.137.68` là gì?**~~ → ✅ **VIP / LB endpoint** (output 3.7). Nhưng vẫn cần hỏi:
-- [ ] **VIP `.68` do ai quản?** keepalived trên chính 3 master, hay LB/F5 của đội hạ tầng mạng?
-      → nếu LB ngoài: **có health-check port 6443 không?** Đây là điều kiện an toàn để restart master
+- [x] ~~**VIP `.68` do ai quản?** keepalived trên master hay LB ngoài?~~ → ✅ **LB NGOÀI CỤM**
+      (output 3.8/3.9: không master nào giữ VIP, không có keepalived/haproxy/nginx trên master)
+- [ ] 🔴 **LB `.68` có health-check port 6443 không?** — **câu hỏi quan trọng nhất còn lại.**
+      Có → restart master an toàn, LB tự loại node đang down.
+      Không → mỗi lần restart có ~1/3 request lỗi. **Không tự kiểm được từ trong cụm**
+- [ ] **LB `.68` là thiết bị gì, ai vận hành?** (F5 / HAProxy trên VM riêng / LB của đội mạng)
 - [ ] **Cluster domain là `.vrp` hay `cluster.local`?** File config khai `.vrp`, cert lại dùng
       `cluster.local` (output 3.6). Cần biết bên nào đúng để không đổi hành vi cluster khi renew
 - [ ] **Có ai từng renew cert cụm này chưa?** Nếu có, làm bằng cách nào (kubeadm hay playbook Kubespray)
@@ -936,8 +1051,8 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 | Rủi ro | Mức độ | Giảm thiểu |
 |---|---|---|
 | ⭐ **Cert mới mất SAN `lb-apiserver.kubernetes.local`** → toàn cụm hỏng nặng hơn hiện tại | 🟠 **Hạ từ 🔴 — đã có cách gỡ** | ✅ Output 3.6: `kubeadm-config.yaml` còn khớp ⇒ renew **kèm `--config /etc/kubernetes/kubeadm-config.yaml`**. Vẫn so SAN trước/sau, chỉ restart khi khớp |
-| 🔴 **LB tập trung `.68` không health-check** → trong lúc restart master, request vẫn bị đẩy vào node chết | 🟠 Cao | Xác minh A6 + A7 **trước khi** restart. Nếu là keepalived: restart node giữ VIP **sau cùng** |
-| Nếu `.68` là keepalived VIP nổi trên master → restart node giữ VIP làm VIP nhảy, gián đoạn vài giây | 🟡 TB | Xác định node đang giữ VIP (A6), xếp nó **cuối** thứ tự 48→49→50 |
+| LB ngoài `.68` có thể không health-check → trong lúc restart master, ~1/3 request bị đẩy vào node đang khởi động lại | 🟡 **TB (hạ từ 🟠)** | **Không tự kiểm được** (thiết bị đội khác). Giảm thiểu: thao tác trong cửa sổ bảo trì; restart từng node và **chờ node đó Ready hẳn** trước khi sang node kế |
+| ~~`.68` là keepalived VIP nổi trên master → VIP nhảy khi restart~~ | ⚪ **Đã loại bỏ** | Output 3.8: rỗng trên cả 3 master ⇒ VIP **ngoài cụm**, restart master không đụng tới VIP |
 | **5 worker `.51-.55` chưa được kiểm tra** — kubelet client cert có thể cũng hết hạn | 🟡 TB | Sau khi control-plane xanh, kiểm `kubelet-client-current.pem` trên từng worker |
 | ~~Là stacked etcd nhưng PKI mất thật~~ | ⚪ **Đã loại bỏ** | Output 3.4: **etcd external**, không có `etcd.yaml` |
 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ **Đã loại bỏ** | Output 3.6: `certSANs` khớp khít cert đang chạy |
