@@ -1092,8 +1092,11 @@ To see the stack trace of this error execute with --v=5 or higher
 
 **📍 Node 48 (`vrp-kubeengine01`) — user `root`, ngày 19/08**
 
+> 🔴 **ĐÃ SỬA sau output 3.18: thêm cờ `-h`.** Bản trước thiếu cờ này nên tar chỉ lưu
+> **symlink `pki`** chứ không gói cert bên trong — backup vô dụng khi rollback.
+
 ```
-tar czf /root/pki-backup-$(hostname)-$(date +%F-%H%M).tar.gz /etc/kubernetes/pki /etc/kubernetes/*.conf /etc/kubernetes/kubeadm-config.yaml
+tar czhf /root/pki-backup-$(hostname)-$(date +%F-%H%M).tar.gz /etc/kubernetes/ssl /etc/kubernetes/*.conf /etc/kubernetes/kubeadm-config.yaml
 ```
 
 **Output:**
@@ -1134,7 +1137,122 @@ tar: Removing leading `/' from member names
 
 ---
 
-### 3.18 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.18 — [Cả 3 node / GĐ1] 🔴 Backup có thể KHÔNG chứa cert — symlink không được đi theo
+
+**📍 Node 48, 49, 50 — user `root`, ~11:07–11:09 +07 ngày 19/08**
+
+Kiên chạy backup trên **cả 3 node** (vượt trước một bước so với dự kiến).
+
+⚠️ **Đây là lệnh bản CŨ — thiếu cờ `-h`.** Quy trình ở mục 7 đã được sửa sau phát hiện này.
+
+```
+tar czf /root/pki-backup-$(hostname)-$(date +%F-%H%M).tar.gz /etc/kubernetes/pki /etc/kubernetes/*.conf /etc/kubernetes/kubeadm-config.yaml
+```
+
+```
+tar tzf /root/pki-backup-$(hostname)-*.tar.gz | head -20
+```
+
+<details>
+<summary>Giải nghĩa — vì sao ĐẾM thay vì chỉ liệt kê</summary>
+
+```
+tar tzf <file> | wc -l
+│   ││└─ f: đọc từ file
+│   │└─ z: giải nén gzip
+│   └─ t: liệt kê nội dung, KHÔNG giải nén
+└─ ⭐ wc -l: ĐẾM SỐ DÒNG = số mục trong archive.
+   VÌ SAO: output 3.18 cho thấy `head -20` chỉ hiện 6 dòng và trông "có vẻ ổn",
+   nhưng thực chất `etc/kubernetes/pki` là symlink RỖNG — không có cert nào bên trong.
+   Đếm số mục bắt được ngay:
+   • ~6 mục   → 🔴 CHỈ CÓ symlink + file .conf, KHÔNG có cert. Backup VÔ DỤNG
+   • 30-60 mục → ✅ có cả cert + key trong ssl/. Backup dùng được
+```
+</details>
+
+Xem đích danh cert quan trọng có trong archive không:
+
+📍 **Từng node 48 → 49 → 50** — user **`root`**
+
+```
+tar tzf /root/pki-backup-$(hostname)-*.tar.gz | grep -E 'apiserver.crt|ca.crt|ca.key'
+```
+
+<details>
+<summary>Cách đọc</summary>
+
+```
+grep -E 'apiserver.crt|ca.crt|ca.key'
+│    │   └─ 3 file SỐNG CÒN: cert apiserver, CA cert, CA key
+│    └─ -E: regex mở rộng, `|` là OR
+└─ KỲ VỌNG: thấy đủ 3 dòng dạng etc/kubernetes/ssl/apiserver.crt ...
+   • RỖNG → 🔴 backup KHÔNG có cert, KHÔNG ĐƯỢC RENEW, làm lại backup với `-h`
+```
+</details>
+
+Kích thước file:
+
+📍 **Từng node 48 → 49 → 50** — user **`root`**
+
+```
+ls -lh /root/pki-backup-*.tar.gz
+```
+
+```
+ls -lh /root/pki-backup-*.tar.gz
+```
+
+**Output — giống hệt nhau trên cả 3 node:**
+
+```
+tar: Removing leading `/' from member names
+
+etc/kubernetes/pki
+etc/kubernetes/admin.conf
+etc/kubernetes/controller-manager.conf
+etc/kubernetes/kubelet.conf
+etc/kubernetes/scheduler.conf
+etc/kubernetes/kubeadm-config.yaml
+```
+
+| Node | File backup | Size | Thời điểm |
+|---|---|---|---|
+| 48 `vrp-kubeengine01` | `pki-backup-vrp-kubeengine01-2026-08-19-1107.tar.gz` | **11K** | 11:07 |
+| 49 `vrp-kubeengine02` | `pki-backup-vrp-kubeengine02-2026-08-19-1108.tar.gz` | **11K** | 11:08 |
+| 50 `vrp-kubeengine03` | `pki-backup-vrp-kubeengine03-2026-08-19-1109.tar.gz` | **11K** | 11:09 |
+
+**Đọc được gì:**
+
+- ✅ Archive **đọc được** trên cả 3 node (`tar tzf` chạy trót lọt) ⇒ file không hỏng, không bị
+  cắt cụt do hết dung lượng.
+- ✅ Đường dẫn trong archive **không có dấu `/` đầu** — khớp thông báo ở output 3.17, và xác nhận
+  lệnh rollback **bắt buộc** cần cờ `-C /`.
+- ✅ Có đủ 3 file `.conf` + `kubelet.conf` + `kubeadm-config.yaml`.
+- 🔴 ⭐ **NGHI VẤN NGHIÊM TRỌNG: archive có thể KHÔNG chứa cert nào.**
+
+  **Bằng chứng 1 — `etc/kubernetes/pki` chỉ hiện MỘT dòng.** Nếu tar gói cả nội dung thư mục,
+  danh sách phải có `etc/kubernetes/pki/apiserver.crt`, `.../ca.crt`, `.../apiserver.key`...
+  Ở đây chỉ có đúng một dòng `etc/kubernetes/pki`.
+
+  **Bằng chứng 2 — cơ chế:** `pki` là **symlink** tới `ssl` (output 3.13). Mặc định `tar` **lưu
+  symlink như một liên kết**, KHÔNG đi theo nó để gói nội dung đích. Cần cờ `-h` (hoặc
+  `--dereference`) mới đi theo symlink.
+
+  **Bằng chứng 3 — kích thước:** chỉ **11K**. Ba file `.conf` (mỗi file ~5-6KB chứa cert nhúng
+  base64) đã chiếm gần hết. Toàn bộ PKI thật — hàng chục cert + key — **không thể** nén xuống
+  còn vài trăm byte.
+
+  ⇒ 🔴 **Nếu đúng, backup này KHÔNG khôi phục được cert.** Ta đang tưởng có mạng lưới an toàn
+  trong khi thực tế không có — **nguy hiểm hơn là biết mình không có backup**.
+
+- ⭐ **Đây chính là điều bước `tar tzf` sinh ra để bắt.** Nhưng phải **đọc kỹ danh sách**, không
+  chỉ nhìn "lệnh chạy trót lọt". Xem Bài học #16.
+- ❓ **Phải xác minh ngay** bằng cách đếm số mục trong archive — xem mục 3.19.
+  **KHÔNG được renew** cho tới khi có backup thật sự chứa cert.
+
+---
+
+### 3.19 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -1470,6 +1588,32 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 
     **Rút ra:** gặp cluster chạy version EOL, đừng chỉ ghi nhận rồi bỏ qua — **kiểm lại xem quy
     trình chuẩn có còn áp dụng được không**. Tài liệu trên mạng thường viết cho bản mới nhất.
+
+16. **🔴 "Lệnh verify chạy trót lọt" ≠ "kết quả verify ĐẠT" — phải đọc nội dung.**
+
+    Bước `tar tzf` ở GĐ1 sinh ra chính để kiểm backup có dùng được không. Nó **chạy trót lọt**
+    trên cả 3 node, in ra danh sách gọn gàng 6 dòng — trông hoàn toàn bình thường.
+
+    **Nhưng đọc kỹ danh sách:** `etc/kubernetes/pki` chỉ hiện **một dòng**, không có
+    `apiserver.crt`, `ca.crt`, `ca.key` nào bên trong. Vì `pki` là **symlink** (output 3.13) mà
+    `tar` mặc định **lưu symlink như liên kết**, không đi theo để gói nội dung — cần cờ `-h`.
+
+    Kích thước **11K** củng cố: 3 file `.conf` chứa cert base64 đã chiếm gần hết; toàn bộ PKI
+    thật không thể nén xuống vài trăm byte.
+
+    ⇒ **Backup tưởng có nhưng không khôi phục được cert.** Đây **nguy hiểm hơn** là biết mình
+    không có backup — vì ta sẽ dám renew với niềm tin sai rằng có đường lùi.
+
+    **Rút ra:**
+    - Lệnh verify phải **đọc kết quả**, không chỉ xem nó có chạy không. Bài học #12 nói *"output
+      rỗng là bằng chứng"*; bài này là mặt kia: **output CÓ nội dung cũng phải soi nội dung đó**.
+    - Thiết kế phép verify sao cho **sai lệch lộ ra bằng con số**, không phải bằng cảm nhận:
+      `wc -l` (đếm mục) và `grep` đích danh `ca.key` bắt được ngay, còn `head -20` thì không.
+    - **Với symlink, luôn hỏi: công cụ này đi theo liên kết hay lưu bản thân liên kết?**
+      `tar` cần `-h`; `cp` cần `-L`; `rsync` cần `-L`; `du` cần `-L`. Mặc định của chúng đều là
+      **không** đi theo.
+    - Cách phòng thủ tốt hơn cả nhớ cờ: **dùng đường dẫn thật** (`/etc/kubernetes/ssl`) thay vì
+      symlink (`/etc/kubernetes/pki`). Quy trình đã sửa theo hướng này — an toàn kép.
 
 ---
 
@@ -2178,8 +2322,11 @@ tar czf <đích> <nguồn1> <nguồn2> <nguồn3>
 │   ││└─ f: chỉ định tên file đích. PHẢI đứng cuối cụm cờ, ngay trước tên file
 │   │└─ z: nén gzip
 │   └─ c: create archive
+│   └─ ⭐⭐ h: ĐI THEO SYMLINK (--dereference) — gói NỘI DUNG đích thay vì
+│      lưu bản thân liên kết. THIẾU CỜ NÀY = backup rỗng, xem output 3.18
 └─ BA NGUỒN, thiếu cái nào cũng không rollback được:
-   • /etc/kubernetes/pki        → toàn bộ cert + key + CA
+   • /etc/kubernetes/ssl        → ⭐ dùng đường dẫn THẬT thay vì symlink `pki`.
+                                   An toàn kép: kể cả quên -h vẫn gói đúng nội dung
    • /etc/kubernetes/*.conf     → admin.conf, kubelet.conf, controller-manager.conf,
                                   scheduler.conf. Cert nhúng base64 BÊN TRONG, renew
                                   cũng ghi đè các file này → phải backup
@@ -2716,6 +2863,7 @@ dừng lại, báo cáo, xử lý node 48 riêng. **Tuyệt đối không** ti�
 | Node 49/50 có thể có tình trạng cert khác 48 (chưa kiểm tra) | 🟡 TB | Chạy `check-expiration` độc lập trên từng node trước khi thao tác |
 | ~~Registry nội bộ không truy cập được khi restart~~ | ⚪ **Đã loại bỏ (node 48)** | ✅ Output 3.11: image `kube-apiserver:v1.23.2` **có trong cache cục bộ** ⇒ kubelet không cần gọi registry. ⚠️ Nên kiểm lại tương tự trên 49/50 |
 | 🔴 **`--config` trỏ file gốc 4-document → kubeadm v1.23 rơi về default → cert mất SAN → toàn cụm hỏng** | 🔴 **Cao — đã xác nhận** | ✅ Output 3.11. Gỡ bằng GĐ0-ter (tách file). ⚠️ Nguy hiểm vì kubeadm có thể **im lặng** bỏ qua, vẫn báo "renewed" — chỉ `diff` SAN ở GĐ3 mới lộ ra |
+| 🔴 **Backup GĐ1 (11:07-11:09) có thể KHÔNG chứa cert** do thiếu cờ `-h` với symlink `pki` → tưởng có đường lùi nhưng không có | 🔴 **Cao — đang xác minh** | Đếm mục trong archive + `grep` đích danh `ca.key` (mục 3.19). Nếu thiếu → **làm lại backup với `tar czhf` và đường dẫn `/etc/kubernetes/ssl`** trước khi renew |
 | Không có snapshot etcd gần đây để rollback nếu hỏng | 🟡 **Hạ từ 🔴** | etcd external ⇒ việc renew cert control-plane **không đụng tới dữ liệu etcd**. Backup PKI (mục Ngắn hạn) mới là bản lùi cần thiết |
 | Gián đoạn API server lúc restart static pod | 🟡 TB | Thực hiện trong cửa sổ bảo trì đã thống nhất với quản lý |
 | Worker node tắt lâu ngày, kubelet cert hết hạn không tự rotate được | 🟢 Thấp | Kiểm tra sau khi control-plane khôi phục; node nào hỏng thì join lại |
