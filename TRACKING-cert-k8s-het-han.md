@@ -982,7 +982,72 @@ sed -n '14,119p' /etc/kubernetes/kubeadm-config.yaml > /root/cluster-config-rene
 
 ---
 
-### 3.15 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.15 — [Node 48 / GĐ0-ter] ✅ Verify file tách: ĐẠT cả 3 phép kiểm
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~11:02 +07 ngày 19/08**
+
+**a) Đếm số YAML document trong file đã tách**
+
+```
+grep -c '^---\|^kind:' /root/cluster-config-renew.yaml
+```
+
+**Output:**
+
+```
+1
+```
+
+**b) Đếm số entry `certSANs`**
+
+```
+sed -n '/certSANs:/,/timeoutForControlPlane/p' /root/cluster-config-renew.yaml | grep -c '^  - '
+```
+
+**Output:**
+
+```
+18
+```
+
+**c) Xác nhận file kết thúc đúng chỗ**
+
+```
+tail -3 /root/cluster-config-renew.yaml
+```
+
+**Output:**
+
+```
+      hostPath: /etc/kubernetes/kubescheduler-config.yaml
+      mountPath: /etc/kubernetes/kubescheduler-config.yaml
+      readOnly: true
+```
+
+**Đọc được gì:**
+
+- ✅ **`1` document** — đúng một `kind: ClusterConfiguration`, **không có dấu `---` nào**.
+  ⇒ Giải quyết đúng vấn đề ở output 3.11 (file gốc có 4 document, kubeadm v1.23 không parse được).
+- ✅ **`18` entry `certSANs`** — khớp **cả ba** nguồn độc lập:
+  file config gốc (output 3.6), cert đang chạy (output 3.10), và file vừa tách.
+  ⇒ Không mất entry nào trong lúc cắt. Ba entry sống còn
+  (`lb-apiserver.kubernetes.local`, `10.208.137.68`, `172.16.128.1`) đều nằm trong số này.
+- ✅ **3 dòng cuối đúng y hệt dòng 117-119 của file gốc** (output 3.12) — `readOnly: true` của
+  khối `scheduler.extraVolumes`.
+  ⇒ File kết thúc **đúng dòng 119**, không cắt lố sang `---` (dòng 120) lẫn
+  `kind: KubeProxyConfiguration` (dòng 122), cũng không cụt giữa chừng.
+- ⭐ **Ba phép kiểm ĐỘC LẬP nhau, cùng chỉ một kết luận** — đây là điều làm kết luận đáng tin:
+  đếm document (cấu trúc), đếm SAN (nội dung), xem dòng cuối (ranh giới). Một phép sai thì hai
+  phép kia sẽ lệch theo.
+  ⇒ **`sed -n '14,119p'` cắt CHÍNH XÁC.** File `/root/cluster-config-renew.yaml` dùng được cho
+  `--config`.
+- ❓ **Còn một điều chưa chứng minh:** file đúng **nội dung và cấu trúc**, nhưng chưa chắc
+  **kubeadm v1.23 thực sự nuốt được**. Đó là hai việc khác nhau — đúng theo Bài học #14.
+  ⇒ Bước `--dry-run` (0t.5) mới là phép kiểm cuối cùng.
+
+---
+
+### 3.16 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
