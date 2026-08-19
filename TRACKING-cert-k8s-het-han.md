@@ -1175,7 +1175,7 @@ Xem đích danh cert quan trọng có trong archive không:
 📍 **Từng node 48 → 49 → 50** — user **`root`**
 
 ```
-tar tzf /root/pki-backup-$(hostname)-*.tar.gz | grep -E 'apiserver.crt|ca.crt|ca.key'
+tar tzf /root/pki-backup-$(hostname)-<timestamp>.tar.gz | grep -E 'apiserver.crt|ca.crt|ca.key'
 ```
 
 <details>
@@ -1258,8 +1258,12 @@ etc/kubernetes/kubeadm-config.yaml
 
 **a) Đếm số mục trong archive**
 
+> 🔴 **KHÔNG dùng glob `*` khi trên node đã có nhiều bản backup.** Cú pháp tar là
+> `tar tzf <archive> [thành viên...]` — glob khớp 2 file sẽ khiến tar hiểu file thứ hai là
+> *thành viên cần tìm bên trong*, báo `Not found in archive`. Chỉ định **timestamp cụ thể**.
+
 ```
-tar tzf /root/pki-backup-$(hostname)-*.tar.gz | wc -l
+tar tzf /root/pki-backup-$(hostname)-<timestamp>.tar.gz | wc -l
 ```
 
 **Output:**
@@ -1298,7 +1302,73 @@ tar tzf /root/pki-backup-$(hostname)-*.tar.gz | grep -E 'apiserver.crt|ca.crt|ca
 
 ---
 
-### 3.20 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.20 — [Cả 3 node / GĐ1] ✅ Backup lại với `-h` — node 48 verify ĐẠT
+
+**📍 Node 48, 49, 50 — user `root`, ~11:18–11:22 +07 ngày 19/08**
+
+**a) Backup lại (cả 3 node)**
+
+```
+tar czhf /root/pki-backup-$(hostname)-$(date +%F-%H%M).tar.gz /etc/kubernetes/ssl /etc/kubernetes/*.conf /etc/kubernetes/kubeadm-config.yaml
+```
+
+**Output (cả 3 node):** `tar: Removing leading '/' from member names` — bình thường (output 3.17).
+
+**b) Verify trên node 48**
+
+```
+tar tzf /root/pki-backup-vrp-kubeengine01-2026-08-19-1118.tar.gz | wc -l
+```
+
+**Output:**
+
+```
+18
+```
+
+```
+tar tzf /root/pki-backup-vrp-kubeengine01-2026-08-19-1118.tar.gz | grep -E 'apiserver.crt|ca.crt|ca.key'
+```
+
+**Output:**
+
+```
+etc/kubernetes/ssl/front-proxy-ca.key
+etc/kubernetes/ssl/ca.crt
+etc/kubernetes/ssl/apiserver.crt
+etc/kubernetes/ssl/ca.key
+etc/kubernetes/ssl/front-proxy-ca.crt
+```
+
+**c) Kích thước — cả 3 node**
+
+```
+ls -lh /root/pki-backup-*.tar.gz
+```
+
+| Node | Bản CŨ (thiếu `-h`) | Bản MỚI (`czhf` + `/ssl`) |
+|---|---|---|
+| 48 `vrp-kubeengine01` | `-1107.tar.gz` — **11K** ❌ | `-1118.tar.gz` — **22K** ✅ |
+| 49 `vrp-kubeengine02` | `-1108.tar.gz` — **11K** ❌ | `-1118.tar.gz` — **22K** ✅ |
+| 50 `vrp-kubeengine03` | `-1109.tar.gz` — **11K** ❌ | `-1118.tar.gz` — **22K** ✅ |
+
+**Đọc được gì:**
+
+- ✅ ⭐ **Node 48: backup ĐẠT.** `18` mục (trước là `6`), và `grep` tìm thấy **đủ 3 file sống còn**
+  `apiserver.crt`, `ca.crt`, `ca.key` — cộng thêm `front-proxy-ca.crt/key`.
+  ⇒ Cờ `-h` + đường dẫn thật `/etc/kubernetes/ssl` đã giải quyết đúng vấn đề ở output 3.19.
+- ✅ **Kích thước 22K vs 11K** — gấp đôi bản cũ, khớp với việc archive giờ chứa thêm ~12 file cert/key.
+- ✅ **Cả 3 node đều có file `-1118.tar.gz` 22K** ⇒ backup trên 49/50 **đã tạo thành công**.
+- ⚠️ **Node 49/50 báo `Cannot open: No such file or directory`** khi verify —
+  **KHÔNG phải backup hỏng.** Nguyên nhân: lệnh verify được đưa với tên file **cứng**
+  `pki-backup-vrp-kubeengine01-...`, chạy nguyên văn trên node 02/03 nên không tìm thấy.
+  ⇒ Lỗi **soạn lệnh**, đã sửa bằng `$(hostname)`. Xem Bài học #17.
+- ❓ **Chưa xác minh:** nội dung backup trên node 49/50 (mới chỉ biết kích thước đúng 22K).
+  Cần verify lại bằng lệnh có `$(hostname)`.
+
+---
+
+### 3.21 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -1660,6 +1730,29 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
       **không** đi theo.
     - Cách phòng thủ tốt hơn cả nhớ cờ: **dùng đường dẫn thật** (`/etc/kubernetes/ssl`) thay vì
       symlink (`/etc/kubernetes/pki`). Quy trình đã sửa theo hướng này — an toàn kép.
+
+17. **Lệnh soạn cho nhiều node phải tự thích ứng — đừng nhúng tên node cứng.**
+
+    Lệnh verify được đưa với tên file **cứng** `pki-backup-vrp-kubeengine01-...`. Kiên chạy
+    nguyên văn trên node 02 và 03 → `Cannot open: No such file or directory`, tưởng backup hỏng.
+
+    **Hai lỗi soạn lệnh liên tiếp trong cùng một bước, ngược chiều nhau:**
+
+    | Lần | Lệnh | Vấn đề | Hậu quả |
+    |---|---|---|---|
+    | 1 | `...-$(hostname)-*.tar.gz` | Glob khớp **2 file** → tar hiểu file thứ 2 là *thành viên* | `Not found in archive` |
+    | 2 | `...-vrp-kubeengine01-...` | Tên **cứng**, không đổi theo node | `No such file` trên 49/50 |
+
+    **Cách đúng — kết hợp cả hai:** `$(hostname)` cho phần thay đổi theo node,
+    **timestamp cụ thể** cho phần cần chính xác:
+    `tar tzf /root/pki-backup-$(hostname)-2026-08-19-1118.tar.gz`
+
+    **Rút ra:**
+    - Lệnh dùng trên nhiều node: phần **định danh node** phải động (`$(hostname)`), phần **định
+      danh phiên bản** phải tĩnh (timestamp cụ thể).
+    - Biết trước một cái bẫy mà vẫn đưa lệnh dính bẫy thì cảnh báo vô nghĩa. Bẫy glob đã được ghi
+      trong phần "cách đọc" của chính lệnh đó — **nhưng lệnh không được sửa theo**.
+      ⇒ Phát hiện rủi ro phải dẫn tới **sửa lệnh**, không chỉ thêm ghi chú.
 
 ---
 
