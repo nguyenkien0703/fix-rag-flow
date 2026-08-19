@@ -1792,6 +1792,111 @@ cp: overwrite '/root/.kube/config'? ^C
 
 ---
 
+### 3.28 — [Node 48 / GĐ5] ⚠️ Verify qua LB THẤT BẠI — nhưng node 48 ĐÃ OK
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~11:44 +07 ngày 19/08**
+
+**a) Cập nhật kubeconfig (đã backup trước)**
+
+```
+cp -a /root/.kube/config /root/kube-config.bak-$(date +%F-%H%M)
+```
+
+```
+\cp -f /etc/kubernetes/admin.conf /root/.kube/config
+```
+
+Cả hai không in gì ⇒ thành công. `\cp` đã bỏ qua alias `cp -i` như dự kiến (output 3.27).
+
+**b) `kubectl get nodes` — THẤT BẠI**
+
+```
+Unable to connect to the server: x509: certificate has expired or is not yet valid: current time 2026-08-19T11:44:35+07:00 is after 2026-08-18T12:02:51Z
+```
+
+**c) `curl` qua endpoint LB — THẤT BẠI**
+
+```
+curl: (60) Peer's Certificate has expired.
+```
+
+**d) 🔍 Chẩn đoán: gọi THẲNG IP node 48, bỏ qua VIP**
+
+```
+curl -sS --cacert /etc/kubernetes/pki/ca.crt https://10.208.137.48:6443/version
+```
+
+**Output:**
+
+```
+{
+  "major": "1",
+  "minor": "23",
+  "gitVersion": "v1.23.2",
+  "gitCommit": "9d142434e3af351a628bffee3939e64c681afa4d",
+  "gitTreeState": "clean",
+  "buildDate": "2022-01-19T17:29:16Z",
+  "goVersion": "go1.17.5",
+  "compiler": "gc",
+  "platform": "linux/amd64"
+}
+```
+
+**e) Cert mà apiserver node 48 ĐANG PHỤC VỤ**
+
+```
+echo | openssl s_client -connect 10.208.137.48:6443 2>/dev/null | openssl x509 -noout -dates
+```
+
+**Output:**
+
+```
+notBefore=Jul  6 08:11:45 2023 GMT
+notAfter=Aug 19 04:31:40 2027 GMT
+```
+
+**Đọc được gì:**
+
+- ✅ ⭐ **NODE 48 HOÀN TOÀN OK.** Gọi thẳng IP → JSON hợp lệ, TLS verify **đạt** bằng CA cluster.
+- ✅ ⭐ **`notAfter = Aug 19 04:31:40 2027`** — khớp **chính xác** bảng `check-expiration`
+  (output 3.25). Apiserver node 48 **đã nạp cert mới vào bộ nhớ**, không chỉ trên đĩa.
+  ⇒ Xác nhận restart ở GĐ4 **thành công thật**, không dính race condition ở Bài học #18.
+- ⚠️ **`notBefore = Jul 6 2023` — chi tiết DỄ HIỂU NHẦM.**
+  Cert vừa ký hôm nay mà `notBefore` lại là ngày dựng cluster (06/07/2023)?
+  ⇒ **`kubeadm certs renew` GIỮ NGUYÊN `notBefore` của cert gốc**, chỉ đẩy `notAfter` ra 1 năm
+  kể từ lúc renew. Hành vi có chủ đích: giữ liên tục chuỗi tin cậy, tránh khoảng trống thời gian
+  nếu đồng hồ các node lệch nhau.
+  ⇒ **Nhìn `notBefore` KHÔNG biết được cert đã renew hay chưa. Phải nhìn `notAfter`.**
+- 🔍 **Nguyên nhân lỗi ở bước b và c — mốc hết hạn là manh mối quyết định:**
+
+  ```
+  is after 2026-08-18T12:02:51Z
+  ```
+
+  ⭐ Mốc này **y hệt output 3.0** (lúc `helm` chết sáng nay) ⇒ đó là **cert CŨ**.
+  Cert mới hết hạn `Aug 19 2027`.
+
+  ⇒ **Client đang nhận cert của node KHÁC.** Đường đi:
+
+  ```
+  kubectl/curl → lb-apiserver.kubernetes.local → VIP 10.208.137.68 → LB phân phối
+                                                                      ├─ node 48 ✅ cert MỚI
+                                                                      ├─ node 49 🔴 cert CŨ
+                                                                      └─ node 50 🔴 cert CŨ
+  ```
+
+  ⇒ **KHÔNG PHẢI SỰ CỐ.** Đây là **trạng thái trung gian ĐÚNG NHƯ DỰ KIẾN** khi renew tuần tự
+  từng node: 2/3 master còn cert cũ, LB đẩy sang node nào thì client nhận cert của node đó.
+  ⇒ Hệ quả trực tiếp của kiến trúc **LB tập trung** (output 3.7/3.8).
+  ⇒ Cũng là **bằng chứng gián tiếp** rằng LB `.68` đang phân phối sang cả 3 master, và
+    ❓ **có vẻ KHÔNG health-check theo TLS** (nó vẫn đẩy sang node có cert hết hạn).
+- ⭐ **Điều chỉnh GĐ5: bước verify qua LB (5.4) đặt SAI CHỖ.**
+  Nó chỉ có ý nghĩa **sau khi xong CẢ 3 node**. Đặt sau node 48 thì chắc chắn fail 2/3 số lần,
+  gây hiểu nhầm là renew hỏng. Xem Bài học #19.
+- ⇒ ✅ **Node 48 ĐẠT. Đủ điều kiện sang node 49.**
+
+---
+
 ### 3.28 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
@@ -2205,6 +2310,46 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
     - `ATTEMPT` tăng **đúng 1** = restart có chủ đích. Nhảy liên tục = crashloop.
     - Bước chờ trong quy trình không phải thủ tục: nó loại bỏ race condition. Vẫn nên chờ ở
       node 49/50.
+
+19. **🔴 Verify qua load balancer trong lúc rollout tuần tự = phép kiểm SAI CHỖ.**
+
+    Quy trình đặt bước "curl qua `lb-apiserver.kubernetes.local`" ngay sau khi verify node 48,
+    và gọi nó là *"quan trọng nhất"*. Khi chạy thật, nó **fail** — làm tưởng renew hỏng.
+
+    **Cơ chế:** LB `.68` phân phối sang **cả 3 master**. Sau node 48 thì chỉ 1/3 số master có
+    cert mới ⇒ mỗi lần gọi có ~2/3 xác suất trúng node 49/50 còn cert cũ ⇒ `certificate has expired`.
+
+    **Manh mối nhận ra:** mốc trong thông báo lỗi là `2026-08-18T12:02:51Z` — **y hệt mốc lúc
+    `helm` chết sáng nay** (output 3.0). Cert mới hết hạn `Aug 19 2027`. Mốc cũ ⇒ đang nói chuyện
+    với node chưa renew.
+
+    **Hai loại phép kiểm, không được lẫn:**
+
+    | Phép kiểm | Đo cái gì | Chạy khi nào |
+    |---|---|---|
+    | `curl https://<IP node>:6443` | Node **này** đã nạp cert mới chưa | Sau **mỗi** node |
+    | `curl https://lb-apiserver...:6443` | **Toàn cụm** đã nhất quán chưa | Chỉ sau khi xong **cả 3** |
+
+    **Rút ra:**
+    - Trong rollout tuần tự, phép kiểm phải nhắm đúng **đơn vị vừa thay đổi** — là node, không
+      phải cluster. Kiểm qua LB khi mới xong 1/3 là hỏi sai câu hỏi.
+    - Khi lỗi cert xuất hiện, **đọc mốc thời gian trong thông báo** trước khi kết luận: nó cho
+      biết đang nhận cert của node nào.
+    - Sự cố "trạng thái trung gian" khác hẳn "thao tác hỏng". Trong rollout nhiều node, luôn hỏi
+      *"cái này có phải là hệ quả bình thường của việc mới làm xong một phần không?"* trước khi
+      rollback.
+
+20. **`notBefore` không cho biết cert đã renew hay chưa — chỉ `notAfter` mới cho biết.**
+
+    Cert vừa renew hôm nay (19/08/2026) nhưng `openssl` in `notBefore=Jul 6 08:11:45 2023` —
+    đúng ngày dựng cluster. Thoạt nhìn tưởng cert chưa đổi.
+
+    **Cơ chế:** `kubeadm certs renew` **giữ nguyên `notBefore`** của cert gốc, chỉ đẩy `notAfter`
+    ra 1 năm kể từ lúc renew. Chủ đích: giữ liên tục chuỗi tin cậy, tránh khoảng trống thời gian
+    nếu đồng hồ giữa các node lệch nhau — cert có `notBefore` ở tương lai sẽ bị từ chối.
+
+    **Rút ra:** khi kiểm cert đã renew chưa, nhìn **`notAfter`** và **Subject Key Identifier**
+    (chuỗi hex ở output 3.23/3.25 — đổi mỗi lần ký). `notBefore` là dấu hiệu vô dụng cho việc này.
 
 ---
 
@@ -3307,7 +3452,67 @@ kubectl -n kube-system get pods -l tier=control-plane -o wide
 ```
 </details>
 
-**5.4 — Kiểm tra qua chính endpoint LB (quan trọng nhất)**
+**5.4 — Kiểm cert node NÀY đang thực sự phục vụ (thay cho bản cũ)**
+
+> 🔴 **ĐÃ SỬA sau output 3.28.** Bản trước dùng `curl` qua `lb-apiserver.kubernetes.local`
+> ngay sau node 48 — **SAI CHỖ**: LB phân phối sang cả 3 master, mà 49/50 chưa renew nên
+> chắc chắn fail ~2/3 số lần, gây hiểu nhầm là renew hỏng.
+> ⇒ Verify **cục bộ từng node** ở đây; verify qua LB chuyển xuống GĐ6, sau khi xong cả 3 node.
+
+📍 **Node đang thao tác** — user **`root`**. Thay IP cho đúng node (48/49/50):
+
+```
+curl -sS --cacert /etc/kubernetes/pki/ca.crt https://10.208.137.48:6443/version
+```
+
+<details>
+<summary>Giải nghĩa</summary>
+
+```
+curl -sS --cacert /etc/kubernetes/pki/ca.crt https://10.208.137.48:6443/version
+     ││   │                                   └─ ⭐ IP TRỰC TIẾP của node, KHÔNG qua
+     ││   │                                      lb-apiserver → loại bỏ biến số "LB đẩy
+     ││   │                                      sang node khác chưa renew"
+     ││   └─ --cacert: verify cert server bằng CA cluster.
+     ││      KHÔNG dùng -k (bỏ verify) — vì mục đích chính LÀ verify cert
+     │└─ S: vẫn hiện lỗi khi có (chỉ -s thì lỗi bị nuốt)
+     └─ s: tắt thanh tiến trình
+└─ KỲ VỌNG: JSON {"major":"1","minor":"23",...}
+   🔴 `certificate is valid for ..., not ...` → SAN sai → ROLLBACK
+   🔴 `certificate has expired` → pod chưa nạp cert mới → so lại container ID (Bài học #18)
+```
+</details>
+
+Xem đích danh cert apiserver đang giữ trong bộ nhớ:
+
+📍 **Node đang thao tác** — user **`root`**
+
+```
+echo | openssl s_client -connect 10.208.137.48:6443 2>/dev/null | openssl x509 -noout -dates
+```
+
+<details>
+<summary>Giải nghĩa</summary>
+
+```
+echo | openssl s_client -connect <IP>:6443 2>/dev/null | openssl x509 -noout -dates
+│      │       │                            │            │            │      └─ in notBefore/notAfter
+│      │       │                            │            └─ đọc cert từ stdin (pipe)
+│      │       │                            └─ nuốt log bắt tay TLS cho gọn
+│      │       └─ mở kết nối TLS, in cert server TRẢ VỀ
+│      └─ ⭐ khác `openssl x509 -in <file>`: lệnh kia đọc cert TRÊN ĐĨA,
+│         lệnh này đọc cert apiserver ĐANG PHỤC VỤ trong bộ nhớ.
+│         Đây là phép kiểm DUY NHẤT phân biệt được "đã ghi đĩa" với "đã nạp"
+│      └─ `echo |`: gửi EOF ngay để s_client thoát, không treo chờ input
+└─ ⭐ CHỈ NHÌN `notAfter`:
+   • notAfter = Aug 19 2027 → ✅ đã nạp cert mới
+   • notAfter = Aug 18 2026 → 🔴 vẫn cert cũ trong bộ nhớ
+   ⚠️ `notBefore` vẫn là Jul 6 2023 (ngày dựng cluster) — ĐÚNG, không phải lỗi:
+      kubeadm renew GIỮ NGUYÊN notBefore, chỉ đẩy notAfter. Xem output 3.28
+```
+</details>
+
+**5.5 — ~~Kiểm tra qua endpoint LB~~ → CHUYỂN XUỐNG GĐ6**
 
 📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
