@@ -1088,7 +1088,53 @@ To see the stack trace of this error execute with --v=5 or higher
 
 ---
 
-### 3.17 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.17 — [Node 48 / GĐ1] Backup PKI — thông báo `Removing leading '/'` KHÔNG phải lỗi
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ngày 19/08**
+
+```
+tar czf /root/pki-backup-$(hostname)-$(date +%F-%H%M).tar.gz /etc/kubernetes/pki /etc/kubernetes/*.conf /etc/kubernetes/kubeadm-config.yaml
+```
+
+**Output:**
+
+```
+tar: Removing leading `/' from member names
+```
+
+**Đọc được gì:**
+
+- ✅ **KHÔNG PHẢI LỖI.** Đây là thông báo **informational** của `tar`, và nó **xác nhận lệnh chạy
+  đúng**. Archive đã được tạo.
+- **Cơ chế:** truyền đường dẫn **tuyệt đối** (`/etc/kubernetes/pki`) thì `tar` tự bỏ dấu `/` đầu,
+  lưu vào archive thành đường dẫn **tương đối** `etc/kubernetes/pki/...`, rồi báo cho người dùng
+  biết nó vừa làm vậy.
+- ⭐ **Vì sao tar làm thế — đây là cơ chế AN TOÀN có chủ đích:**
+  Nếu archive lưu đường dẫn tuyệt đối, bất kỳ ai giải nén nó ở **bất kỳ thư mục nào** cũng sẽ
+  **ghi đè thẳng vào `/etc/kubernetes/` của hệ thống**. Giải nén một file backup lạ có thể phá
+  hỏng máy đang chạy.
+  ⇒ Bỏ `/` đầu ⇒ mặc định giải nén ra **thư mục hiện tại**; muốn về đúng chỗ cũ phải **cố ý**
+  chỉ định `-C /`.
+- ⭐ **Liên hệ trực tiếp tới bước ROLLBACK R1:** lệnh khôi phục trong file viết
+  `tar xzf <file> -C /`. Cờ `-C /` **không thừa** — nó bù lại đúng dấu `/` mà tar đã bỏ ở bước
+  backup này. Thiếu `-C /` thì file sẽ bung ra thư mục hiện tại (vd `/root/etc/kubernetes/...`),
+  **không** khôi phục được gì.
+- **Phân biệt 3 loại thông báo của `tar`:**
+
+  | Loại | Ví dụ | Ý nghĩa |
+  |---|---|---|
+  | **Informational** (đang gặp) | `Removing leading '/' from member names` | Báo việc vừa làm. Archive **tạo thành công** |
+  | Warning | `file changed as we read it` | Có vấn đề nhưng vẫn chạy tiếp |
+  | Error | `Cannot open: Permission denied` / `No space left on device` | **Thất bại thật** |
+
+- 📌 **Ghi chú:** dòng `To see the stack trace of this error execute with --v=5 or higher` ở phía
+  trên màn hình là **tàn dư của lệnh `--dry-run`** ở output 3.16, **không liên quan** tới lệnh tar.
+- ❓ **Chưa xác minh:** archive có thực sự đọc được không. Bắt buộc chạy `tar tzf` để xác nhận —
+  `tar czf` có thể tạo file lỗi nếu hết dung lượng đĩa.
+
+---
+
+### 3.18 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -2140,6 +2186,11 @@ tar czf <đích> <nguồn1> <nguồn2> <nguồn3>
    • kubeadm-config.yaml        → file dùng cho --config, mất là không renew đúng SAN được
 ```
 </details>
+
+> ℹ️ **`tar: Removing leading '/' from member names` là BÌNH THƯỜNG, không phải lỗi.**
+> Tar bỏ dấu `/` đầu để archive lưu đường dẫn tương đối — cơ chế an toàn, tránh việc giải nén
+> ở đâu cũng ghi đè thẳng vào hệ thống. Đây chính là lý do lệnh rollback R1 cần cờ `-C /`.
+> Chi tiết: xem output 3.17.
 
 Kiểm tra backup thật sự đọc được (đừng tin file `.tar.gz` chỉ vì nó tồn tại):
 
