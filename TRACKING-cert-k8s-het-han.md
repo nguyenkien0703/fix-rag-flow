@@ -1675,7 +1675,86 @@ front-proxy-ca          Jul 03, 2033 08:11 UTC   6y             no
 
 ---
 
-### 3.26 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.26 — [Node 48 / GĐ4] ✅ Restart control-plane — 3 pod lên với cert mới
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~11:38 +07 ngày 19/08**
+
+**Bước 1 — gỡ manifest**
+
+```
+mv /etc/kubernetes/manifests /etc/kubernetes/manifests.off
+```
+
+**Bước 2 — kiểm pod đã bị xoá**
+
+```
+crictl ps | grep -E 'apiserver|scheduler|controller'
+```
+
+**Output:**
+
+```
+233bb95e86d18   8a0228dd6a683   8 months ago   Running   kube-apiserver   215   3bcff79501ab3
+```
+
+**Bước 3 — đưa manifest trở lại**
+
+```
+mv /etc/kubernetes/manifests.off /etc/kubernetes/manifests
+```
+
+**Bước 4 — kiểm pod đã lên**
+
+```
+crictl ps | grep -E 'apiserver|scheduler|controller'
+```
+
+**Output:**
+
+```
+69a2abb1f8ac9   6114d758d6d16   6 seconds ago   Running   kube-scheduler            0     315191a6d7648
+3a76f9689c819   8a0228dd6a683   6 seconds ago   Running   kube-apiserver          216     cc389f6eae903
+be9b87f431442   4783639ba7e03   6 seconds ago   Running   kube-controller-manager   0     14c479ed369d3
+```
+
+**Đọc được gì:**
+
+- ✅ **Cả 3 static pod đã lên**, `STATE = Running`, `AGE = 6 seconds ago`.
+- ✅ ⭐ **Container ID của apiserver ĐỔI: `233bb95e86d18` → `3a76f9689c819`**
+  ⇒ **Bằng chứng pod được TẠO LẠI thật**, không phải pod cũ còn sót. Kết hợp với `AGE` reset về
+  6 giây ⇒ pod mới **đã đọc cert mới** từ hostPath.
+- ⚠️ ⭐ **BƯỚC 2 CHƯA RỖNG — quy trình yêu cầu chờ, nhưng đã `mv` trở lại ngay.**
+
+  Output bước 2 vẫn còn `kube-apiserver ... 8 months ago Running`. Quy trình ghi rõ *"KHÔNG sang
+  bước 3 khi chưa rỗng"*.
+
+  **Lần này kết quả vẫn đúng** — kubelet tuần tự hoá công việc: khi manifest xuất hiện lại, nó
+  vẫn hoàn tất việc xoá pod cũ trước khi tạo pod mới. Bằng chứng: container ID đổi + AGE reset.
+
+  **Nhưng rủi ro thật là race condition:** nếu `mv` trở lại **quá nhanh**, kubelet có thể chưa kịp
+  xử lý sự kiện "manifest biến mất", coi như không có gì thay đổi và **không restart pod nào**.
+  Khi đó apiserver vẫn giữ **cert cũ trong bộ nhớ** — nhìn `crictl ps` thấy `Running` nhưng thực
+  chất **chưa nạp cert mới**, và bước verify sẽ vẫn báo lỗi cert hết hạn.
+
+  ⇒ **Cách phát hiện:** so **container ID** trước/sau. ID không đổi ⇒ pod không được tạo lại ⇒
+  phải làm lại GĐ4. Ở đây ID đã đổi nên **an toàn**.
+  ⇒ Với node 49/50: vẫn nên chờ tới khi rỗng. Xem Bài học #18.
+
+- **Cột `215` → `216`** là **ATTEMPT** — số lần kubelet tạo container này kể từ khi node khởi động.
+  ⇒ Tăng **đúng 1 đơn vị** = một lần restart có chủ đích. Nếu crashloop thì con số sẽ **nhảy liên
+  tục** mỗi lần chạy lệnh.
+  ⇒ `scheduler` và `controller-manager` là `0` vì chúng vừa được tạo lần đầu sau khi bị xoá
+  (counter riêng cho từng container mới).
+- ⚠️ **Con số `215` tự nó nói chuyện khác: apiserver đã restart 215 lần** kể từ khi node boot,
+  và pod cũ có `AGE = 8 months ago`.
+  ⇒ ❓ **Chưa rõ nguyên nhân** — có thể do OOM, do liveness probe fail, hoặc do apiserver crash
+  định kỳ. **Ngoài phạm vi việc renew cert**, nhưng là nợ kỹ thuật đáng điều tra.
+- ❓ **Chưa xác minh:** apiserver có thực sự phục vụ bằng cert mới không. `Running` chỉ nói
+  container sống, chưa nói cert. Cần GĐ5.
+
+---
+
+### 3.27 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -2061,6 +2140,34 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
       trong phần "cách đọc" của chính lệnh đó — **nhưng lệnh không được sửa theo**.
       ⇒ Phát hiện rủi ro phải dẫn tới **sửa lệnh**, không chỉ thêm ghi chú.
 
+18. **Restart static pod: `Running` không chứng minh pod ĐƯỢC TẠO LẠI — phải so container ID.**
+
+    Ở GĐ4 node 48, bước chờ "tới khi `crictl ps` rỗng" bị bỏ qua — `mv` trở lại ngay khi apiserver
+    cũ vẫn đang chạy. Kết quả **vẫn đúng**, nhưng vì may hơn vì đúng quy trình.
+
+    **Cơ chế rủi ro:** kubelet phản ứng với **sự kiện** thư mục manifest biến mất/xuất hiện. Nếu
+    hai lần `mv` diễn ra quá nhanh, kubelet có thể chỉ thấy trạng thái cuối (manifest vẫn ở đó),
+    coi như **không có gì thay đổi**, và **không restart pod nào**.
+
+    ⇒ Khi đó `crictl ps` vẫn hiện `Running` — nhưng apiserver còn giữ **cert cũ trong bộ nhớ**.
+    Nhìn output thì tưởng xong, thực chất chưa nạp cert mới.
+
+    **Cách phân biệt — ba dấu hiệu, không dùng `STATE`:**
+
+    | Dấu hiệu | Pod ĐƯỢC tạo lại | Pod KHÔNG được tạo lại |
+    |---|---|---|
+    | **CONTAINER ID** | 🔄 **Đổi** (`233bb...` → `3a76f...`) | Giữ nguyên |
+    | **AGE** | Reset về vài giây | Vẫn là giá trị cũ (`8 months ago`) |
+    | **ATTEMPT** | Tăng đúng 1 (`215` → `216`) | Không đổi |
+    | ~~STATE~~ | `Running` | `Running` — **không phân biệt được** |
+
+    **Rút ra:**
+    - Với static pod, `STATE = Running` là dấu hiệu **vô dụng** để kiểm restart. Dùng
+      **container ID** — nó là danh tính, đổi ID = container mới.
+    - `ATTEMPT` tăng **đúng 1** = restart có chủ đích. Nhảy liên tục = crashloop.
+    - Bước chờ trong quy trình không phải thủ tục: nó loại bỏ race condition. Vẫn nên chờ ở
+      node 49/50.
+
 ---
 
 ## 6. Nợ kỹ thuật
@@ -2074,6 +2181,7 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 | Không biết repo Kubespray/Ansible inventory ở đâu | Không có bàn giao | `certSANs` gốc và mọi cấu hình cluster nằm ở đó. Không có repo = không thể dựng lại cluster, không thể nâng cấp đúng cách |
 | Không rõ ai sửa `kube-apiserver.yaml` ngày 18/09/2024 và sửa gì | Không có changelog/git cho `/etc/kubernetes` | Không biết cấu hình hiện tại lệch bao nhiêu so với file config gốc |
 | Thư mục cert quyền `755` thay vì `700` mặc định | Kubespray cấu hình | Mọi user trên node đọc được danh sách file cert. Cần kiểm quyền file `.key` bên trong có phải `600` không |
+| **apiserver đã restart 215 lần** kể từ khi node 48 boot (output 3.26) | ATTEMPT counter của containerd | ❓ Chưa rõ nguyên nhân: OOM? liveness probe fail? Ngoài phạm vi renew cert nhưng đáng điều tra — restart nhiều có thể là dấu hiệu cấu hình sai hoặc thiếu tài nguyên |
 | Vai trò IP `10.208.137.68` không rõ | Có trong SAN cert nhưng không thuộc danh sách node | Có thể là VIP hoặc node đã gỡ. Không rõ thì không dám bỏ, cũng không dám dựa vào |
 | Không có tài liệu `certSANs` gốc của cluster | ConfigMap `kubeadm-config` là nơi duy nhất, mà nó chỉ đọc được khi cluster sống | Cluster chết = mất luôn thông tin cần để sửa cluster. Vòng lặp chết |
 | `~/.kube/config` không được setup cho user vận hành | Thao tác qua `su root` | Mỗi lần sự cố phải mò lại; dễ nhầm lỗi kubeconfig thành lỗi cluster |
