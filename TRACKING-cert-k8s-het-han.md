@@ -1067,6 +1067,28 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 > chạy lệnh tiếp. Ba điểm 🛑 dưới đây là **bắt buộc dừng**, không được tự chạy tiếp.
 > Chi tiết ở mục 3 → "Giao ước cập nhật".
 
+##### 📍 Bảng tra cứu node / user — mỗi lệnh trong quy trình đều có nhãn này
+
+| Giai đoạn | Chạy ở đâu | User | Ghi chú |
+|---|---|---|---|
+| GĐ0 Tiền kiểm | Node **48** `vrp-kubeengine01` | `root` | Chỉ đọc |
+| GĐ1 Backup | **Cả 3** master 48 → 49 → 50 | `root` | Lần lượt, không song song |
+| GĐ2 Renew | Node **48** trước | `root` | 49/50 làm sau khi 48 xong hẳn |
+| GĐ3 So SAN | Node **48** | `root` | 🛑🛑 Chốt chặn |
+| GĐ4 Restart | Node **48** | `root` | Không đứt SSH |
+| GĐ5 Verify | Node **48** | `root` | — |
+| GĐ6.2 Cert kubelet | **5 worker** `.51` → `.55` | `root` | — |
+| GĐ6.3 Helm | Worker **`vrp-kubeengine04`** | ⚠️ **`app`** | **Khác user!** Đúng nơi phát hiện sự cố |
+| ROLLBACK | Node đang gặp sự cố | `root` | — |
+
+> ⚠️ **Vì sao phải ghi rõ user:** chính phiên này đã có bằng chứng — cùng một sự cố cert nhưng
+> `vt_admin` trên master 48 báo `localhost:8080 refused` (output 3.1) còn `app` trên worker 04
+> báo `x509: certificate has expired` (output 3.0). **Sai user ⇒ đọc sai triệu chứng ⇒ chẩn đoán sai.**
+>
+> Master: đăng nhập `vt_admin` rồi `su` sang `root` (như đã làm ở output 3.2).
+> Worker: user `app` cho lệnh helm — **không** dùng `root`, vì kubeconfig và Helm release
+> nằm ở `$HOME` của `app`.
+
 #### Điều kiện tiên quyết
 
 | Điều kiện | Trạng thái | Nguồn |
@@ -1084,6 +1106,8 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 Gộp A8 + A9 vào đây, không cần round-trip riêng.
 
 **0.1 — Đếm chính xác số SAN entry của cert hiện tại**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
@@ -1116,6 +1140,8 @@ openssl x509 -in <cert> -noout -text | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
 
 **0.2 — Xác nhận version kubeadm khớp version cluster**
 
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
 ```
 kubeadm version -o short
 ```
@@ -1131,6 +1157,8 @@ kubeadm version -o short
    Binary nâng cấp mà cluster còn version cũ (hoặc ngược lại) → cert có thể khác kỳ vọng
 ```
 </details>
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 grep image: /etc/kubernetes/manifests/kube-apiserver.yaml
@@ -1149,6 +1177,8 @@ grep image: /etc/kubernetes/manifests/kube-apiserver.yaml
 </details>
 
 **0.3 — Ghi lại SAN đầy đủ ra file để so sánh về sau**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -A3 'Alternative Name' > /root/san-truoc-renew-48.txt
@@ -1177,7 +1207,9 @@ openssl ... | grep -A3 'Alternative Name' > /root/san-truoc-renew-48.txt
 > Backup cả 3 node **trước**, không backup từng node ngay trước khi renew nó.
 > Lý do: nếu node 48 hỏng và cần dựng lại, có thể vẫn cần đối chiếu PKI của 49/50.
 
-**Chạy trên từng node 48, 49, 50:**
+📍 **Từng node 48 → 49 → 50** (`vrp-kubeengine01/02/03`) — user **`root`**
+
+> ⚠️ Chạy **lần lượt**, không song song. Ghi rõ đã backup xong node nào.
 
 ```
 tar czf /root/pki-backup-$(hostname)-$(date +%F-%H%M).tar.gz /etc/kubernetes/pki /etc/kubernetes/*.conf /etc/kubernetes/kubeadm-config.yaml
@@ -1205,6 +1237,8 @@ tar czf <đích> <nguồn1> <nguồn2> <nguồn3>
 
 Kiểm tra backup thật sự đọc được (đừng tin file `.tar.gz` chỉ vì nó tồn tại):
 
+📍 **Từng node 48 → 49 → 50** — user **`root`**
+
 ```
 tar tzf /root/pki-backup-$(hostname)-*.tar.gz | head -20
 ```
@@ -1228,6 +1262,10 @@ tar tzf <file> | head -20
 #### GIAI ĐOẠN 2 — Renew cert (node 48 trước)
 
 **2.1 — Renew kèm `--config`**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+> 🔴 Node 49/50 làm **sau**, khi node 48 đã verify xong.
 
 ```
 kubeadm certs renew all --config /etc/kubernetes/kubeadm-config.yaml
@@ -1294,11 +1332,15 @@ kube-scheduler and etcd, so that they can use the new certificates.
 
 **3.1 — Chụp SAN của cert mới**
 
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
 ```
 openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -A3 'Alternative Name' > /root/san-sau-renew-48.txt
 ```
 
 **3.2 — So sánh bằng máy, không so bằng mắt**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 diff /root/san-truoc-renew-48.txt /root/san-sau-renew-48.txt
@@ -1327,6 +1369,8 @@ diff <file cũ> <file mới>
 </details>
 
 **3.3 — Kiểm hạn mới**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 kubeadm certs check-expiration
@@ -1361,6 +1405,8 @@ Các dòng !MISSING! của etcd VẪN CÒN — đúng như cũ, vì etcd externa
 
 **4.1 — Tái tạo static pod bằng cách di chuyển manifest**
 
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
 ```
 mv /etc/kubernetes/manifests /etc/kubernetes/manifests.off
 ```
@@ -1382,6 +1428,8 @@ mv /etc/kubernetes/manifests /etc/kubernetes/manifests.off
 
 Chờ ~20 giây rồi kiểm tra pod đã bị xoá:
 
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
 ```
 crictl ps | grep -E 'apiserver|scheduler|controller'
 ```
@@ -1402,6 +1450,8 @@ Lỗi "connect endpoint": thêm -r unix:///run/containerd/containerd.sock
 
 **4.2 — Đưa manifest trở lại**
 
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
 ```
 mv /etc/kubernetes/manifests.off /etc/kubernetes/manifests
 ```
@@ -1418,6 +1468,8 @@ mv /etc/kubernetes/manifests.off /etc/kubernetes/manifests
 </details>
 
 Chờ ~30-60 giây cho pod khởi động:
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 crictl ps | grep -E 'apiserver|scheduler|controller'
@@ -1440,6 +1492,8 @@ KỲ VỌNG: 3 container, cột STATE = Running, cột ATTEMPT thấp (0 hoặc 
 
 **5.1 — Cập nhật kubeconfig (cert cũ trong `~/.kube/config` đã hết hạn)**
 
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
 ```
 cp /etc/kubernetes/admin.conf /root/.kube/config
 ```
@@ -1459,6 +1513,8 @@ Nếu /root/.kube/ chưa tồn tại: mkdir -p /root/.kube
 
 **5.2 — Kiểm tra cluster trả lời**
 
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
 ```
 kubectl get nodes
 ```
@@ -1476,6 +1532,8 @@ KỲ VỌNG: bảng 8 node (3 master + 5 worker), STATUS = Ready
 </details>
 
 **5.3 — Kiểm tra control-plane pod**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 kubectl -n kube-system get pods -l tier=control-plane -o wide
@@ -1498,6 +1556,8 @@ kubectl -n kube-system get pods -l tier=control-plane -o wide
 </details>
 
 **5.4 — Kiểm tra qua chính endpoint LB (quan trọng nhất)**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 curl -sS --cacert /etc/kubernetes/pki/ca.crt https://lb-apiserver.kubernetes.local:6443/version
@@ -1538,11 +1598,15 @@ curl -sS --cacert /etc/kubernetes/pki/ca.crt https://lb-apiserver.kubernetes.loc
 
 **6.1 — Kiểm tra toàn cụm**
 
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
 ```
 kubectl get nodes -o wide
 ```
 
 **6.2 — Kiểm cert kubelet trên 5 worker `137.51 → .55`**
+
+📍 **Từng worker `10.208.137.51` → `.55`** (`vrp-kubeengine04` …) — user **`root`**
 
 ```
 openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates
@@ -1565,7 +1629,9 @@ openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates
 
 **6.3 — Chạy lại việc gốc: upgrade RAGFlow (issue #6)**
 
-**Trên worker `vrp-kubeengine04`, user `app`:**
+📍 **Worker `vrp-kubeengine04`** — user **`app`** ⚠️ **KHÁC user `root` của mọi lệnh trên**
+
+> Đây là node/user đã phát hiện sự cố ban đầu (output 3.0) — chạy lại đúng chỗ đó để xác nhận đã khỏi.
 
 ```
 helm upgrade ragflow . -n ragflow -f values.yaml
@@ -1582,6 +1648,8 @@ helm upgrade ragflow . -n ragflow -f values.yaml
 > Chỉ dùng khi **chưa restart** (giai đoạn 3 fail) hoặc **đã restart nhưng hỏng** (giai đoạn 4/5 fail).
 
 **R1 — Nếu CHƯA restart (dễ):**
+
+📍 **Node đang gặp sự cố** — user **`root`**
 
 ```
 tar xzf /root/pki-backup-$(hostname)-<timestamp>.tar.gz -C /
