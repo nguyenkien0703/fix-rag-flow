@@ -54,7 +54,10 @@ hỏng nặng hơn hiện tại).
 | Health-check của LB | ❓ **không tự xác minh được từ trong cụm** — thiết bị của đội khác | Ràng buộc phạm vi, phải hỏi |
 | Cluster CIDR (pod) | `172.16.0.0/17` | ✅ Output 3.6 |
 | Service CIDR | `172.16.128.0/17` | ✅ Output 3.6 |
-| Cluster domain | ❓ khai `.vrp` trong config nhưng cert dùng `cluster.local` | Output 3.6 — cần làm rõ |
+| ✅ **Cluster domain** | **`vrp`** (`dnsDomain: vrp`) — cert hiện tại dùng `cluster.local` mặc định ⇒ renew sẽ **thêm** `kubernetes.default.svc.vrp` | ✅ Output 3.12 |
+| 🔴 **`certificatesDir`** | **`/etc/kubernetes/ssl`** — KHÔNG phải `/etc/kubernetes/pki` mặc định. ❓ `pki` có phải symlink tới `ssl`? | ✅ Output 3.12 — xác minh ở GĐ0-quater |
+| ✅ **etcd endpoints** | `https://10.208.137.48/49/50:2379`, cert riêng ở `/etc/ssl/etcd/ssl/` | ✅ Output 3.12 |
+| `clusterName` | `vrp` | ✅ Output 3.12 |
 | Người dựng cụm | ❓ **Không phải Kiên** (nhân viên mới, phụ trách deploy service). Cần hỏi sếp nếu cần | Kiên xác nhận |
 | Ứng dụng bị ảnh hưởng | RAGFlow `v0.26.4`, namespace `ragflow`, deploy bằng Helm | Output 3.0 |
 | User thao tác | worker: `app` / master: `vt_admin` → `su` sang `root` | Screenshot |
@@ -74,6 +77,8 @@ hỏng nặng hơn hiện tại).
 | 7 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.6: `certSANs` khớp cert đang chạy ⇒ **dùng được `--config`** |
 | 9 | 🔴 **File `kubeadm-config.yaml` có 4 YAML document — v1.23 không parse được cho `--config`** | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | Output 3.11. Tách file chỉ chứa `ClusterConfiguration` → GĐ0-ter |
 | 10 | Kubernetes **v1.23.2 đã EOL** (02/2023, quá hạn 3 năm) | 🟠 Cao | 🔶 **OPEN — ngoài phạm vi việc này** | Không chặn renew. Cần lên kế hoạch nâng cấp riêng, bàn với sếp |
+| 11 | 🔴 **`certificatesDir: /etc/kubernetes/ssl`** — mọi lệnh trong quy trình đang dùng `/etc/kubernetes/pki` | 🔴 Cao | 🔶 **OPEN** | Output 3.12. Xác minh `pki` có phải symlink tới `ssl` (GĐ0-quater 0q.1). Nếu là 2 thư mục riêng → phải sửa mọi đường dẫn |
+| 12 | Cert cụm **etcd external** chưa kiểm hạn | 🟡 TB | 🔶 **OPEN — ngoài phạm vi** | Cert ở `/etc/ssl/etcd/ssl/`, không do `kubeadm certs renew` quản. Kiểm sau khi khôi phục control-plane |
 | 8 | LB tập trung `.68` — chưa rõ có health-check không | 🟡 **TB (hạ từ 🟠)** | 🔶 **OPEN — bị chặn bởi phạm vi** | ✅ Output 3.8: VIP **ngoài cụm**, master restart không đụng VIP. Còn lại: hỏi đội mạng về health-check port 6443 |
 
 ---
@@ -795,7 +800,101 @@ crictl images | grep kube-apiserver
 
 ---
 
-### 3.12 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.12 — [Node 48 / GĐ0-ter] Ranh giới `ClusterConfiguration` + 4 phát hiện mới
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~10:48 +07 ngày 19/08**
+
+**a) Vị trí các document**
+
+```
+grep -n '^---\|^kind:' /etc/kubernetes/kubeadm-config.yaml
+```
+
+**Output:**
+
+```
+2:kind: InitConfiguration
+13:---
+15:kind: ClusterConfiguration
+120:---
+122:kind: KubeProxyConfiguration
+160:---
+162:kind: KubeletConfiguration
+```
+
+**b) Nội dung file** (`cat -n`, trích các dòng quyết định)
+
+```
+  1  apiVersion: kubeadm.k8s.io/v1beta2
+  2  kind: InitConfiguration
+  4    advertiseAddress: 10.208.137.48
+ 13  ---
+ 14  apiVersion: kubeadm.k8s.io/v1beta2      ← ⭐ BẮT ĐẦU khối cần cắt
+ 15  kind: ClusterConfiguration
+ 16  clusterName: vrp
+ 17  etcd:
+ 18    external:
+ 19      endpoints:
+ 20      - https://10.208.137.48:2379
+ 21      - https://10.208.137.49:2379
+ 22      - https://10.208.137.50:2379
+ 23      caFile: /etc/ssl/etcd/ssl/ca.pem
+ 24      certFile: /etc/ssl/etcd/ssl/node-vrp-kubeengine01.pem
+ 25      keyFile: /etc/ssl/etcd/ssl/node-vrp-kubeengine01-key.pem
+ 30  networking:
+ 31    dnsDomain: vrp
+ 32    serviceSubnet: "172.16.128.0/17"
+ 33    podSubnet: "172.16.0.0/17"
+ 34  kubernetesVersion: v1.23.2
+ 35  controlPlaneEndpoint: lb-apiserver.kubernetes.local:6443
+ 36  certificatesDir: /etc/kubernetes/ssl        ← 🔴 KHÔNG phải /etc/kubernetes/pki
+ 37  imageRepository: 10.60.129.132:8890
+ 78    certSANs:
+ 79    - kubernetes
+ ...
+ 96    - vrp-kubeengine03.vrp
+ 97    timeoutForControlPlane: 5m0s
+119        readOnly: true                       ← ⭐ KẾT THÚC khối cần cắt
+120  ---
+122  kind: KubeProxyConfiguration
+162  kind: KubeletConfiguration
+```
+
+**Đọc được gì:**
+
+- ✅ **Ranh giới cắt: dòng `14` → `119`.** Lấy từ dòng 14 (`apiVersion`) vì trường này **bắt buộc**
+  phải đi kèm `kind`; kết thúc ở 119, ngay **trước** dấu `---` ở dòng 120.
+- 🔴 ⭐ **PHÁT HIỆN NGHIÊM TRỌNG — `certificatesDir: /etc/kubernetes/ssl`** (dòng 36),
+  **KHÔNG phải `/etc/kubernetes/pki`** như mặc định kubeadm.
+
+  ⚠️ **Mọi lệnh `openssl` trong quy trình đang trỏ `/etc/kubernetes/pki/apiserver.crt`.**
+  Nếu kubeadm ghi cert mới vào `/etc/kubernetes/ssl/` thì:
+  - File SAN mốc `/root/san-truoc-renew-48.txt` (output 3.10) có thể **không phải cert đang chạy**
+  - Bước `diff` ở GĐ3 sẽ so **nhầm file** → không phát hiện được cert mới thiếu SAN
+
+  ⇒ Nhưng lệnh 0.1 (output 3.10) **chạy được** và ra 18 entry ⇒ `/etc/kubernetes/pki/apiserver.crt`
+  **có tồn tại**. Hai khả năng: (a) `pki` là **symlink** tới `ssl` — Kubespray hay làm vậy;
+  (b) hai thư mục riêng biệt, cert ở `pki` là bản cũ/thừa.
+  ⇒ ❓ **PHẢI XÁC MINH TRƯỚC KHI RENEW** — xem GĐ0-quater.
+
+- ✅ **`etcd.external` (dòng 17-25) — XÁC NHẬN DỨT ĐIỂM** etcd external, endpoints trỏ
+  `10.208.137.48/49/50:2379`, cert etcd riêng ở `/etc/ssl/etcd/ssl/`.
+  ⇒ Củng cố output 3.4. Cert etcd **không** do `kubeadm certs renew` quản ⇒ nằm ngoài phạm vi
+  việc này, nhưng ❓ **chưa kiểm hạn** — cert etcd hết hạn sẽ gây sự cố riêng.
+- ✅ **`dnsDomain: vrp` (dòng 31)** — cluster domain thật là **`vrp`**, không phải `cluster.local`.
+  ⇒ **Giải thích được điểm lệch ở output 3.6**: file khai `kubernetes.default.svc.vrp` (đúng theo
+  dnsDomain), nhưng cert đang chạy lại có `kubernetes.default.svc.cluster.local` (giá trị mặc định
+  kubeadm). Nghĩa là lần sinh cert gần nhất, `dnsDomain` **chưa được áp dụng** vào SAN.
+  ⇒ Renew kèm `--config` sẽ **thêm** `kubernetes.default.svc.vrp` → SAN 18 → **19 entry**.
+- ✅ `certSANs` nằm **dòng 78-96**, đủ 18 entry, khớp output 3.6.
+- ✅ `controlPlaneEndpoint: lb-apiserver.kubernetes.local:6443` (dòng 35) — khớp output 3.0.
+- ⚠️ **`imageRepository: 10.60.129.132:8890`** (dòng 37) — cổng **8890**, trong khi image thật
+  đang chạy là `10.60.129.132:8890/kube-apiserver` (output 3.11 hiện `8890`).
+  ⇒ Khớp nhau. (Ghi chú: đọc từ screenshot qua VDI, cần soi kỹ 8890 vs 8090 khi thao tác.)
+
+---
+
+### 3.13 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -1478,6 +1577,149 @@ crictl images | grep kube-apiserver
 
 ---
 
+#### 🔒 QUY TẮC BACKUP — áp dụng cho MỌI bước có sửa file
+
+> Kiên chốt 2026-08-19: *"trước khi làm gì thì cũng cần có backup"*.
+>
+> **Nguyên tắc:** file nào sắp bị **sửa / ghi đè / đổi tên** thì phải có bản sao **trước đó**.
+> File chỉ **đọc** thì không cần — nhưng khi phân vân thì cứ backup, chi phí gần bằng 0.
+
+| Bước | Đụng vào file nào | Kiểu đụng | Backup |
+|---|---|---|---|
+| GĐ0, 0-bis, 0-ter | `kubeadm-config.yaml` | **Chỉ đọc** (`grep`, `cat`, `sed -n`) | Vẫn backup — xem 0q.2 |
+| GĐ1 | — | — | Đây **chính là** bước backup PKI |
+| **GĐ2 renew** | `/etc/kubernetes/ssl/*` (hoặc `pki`), `*.conf` | 🔴 **GHI ĐÈ** | ✅ GĐ1 đã lo |
+| **GĐ4 restart** | thư mục `manifests/` | 🔴 **ĐỔI TÊN** | ✅ 0q.3 |
+| GĐ5 | `~/.kube/config` | 🔴 **GHI ĐÈ** | ✅ 0q.4 |
+
+> ⚠️ `sed -n '14,119p' <nguồn> > /root/<đích>` **KHÔNG sửa file nguồn** — nó chỉ đọc và ghi ra
+> file mới ở `/root/`. Nhưng vẫn backup theo nguyên tắc trên.
+
+---
+
+#### 🔴 GIAI ĐOẠN 0-quater — Xác minh `certificatesDir` + backup (BẮT BUỘC)
+
+> Phát sinh sau output 3.12: file config khai **`certificatesDir: /etc/kubernetes/ssl`**,
+> không phải `/etc/kubernetes/pki` mà mọi lệnh trong quy trình đang dùng.
+> **Nếu sai thư mục, bước `diff` SAN ở GĐ3 sẽ so nhầm file và không phát hiện được cert hỏng.**
+
+**0q.1 — ⭐ `pki` và `ssl` là một hay hai thư mục khác nhau?**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+ls -ld /etc/kubernetes/pki /etc/kubernetes/ssl
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+ls -ld /etc/kubernetes/pki /etc/kubernetes/ssl
+│  ││
+│  │└─ ⭐ d: hiện thông tin CHÍNH thư mục, KHÔNG liệt kê nội dung bên trong.
+│  │   Thiếu `d` thì ls đổ ra toàn bộ file trong cả hai thư mục — rối, và
+│  │   quan trọng hơn là KHÔNG thấy được thư mục đó có phải symlink không
+│  └─ -l: long format — cần để thấy ký tự đầu tiên (`d` = thư mục, `l` = symlink)
+└─ ĐỌC KẾT QUẢ — nhìn KÝ TỰ ĐẦU mỗi dòng:
+   • `lrwxrwxrwx ... pki -> ssl`  → pki là SYMLINK trỏ tới ssl ⇒ HAI TÊN MỘT THƯ MỤC
+     ⇒ ✅ mọi lệnh /etc/kubernetes/pki/... trong quy trình VẪN ĐÚNG, không phải sửa gì
+   • `drwx------ ... pki` VÀ `drwx------ ... ssl` (cả hai đều `d`)
+     → HAI thư mục RIÊNG BIỆT ⇒ 🔴 phải đổi mọi đường dẫn sang /etc/kubernetes/ssl
+   • Một trong hai báo "No such file or directory" → chỉ tồn tại một thư mục, dùng cái đó
+```
+</details>
+
+Nếu là hai thư mục riêng, so tiếp cert nào mới hơn:
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+ls -l /etc/kubernetes/pki/apiserver.crt /etc/kubernetes/ssl/apiserver.crt
+```
+
+<details>
+<summary>Cách đọc</summary>
+
+```
+So cột mtime và kích thước:
+• Cùng inode/kích thước/mtime → nhiều khả năng hardlink hoặc bản sao giống hệt
+• Khác mtime → 🔴 file trong `ssl` là bản ĐANG DÙNG (theo certificatesDir),
+  file trong `pki` là bản cũ/thừa ⇒ output 3.10 đã đọc NHẦM file
+  ⇒ phải chạy lại 0.1 và 0.3 với đường dẫn /etc/kubernetes/ssl/
+```
+</details>
+
+**0q.2 — Backup file config gốc (trước khi tách)**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+cp -a /etc/kubernetes/kubeadm-config.yaml /root/kubeadm-config.yaml.bak-$(date +%F-%H%M)
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+cp -a <nguồn> <đích>
+│  │
+│  └─ ⭐ -a (archive) = -dR --preserve=all: giữ NGUYÊN quyền, owner, timestamp, symlink.
+│     `cp` trần sẽ đổi mtime thành thời điểm copy và đặt owner theo user đang chạy
+│     → mất thông tin "file này sửa lần cuối 06/07/2023" vốn là manh mối quan trọng
+│     (chính mtime đã lộ ra chuyện apiserver.yaml bị sửa 09/2024 — xem Bài học #10)
+└─ $(date +%F-%H%M) → 2026-08-19-1048: chạy lại không ghi đè bản backup trước
+   Đặt ở /root/ chứ không cùng thư mục /etc/kubernetes/ — tránh kubeadm/kubelet
+   quét nhầm file .bak
+```
+</details>
+
+**0q.3 — Backup thư mục manifests (GĐ4 sẽ đổi tên nó)**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+cp -a /etc/kubernetes/manifests /root/manifests-backup-$(date +%F-%H%M)
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+cp -a /etc/kubernetes/manifests /root/manifests-backup-<timestamp>
+│  │  └─ 3 file: kube-apiserver.yaml, kube-controller-manager.yaml, kube-scheduler.yaml
+│  └─ -a: copy đệ quy + giữ nguyên quyền/mtime (xem 0q.2)
+└─ ⭐ VÌ SAO CẦN: GĐ4 đổi tên thư mục này thành manifests.off rồi đổi lại.
+   Nếu thao tác bị gián đoạn giữa chừng (mất SSH, gõ nhầm), thư mục có thể ở trạng
+   thái dở dang → control-plane KHÔNG BAO GIỜ chạy lại. Có bản copy thì khôi phục được.
+   ⚠️ Đặt ở /root/, KHÔNG để trong /etc/kubernetes/ — kubelet quét mọi thứ trong đó
+```
+</details>
+
+**0q.4 — Backup kubeconfig hiện tại (GĐ5 sẽ ghi đè)**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+cp -a /root/.kube/config /root/kube-config.bak-$(date +%F-%H%M) 2>/dev/null || echo "chua co ~/.kube/config - bo qua"
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+cp -a <nguồn> <đích> 2>/dev/null || echo "..."
+│                     │            │  └─ chạy khi vế trái THẤT BẠI
+│                     │            └─ `||` = OR: chỉ chạy vế phải nếu vế trái exit code ≠ 0
+│                     └─ nuốt thông báo lỗi "No such file" — vì đây là trường hợp
+│                        BÌNH THƯỜNG (output 3.1 cho thấy root chưa có ~/.kube/config)
+└─ ⭐ Cấu trúc `lệnh || echo` giúp lệnh KHÔNG BAO GIỜ báo lỗi đỏ, mà in thông báo dễ hiểu.
+   Hữu ích khi file có thể có hoặc không — tránh hoang mang lúc thao tác gấp
+```
+</details>
+
+---
+
 #### 🔴 GIAI ĐOẠN 0-ter — Tách file config (BẮT BUỘC, phát sinh sau output 3.11)
 
 > **Vì sao bắt buộc:** `/etc/kubernetes/kubeadm-config.yaml` chứa **4 document**
@@ -1487,7 +1729,7 @@ crictl images | grep kube-apiserver
 >
 > ⇒ Phải tạo file mới **chỉ chứa `ClusterConfiguration`**.
 
-**0t.1 — Xem chính xác phạm vi khối `ClusterConfiguration`**
+**0t.1 — ✅ ĐÃ CHẠY (output 3.12)** — Xem chính xác phạm vi khối `ClusterConfiguration`
 
 📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
@@ -1513,7 +1755,7 @@ grep -n '^---\|^kind:' /etc/kubernetes/kubeadm-config.yaml
 ```
 </details>
 
-**0t.2 — Xem toàn bộ file để xác định ranh giới chính xác**
+**0t.2 — ✅ ĐÃ CHẠY (output 3.12)** — Xem toàn bộ file để xác định ranh giới
 
 📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
@@ -1537,13 +1779,14 @@ cat -n /etc/kubernetes/kubeadm-config.yaml
 
 **0t.3 — Tách khối `ClusterConfiguration` ra file riêng**
 
-> ⚠️ **CHƯA CHẠY LỆNH NÀY** cho tới khi xác nhận số dòng từ 0t.2.
-> Thay `<đầu>` và `<cuối>` bằng số dòng thật.
+> ✅ **Số dòng ĐÃ XÁC ĐỊNH từ output 3.12: cắt dòng `14` → `119`.**
+> Dòng 14 là `apiVersion` (bắt buộc đi kèm `kind` ở dòng 15); dòng 119 là dòng cuối
+> trước dấu `---` ở dòng 120.
 
 📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
-sed -n '<đầu>,<cuối>p' /etc/kubernetes/kubeadm-config.yaml > /root/cluster-config-renew.yaml
+sed -n '14,119p' /etc/kubernetes/kubeadm-config.yaml > /root/cluster-config-renew.yaml
 ```
 
 <details>
@@ -1553,7 +1796,7 @@ sed -n '<đầu>,<cuối>p' /etc/kubernetes/kubeadm-config.yaml > /root/cluster-
 sed -n '<đầu>,<cuối>p' <file nguồn> > <file đích>
 │   │   │              │             └─ `>` ghi đè file đích (chạy lại được, không nối thêm)
 │   │   │              └─ ĐỌC, không sửa file gốc — file gốc giữ nguyên làm bản đối chiếu
-│   │   └─ dải dòng cần lấy, vd '12,77'
+│   │   └─ dải dòng cần lấy: '14,119' (xác định từ output 3.12)
 │   │      `p` cuối = print (in ra) dòng trong dải đó
 │   └─ ⭐ -n: TẮT chế độ tự in mọi dòng của sed.
 │      KHÔNG có -n thì sed in TẤT CẢ các dòng, cộng thêm in LẶP LẠI dải đã chọn
@@ -2126,7 +2369,8 @@ dừng lại, báo cáo, xử lý node 48 riêng. **Tuyệt đối không** ti�
 | **5 worker `.51-.55` chưa được kiểm tra** — kubelet client cert có thể cũng hết hạn | 🟡 TB | Sau khi control-plane xanh, kiểm `kubelet-client-current.pem` trên từng worker |
 | ~~Là stacked etcd nhưng PKI mất thật~~ | ⚪ **Đã loại bỏ** | Output 3.4: **etcd external**, không có `etcd.yaml` |
 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ **Đã loại bỏ** | Output 3.6: `certSANs` khớp khít cert đang chạy |
-| Cert của cụm **etcd external** cũng có thể sắp/đã hết hạn — sự cố riêng biệt chưa kiểm tra | 🟡 TB | Sau khi khôi phục control-plane, xác định endpoint etcd và kiểm hạn cert phía đó |
+| 🔴 **`diff` SAN ở GĐ3 so nhầm file** nếu cert thật nằm ở `/etc/kubernetes/ssl` mà lệnh đọc `/etc/kubernetes/pki` → không phát hiện được cert hỏng | 🔴 Cao | Xác minh 0q.1 **trước khi** renew. Nếu 2 thư mục riêng → chạy lại 0.1/0.3 với đường dẫn đúng |
+| Cert cụm **etcd external** (`/etc/ssl/etcd/ssl/`) chưa kiểm hạn — sự cố riêng biệt | 🟡 TB | Kiểm sau khi khôi phục control-plane. Không do `kubeadm certs renew` quản |
 | ~~Restart nhiều master cùng lúc → mất quorum etcd~~ | 🟢 **Hạ từ 🔴** | etcd **external** (output 3.4) ⇒ không có quorum trên master để mất. Vẫn giữ tuần tự 48→49→50 để còn đường rollback nếu cert mới sai SAN |
 | Node 49/50 có thể có tình trạng cert khác 48 (chưa kiểm tra) | 🟡 TB | Chạy `check-expiration` độc lập trên từng node trước khi thao tác |
 | ~~Registry nội bộ không truy cập được khi restart~~ | ⚪ **Đã loại bỏ (node 48)** | ✅ Output 3.11: image `kube-apiserver:v1.23.2` **có trong cache cục bộ** ⇒ kubelet không cần gọi registry. ⚠️ Nên kiểm lại tương tự trên 49/50 |
