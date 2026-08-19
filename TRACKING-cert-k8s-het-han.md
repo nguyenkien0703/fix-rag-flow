@@ -65,13 +65,15 @@ hỏng nặng hơn hiện tại).
 
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
-| 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | 🔶 **OPEN — quy trình đã soạn** | `kubeadm certs renew all` **`--config /etc/kubernetes/kubeadm-config.yaml`** → so SAN → restart static pod. Lần lượt 48→49→50. ➡️ Xem mục 7 |
+| 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | 🔶 **OPEN — đang thực hiện GĐ0** | `kubeadm certs renew all` **`--config /root/cluster-config-renew.yaml`** (file TÁCH ở GĐ0-ter, không phải file gốc) → so SAN → restart. Lần lượt 48→49→50 |
 | 2 | `kubectl` không chạy được dưới user `root` (thiếu kubeconfig) | 🟡 TB | 🔶 **OPEN** | Copy `admin.conf` → `~/.kube/config` **sau khi** renew xong |
 | 3 | ~~Toàn bộ PKI etcd báo `!MISSING!`~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.4: không có `etcd.yaml` ⇒ **etcd external** ⇒ `!MISSING!` chỉ là cosmetic |
 | 4 | `kubeadm` fallback default config → cert mới mất SAN | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | ✅ Output 3.6 xác nhận `kubeadm-config.yaml` còn đúng ⇒ renew **kèm `--config /etc/kubernetes/kubeadm-config.yaml`**. Cấm lệnh trần |
 | 5 | Không có cảnh báo trước khi cert hết hạn | 🟡 TB | 🔶 **OPEN** | Dựng `x509-certificate-exporter` + alert trước 30 ngày |
 | 6 | RAGFlow `v0.26.4` chưa upgrade được (việc gốc ban đầu) | 🟢 Thấp | 🔶 **OPEN** — bị chặn bởi #1 | Chạy lại `helm upgrade` sau khi cluster khôi phục |
 | 7 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.6: `certSANs` khớp cert đang chạy ⇒ **dùng được `--config`** |
+| 9 | 🔴 **File `kubeadm-config.yaml` có 4 YAML document — v1.23 không parse được cho `--config`** | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | Output 3.11. Tách file chỉ chứa `ClusterConfiguration` → GĐ0-ter |
+| 10 | Kubernetes **v1.23.2 đã EOL** (02/2023, quá hạn 3 năm) | 🟠 Cao | 🔶 **OPEN — ngoài phạm vi việc này** | Không chặn renew. Cần lên kế hoạch nâng cấp riêng, bàn với sếp |
 | 8 | LB tập trung `.68` — chưa rõ có health-check không | 🟡 **TB (hạ từ 🟠)** | 🔶 **OPEN — bị chặn bởi phạm vi** | ✅ Output 3.8: VIP **ngoài cụm**, master restart không đụng VIP. Còn lại: hỏi đội mạng về health-check port 6443 |
 
 ---
@@ -720,7 +722,80 @@ openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -A3 'Alte
 
 ---
 
-### 3.11 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.11 — [Node 48 / GĐ0-bis] 🔴 Cấu trúc file config KHÔNG dùng được cho `--config`
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ngày 19/08**
+
+**a) Đếm số YAML document**
+
+```
+grep -c '^---' /etc/kubernetes/kubeadm-config.yaml
+```
+
+**Output:**
+
+```
+3
+```
+
+**b) Các `kind` có trong file**
+
+```
+grep '^kind:' /etc/kubernetes/kubeadm-config.yaml
+```
+
+**Output:**
+
+```
+kind: InitConfiguration
+kind: ClusterConfiguration
+kind: KubeProxyConfiguration
+kind: KubeletConfiguration
+```
+
+**c) Image apiserver trong cache cục bộ**
+
+```
+crictl images | grep kube-apiserver
+```
+
+**Output:**
+
+```
+10.60.129.132:8090/kube-apiserver    v1.23.2    8a0228dd6a683    32.6MB
+```
+
+**Đọc được gì:**
+
+- 🔴 ⭐ **KHÔNG ĐƯỢC chạy `kubeadm certs renew all --config /etc/kubernetes/kubeadm-config.yaml`
+  như quy trình đã soạn.** File chứa **4 document** (3 dấu `---` ngăn 4 object).
+
+  **Cơ chế hỏng:** `kubeadm certs renew --config` ở nhánh **v1.23** dùng
+  `LoadOrDefaultInitConfiguration` để parse file. Hàm này hiểu `InitConfiguration` và
+  `ClusterConfiguration`, nhưng gặp `KubeProxyConfiguration` / `KubeletConfiguration` thì tuỳ
+  bản mà **báo lỗi `unknown kind`** hoặc **im lặng bỏ qua toàn bộ file** → rơi về **default config**.
+
+  ⇒ Rơi về default = đúng thảm hoạ đang muốn tránh: cert mới mất `lb-apiserver.kubernetes.local`,
+  mất VIP `10.208.137.68`, mất ClusterIP `172.16.128.1` → **toàn cụm hỏng**.
+
+  ⚠️ **Nguy hiểm nhất:** nếu kubeadm **im lặng** bỏ qua, lệnh **vẫn báo "renewed" thành công**.
+  Không có dấu hiệu gì bất thường. Chỉ bước `diff` SAN ở GĐ3 mới lộ ra.
+
+  ⇒ **Cách gỡ:** tách file mới chỉ chứa `ClusterConfiguration`, giữ nguyên `certSANs` —
+  xem GIAI ĐOẠN 0-ter trong quy trình.
+
+- ✅ **Image CÓ trong cache cục bộ**: `10.60.129.132:8090/kube-apiserver:v1.23.2`,
+  ID `8a0228dd6a683`, 32.6MB.
+  ⇒ Khi restart ở GĐ4, kubelet **dùng image từ cache**, **không gọi ra registry**.
+  ⇒ **Loại trừ được** rủi ro "registry nội bộ chết làm static pod không lên được".
+  ⚠️ Mới kiểm trên node 48. Node 49/50 nên kiểm tương tự trước khi restart node đó.
+
+- ❓ **Chưa xác minh:** bản v1.23.2 cụ thể này báo lỗi hay im lặng khi gặp `unknown kind`.
+  **Không cần biết** — cách gỡ (tách file) an toàn cho cả hai trường hợp.
+
+---
+
+### 3.12 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -1021,6 +1096,41 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 
     **Rút ra:** khi bí, hỏi ngay "cái này nằm trong tay mình hay tay người khác?" trước khi
     quyết định chạy thêm lệnh hay đi hỏi.
+
+14. **🔴 "File config tồn tại và nội dung đúng" ≠ "công cụ dùng được file đó".**
+
+    Ở output 3.6 đã kiểm `certSANs` trong `kubeadm-config.yaml` — **khớp khít** 18/18 entry với
+    cert đang chạy. Kết luận lúc đó: *"dùng được `--config`, đây là kết quả tốt nhất có thể"*.
+
+    **Cái làm lộ ra là thiếu:** output 3.11 — file có **4 YAML document**, mà `kubeadm certs renew
+    --config` ở v1.23 **không parse được** cấu trúc đó. Nội dung đúng, nhưng **định dạng công cụ
+    không nuốt được**.
+
+    **Vì sao suýt hỏng:** nếu chạy thẳng lệnh renew như quy trình đã soạn, kubeadm rơi về default
+    config → cert mới mất `lb-apiserver.kubernetes.local` + VIP + ClusterIP → **toàn cụm hỏng**,
+    và cert cũ đã bị ghi đè. Nguy hiểm nhất là kubeadm có thể **im lặng** bỏ qua file, **vẫn báo
+    "renewed" thành công** — không có dấu hiệu bất thường nào cho tới bước `diff`.
+
+    **Hai tầng kiểm khác nhau, phải làm cả hai:**
+
+    | Tầng | Câu hỏi | Lệnh | Kết quả phiên này |
+    |---|---|---|---|
+    | Nội dung | `certSANs` có đúng không? | `grep -A30 certSANs` | ✅ Khớp 18/18 |
+    | **Định dạng** | **Công cụ đọc được file không?** | `grep -c '^---'` + `grep '^kind:'` | 🔴 **4 document — KHÔNG đọc được** |
+
+    **Rút ra:** kiểm nội dung xong đừng dừng — hỏi tiếp *"công cụ có thực sự dùng được file này
+    không?"*. Với công cụ cũ (EOL), khoảng cách giữa "file đúng" và "công cụ hiểu file" càng rộng.
+    Bước `--dry-run` ở GĐ0-ter sinh ra chính vì lý do này.
+
+15. **Version EOL không chỉ là rủi ro bảo mật — nó đổi cả hành vi công cụ.**
+
+    Phát hiện v1.23.2 EOL (output 3.10) ban đầu chỉ ghi như "nợ kỹ thuật, ngoài phạm vi".
+    Nhưng nó **trực tiếp** sinh ra vấn đề ở output 3.11: cờ `--config` của `kubeadm certs renew`
+    trên nhánh 1.23 kém khoan dung hơn bản mới. Bản mới hơn parse được file nhiều document;
+    1.23 thì không.
+
+    **Rút ra:** gặp cluster chạy version EOL, đừng chỉ ghi nhận rồi bỏ qua — **kiểm lại xem quy
+    trình chuẩn có còn áp dụng được không**. Tài liệu trên mạng thường viết cho bản mới nhất.
 
 ---
 
@@ -1368,6 +1478,157 @@ crictl images | grep kube-apiserver
 
 ---
 
+#### 🔴 GIAI ĐOẠN 0-ter — Tách file config (BẮT BUỘC, phát sinh sau output 3.11)
+
+> **Vì sao bắt buộc:** `/etc/kubernetes/kubeadm-config.yaml` chứa **4 document**
+> (`InitConfiguration`, `ClusterConfiguration`, `KubeProxyConfiguration`, `KubeletConfiguration`).
+> `kubeadm certs renew --config` ở v1.23 **không parse được** file như vậy → rơi về default config
+> → cert mới mất SAN → **toàn cụm hỏng**.
+>
+> ⇒ Phải tạo file mới **chỉ chứa `ClusterConfiguration`**.
+
+**0t.1 — Xem chính xác phạm vi khối `ClusterConfiguration`**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+grep -n '^---\|^kind:' /etc/kubernetes/kubeadm-config.yaml
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+grep -n '^---\|^kind:' /etc/kubernetes/kubeadm-config.yaml
+│    │   │     │
+│    │   │     └─ `\|` = OR trong regex CƠ BẢN (BRE). Ở đây KHÔNG dùng -E nên `|`
+│    │   │        phải escape thành `\|`. Nếu dùng -E thì viết `|` trần
+│    │   └─ khớp dòng bắt đầu bằng `---` (ngăn document) hoặc `kind:` (loại object)
+│    └─ -n: ⭐ IN SỐ DÒNG — đây là mục đích chính, cần biết ClusterConfiguration
+│       bắt đầu và kết thúc ở dòng nào để cắt cho đúng
+└─ ĐỌC KẾT QUẢ: tìm dòng `kind: ClusterConfiguration`, rồi tìm dấu `---` KẾ TIẾP.
+   Khối cần lấy nằm giữa hai mốc đó (không gồm dấu `---` sau).
+   Ví dụ: kind ở dòng 15, `---` kế tiếp ở dòng 78 → cần lấy dòng 12..77
+   (lùi lên vài dòng để lấy cả `apiVersion:` đứng trước `kind:`)
+```
+</details>
+
+**0t.2 — Xem toàn bộ file để xác định ranh giới chính xác**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+cat -n /etc/kubernetes/kubeadm-config.yaml
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+cat -n /etc/kubernetes/kubeadm-config.yaml
+│   │
+│   └─ -n: đánh số dòng — khớp với số dòng ở 0t.1 để cắt chính xác
+└─ File 4463 bytes (~120 dòng), đủ ngắn để xem hết một lần.
+   ⭐ CẦN NHÌN: khối ClusterConfiguration bắt đầu từ dòng `apiVersion: kubeadm.k8s.io/v1beta2`
+   (hoặc v1beta3) NGAY TRƯỚC `kind: ClusterConfiguration`, kết thúc ngay TRƯỚC dấu `---` kế tiếp
+   ⚠️ Gửi output này cho mình xác nhận ranh giới trước khi cắt — cắt sai làm mất certSANs
+```
+</details>
+
+**0t.3 — Tách khối `ClusterConfiguration` ra file riêng**
+
+> ⚠️ **CHƯA CHẠY LỆNH NÀY** cho tới khi xác nhận số dòng từ 0t.2.
+> Thay `<đầu>` và `<cuối>` bằng số dòng thật.
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+sed -n '<đầu>,<cuối>p' /etc/kubernetes/kubeadm-config.yaml > /root/cluster-config-renew.yaml
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+sed -n '<đầu>,<cuối>p' <file nguồn> > <file đích>
+│   │   │              │             └─ `>` ghi đè file đích (chạy lại được, không nối thêm)
+│   │   │              └─ ĐỌC, không sửa file gốc — file gốc giữ nguyên làm bản đối chiếu
+│   │   └─ dải dòng cần lấy, vd '12,77'
+│   │      `p` cuối = print (in ra) dòng trong dải đó
+│   └─ ⭐ -n: TẮT chế độ tự in mọi dòng của sed.
+│      KHÔNG có -n thì sed in TẤT CẢ các dòng, cộng thêm in LẶP LẠI dải đã chọn
+│      → file đích có nội dung thừa và lặp. Đây là cờ dễ quên nhất của sed
+└─ Đặt file ở /root/ chứ KHÔNG ghi đè /etc/kubernetes/kubeadm-config.yaml:
+   file gốc là bản ghi lịch sử của cluster, không được sửa
+```
+</details>
+
+**0t.4 — Kiểm file vừa tách: đúng 1 document, có đủ 18 `certSANs`**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+grep -c '^---\|^kind:' /root/cluster-config-renew.yaml
+```
+
+<details>
+<summary>Cách đọc</summary>
+
+```
+KỲ VỌNG: 1  (đúng một dòng `kind: ClusterConfiguration`, KHÔNG có dấu `---` nào)
+• Ra 2+ → cắt lẫn document khác, làm lại 0t.3 với dải dòng hẹp hơn
+• Ra 0  → cắt trượt, không có kind nào, làm lại
+```
+</details>
+
+```
+grep -A20 'certSANs' /root/cluster-config-renew.yaml
+```
+
+<details>
+<summary>Cách đọc</summary>
+
+```
+KỲ VỌNG: đủ 18 entry, giống hệt output 3.6. ⭐ SOI KỸ 3 entry sống còn:
+  - lb-apiserver.kubernetes.local
+  - 10.208.137.68
+  - 172.16.128.1
+Thiếu bất kỳ entry nào → cắt sai → làm lại 0t.3, KHÔNG renew
+```
+</details>
+
+**0t.5 — Kiểm kubeadm parse được file mới (thử nghiệm KHÔ, không sửa gì)**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+kubeadm certs renew apiserver --config /root/cluster-config-renew.yaml --dry-run
+```
+
+<details>
+<summary>Giải nghĩa lệnh — ⭐ bước an toàn quan trọng nhất</summary>
+
+```
+kubeadm certs renew apiserver --config /root/cluster-config-renew.yaml --dry-run
+│                   │          │                                       │
+│                   │          │                                       └─ ⭐⭐ CHẠY THỬ:
+│                   │          │          kubeadm làm MỌI thứ như thật nhưng ghi cert ra
+│                   │          │          THƯ MỤC TẠM, KHÔNG đụng /etc/kubernetes/pki
+│                   │          └─ file vừa tách ở 0t.3
+│                   └─ chỉ renew MỘT cert `apiserver` thay vì `all` — đủ để kiểm parse,
+│                      phạm vi hẹp nhất có thể
+└─ ⭐ VÌ SAO BƯỚC NÀY QUÝ: kiểm được kubeadm CÓ ĐỌC ĐƯỢC file mới không, mà KHÔNG
+   phải renew thật. Nếu file vẫn sai, lỗi hiện ra ngay ở đây — cert thật còn nguyên vẹn.
+   ĐỌC KẾT QUẢ:
+   • In đường dẫn thư mục tạm + "certificate ... renewed" → ✅ file OK, sang GĐ1
+   • Lỗi `unknown kind` / `failed to unmarshal` → file vẫn sai, quay lại 0t.3
+   • ⚠️ v1.23 có thể KHÔNG hỗ trợ --dry-run cho `certs renew`: nếu báo
+     `unknown flag: --dry-run` thì bỏ qua bước này, dựa vào 0t.4 + so SAN ở GĐ3
+```
+</details>
+
+---
+
 #### GIAI ĐOẠN 1 — Backup (BẮT BUỘC, chạy trên CẢ 3 node trước khi renew node đầu tiên)
 
 > Backup cả 3 node **trước**, không backup từng node ngay trước khi renew nó.
@@ -1434,16 +1695,18 @@ tar tzf <file> | head -20
 > 🔴 Node 49/50 làm **sau**, khi node 48 đã verify xong.
 
 ```
-kubeadm certs renew all --config /etc/kubernetes/kubeadm-config.yaml
+kubeadm certs renew all --config /root/cluster-config-renew.yaml
 ```
 
 <details>
 <summary>Giải nghĩa lệnh — ⭐ LỆNH QUAN TRỌNG NHẤT CẢ QUY TRÌNH</summary>
 
 ```
-kubeadm certs renew all --config /etc/kubernetes/kubeadm-config.yaml
+kubeadm certs renew all --config /root/cluster-config-renew.yaml
 │       │     │     │    │
-│       │     │     │    └─ ⭐⭐ CỜ SỐNG CÒN. Xem giải thích bên dưới
+│       │     │     │    └─ ⭐⭐ CỜ SỐNG CÒN + ⚠️ FILE ĐÃ TÁCH ở GĐ0-ter,
+│       │     │     │       KHÔNG phải /etc/kubernetes/kubeadm-config.yaml gốc
+│       │     │     │       (file gốc có 4 document, v1.23 parse không được — output 3.11)
 │       │     │     └─ renew MỌI cert: apiserver, apiserver-kubelet-client,
 │       │     │        front-proxy-client, + cert nhúng trong admin.conf /
 │       │     │        controller-manager.conf / scheduler.conf
@@ -1866,8 +2129,8 @@ dừng lại, báo cáo, xử lý node 48 riêng. **Tuyệt đối không** ti�
 | Cert của cụm **etcd external** cũng có thể sắp/đã hết hạn — sự cố riêng biệt chưa kiểm tra | 🟡 TB | Sau khi khôi phục control-plane, xác định endpoint etcd và kiểm hạn cert phía đó |
 | ~~Restart nhiều master cùng lúc → mất quorum etcd~~ | 🟢 **Hạ từ 🔴** | etcd **external** (output 3.4) ⇒ không có quorum trên master để mất. Vẫn giữ tuần tự 48→49→50 để còn đường rollback nếu cert mới sai SAN |
 | Node 49/50 có thể có tình trạng cert khác 48 (chưa kiểm tra) | 🟡 TB | Chạy `check-expiration` độc lập trên từng node trước khi thao tác |
-| 🔴 **Registry nội bộ `10.60.129.132:8090` có thể không truy cập được khi restart** → kubelet không kéo được image → static pod không lên | 🟠 Cao | Kiểm image còn trong cache cục bộ **trước khi** restart (mục 3.11). Nếu image đã có sẵn, kubelet dùng cache, không cần registry |
-| v1.23 EOL: cờ `--config` của `kubeadm certs renew` kém ổn định hơn bản mới, có thể bỏ qua `certSANs` | 🟠 Cao | Kiểm cấu trúc file config (3.11); **bắt buộc** so SAN ở GĐ3 trước khi restart |
+| ~~Registry nội bộ không truy cập được khi restart~~ | ⚪ **Đã loại bỏ (node 48)** | ✅ Output 3.11: image `kube-apiserver:v1.23.2` **có trong cache cục bộ** ⇒ kubelet không cần gọi registry. ⚠️ Nên kiểm lại tương tự trên 49/50 |
+| 🔴 **`--config` trỏ file gốc 4-document → kubeadm v1.23 rơi về default → cert mất SAN → toàn cụm hỏng** | 🔴 **Cao — đã xác nhận** | ✅ Output 3.11. Gỡ bằng GĐ0-ter (tách file). ⚠️ Nguy hiểm vì kubeadm có thể **im lặng** bỏ qua, vẫn báo "renewed" — chỉ `diff` SAN ở GĐ3 mới lộ ra |
 | Không có snapshot etcd gần đây để rollback nếu hỏng | 🟡 **Hạ từ 🔴** | etcd external ⇒ việc renew cert control-plane **không đụng tới dữ liệu etcd**. Backup PKI (mục Ngắn hạn) mới là bản lùi cần thiết |
 | Gián đoạn API server lúc restart static pod | 🟡 TB | Thực hiện trong cửa sổ bảo trì đã thống nhất với quản lý |
 | Worker node tắt lâu ngày, kubelet cert hết hạn không tự rotate được | 🟢 Thấp | Kiểm tra sau khi control-plane khôi phục; node nào hỏng thì join lại |
