@@ -35,13 +35,17 @@ cluster HA hoạt động ổn định, **không làm mất quorum etcd và khô
 | Node phát hiện lỗi | `vrp-kubeengine04` (worker), user `app` | Output 3.0 |
 | ~~IP nghi VIP 10.208.216.4~~ | ❌ **LOẠI BỎ — thuộc cụm khác, không liên quan** | Kiên đính chính 2026-08-19 |
 | ⭐ **Control-plane endpoint** | **`https://lb-apiserver.kubernetes.local:6443`** — là **DNS name**, không phải IP | ✅ Output 3.0 |
-| Công cụ dựng cluster | ❓ **nghi Kubespray** — `lb-apiserver.kubernetes.local` là tên mặc định của Kubespray. Bên dưới vẫn là kubeadm | Suy luận từ tên endpoint — **chưa xác minh** |
+| Công cụ dựng cluster | ❓ **nghi Kubespray** — tên endpoint là mặc định Kubespray. **Nhưng dùng LB tập trung, không phải localhost-LB mặc định** ⇒ có tuỳ biến | Suy luận — **chưa xác minh** |
 | Công cụ quản trị cert | `kubeadm` (lệnh `certs check-expiration` chạy được) | Output 3.2 |
 | ✅ **Kiến trúc etcd** | **EXTERNAL** — không có `etcd.yaml` trong manifests | ✅ Output 3.4 |
 | Ngày dựng cluster | **06/07/2023** (mtime `kubeadm-config.yaml`) | ✅ Output 3.3 |
 | Lần sửa apiserver gần nhất | **18/09/2024** — ❓ ai sửa, sửa gì chưa rõ | ✅ Output 3.4 (mtime) |
 | Service CIDR | `172.16.128.0/x` (ClusterIP svc kubernetes = `172.16.128.1`) — **tùy biến**, không phải mặc định | ✅ Output 3.5 |
-| ⚠️ IP lạ trong SAN | **`10.208.137.68`** — không thuộc master 48-50 lẫn worker 51-55 | ✅ Output 3.5 — ❓ vai trò chưa rõ |
+| ✅ **VIP / LB endpoint** | **`10.208.137.68`** = `lb-apiserver.kubernetes.local`. **LB TẬP TRUNG**, không phải localhost-LB | ✅ Output 3.7 |
+| Cơ chế LB | ❓ keepalived VIP nổi trên master, hay LB ngoài? Chưa rõ | Xác định bằng lệnh A6 |
+| Cluster CIDR (pod) | `172.16.0.0/17` | ✅ Output 3.6 |
+| Service CIDR | `172.16.128.0/17` | ✅ Output 3.6 |
+| Cluster domain | ❓ khai `.vrp` trong config nhưng cert dùng `cluster.local` | Output 3.6 — cần làm rõ |
 | Người dựng cụm | ❓ **Không phải Kiên** (nhân viên mới, phụ trách deploy service). Cần hỏi sếp nếu cần | Kiên xác nhận |
 | Ứng dụng bị ảnh hưởng | RAGFlow `v0.26.4`, namespace `ragflow`, deploy bằng Helm | Output 3.0 |
 | User thao tác | worker: `app` / master: `vt_admin` → `su` sang `root` | Screenshot |
@@ -55,10 +59,11 @@ cluster HA hoạt động ổn định, **không làm mất quorum etcd và khô
 | 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | 🔶 **OPEN** | `kubeadm certs renew` bằng CA còn hạn → restart static pod. Lần lượt 48→49→50 |
 | 2 | `kubectl` không chạy được dưới user `root` (thiếu kubeconfig) | 🟡 TB | 🔶 **OPEN** | Copy `admin.conf` → `~/.kube/config` **sau khi** renew xong |
 | 3 | ~~Toàn bộ PKI etcd báo `!MISSING!`~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.4: không có `etcd.yaml` ⇒ **etcd external** ⇒ `!MISSING!` chỉ là cosmetic |
-| 4 | `kubeadm` fallback default config → **cert mới có thể mất SAN `lb-apiserver.kubernetes.local`** | 🔴 **Cao (nâng từ 🟠)** | 🔶 **OPEN** | Đã xác định cụ thể nhờ output 3.0. **BẮT BUỘC** renew kèm `--config`, cấm dùng lệnh trần |
+| 4 | `kubeadm` fallback default config → cert mới mất SAN | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | ✅ Output 3.6 xác nhận `kubeadm-config.yaml` còn đúng ⇒ renew **kèm `--config /etc/kubernetes/kubeadm-config.yaml`**. Cấm lệnh trần |
 | 5 | Không có cảnh báo trước khi cert hết hạn | 🟡 TB | 🔶 **OPEN** | Dựng `x509-certificate-exporter` + alert trước 30 ngày |
 | 6 | RAGFlow `v0.26.4` chưa upgrade được (việc gốc ban đầu) | 🟢 Thấp | 🔶 **OPEN** — bị chặn bởi #1 | Chạy lại `helm upgrade` sau khi cluster khôi phục |
-| 7 | `kubeadm-config.yaml` (2023) có thể lỗi thời so với apiserver manifest (2024) | 🟠 Cao | 🔶 **OPEN** | So `certSANs` trong file với SAN thật ở output 3.5 trước khi dùng renew |
+| 7 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.6: `certSANs` khớp cert đang chạy ⇒ **dùng được `--config`** |
+| 8 | **LB tập trung `.68` — chưa rõ có health-check loại node đang restart không** | 🟠 Cao | 🔶 **OPEN** | Xác minh trước khi restart master (lệnh A6/A7) |
 
 ---
 
@@ -104,10 +109,11 @@ Unable to connect to the server: tls: failed to verify certificate: x509: certif
 - ⭐ **Control-plane endpoint là `https://lb-apiserver.kubernetes.local:6443`** — một **DNS name**,
   không phải IP node. Đây là thông tin **quyết định** cho bước renew: SAN của cert apiserver
   **bắt buộc** phải chứa tên này, nếu không toàn cụm sẽ hỏng sau khi renew.
-- Tên `lb-apiserver.kubernetes.local` là **giá trị mặc định của Kubespray**. Kubespray dựng HA
-  bằng nginx/HAProxy chạy cục bộ trên **mỗi** node, listen `127.0.0.1:6443` rồi map hostname này
-  vào `/etc/hosts` từng node → mỗi node tự LB sang 3 master, **không dùng VIP dùng chung**.
-  ❓ chưa xác minh, nhưng khớp với việc `kubeadm` vẫn dùng được (Kubespray dùng kubeadm làm engine).
+- Tên `lb-apiserver.kubernetes.local` là **giá trị mặc định của Kubespray** ⇒ nghi cụm dựng bằng
+  Kubespray (bên dưới vẫn là kubeadm — Kubespray dùng kubeadm làm engine).
+  ⚠️ **Ghi chú bổ sung sau output 3.7:** ban đầu đã suy tiếp rằng cụm dùng **localhost-LB**
+  (mặc định của Kubespray). **Suy luận đó SAI** — `/etc/hosts` trỏ tới VIP `10.208.137.68`,
+  tức **LB tập trung**. Xem Bài học #11.
 - **Mốc hết hạn chính xác: `2026-08-18T12:02:51Z`** — chi tiết hơn bảng `check-expiration`
   (chỉ có `11:53 UTC`). Chênh ~10 phút là bình thường, cert được `kubeadm init` sinh tuần tự.
 - `current time 2026-08-19T08:49:32+07:00` ⇒ node chạy **UTC+7 và đồng hồ đúng**.
@@ -346,23 +352,166 @@ Signature Algorithm: sha256WithRSAEncryption
 | DNS hostname | `vrp-kubeengine01/02/03` + biến thể `.vrp` | 3 master. **Không có `04`, `05`** — bình thường, worker không cần trong SAN apiserver |
 | IP ClusterIP | `172.16.128.1` | ClusterIP của svc `kubernetes` ⇒ service CIDR là `172.16.128.0/x` (**không** phải mặc định `10.96.0.0/12` của kubeadm, cũng không phải `10.233.0.0/18` của Kubespray) |
 | IP master | `10.208.137.48`, `.49`, `.50` | 3 master, khớp Kiên xác nhận |
-| IP loopback | `127.0.0.1` | Khớp cơ chế LB cục bộ |
+| IP loopback | `127.0.0.1` | Truy cập apiserver từ chính node. **Entry chuẩn của mọi cluster** — không nói gì về cơ chế LB (xem Bài học #11) |
 | ⚠️ IP lạ | **`10.208.137.68`** | **Không thuộc master 48-50, cũng không thuộc worker 51-55** |
 
 **Đọc được gì:**
 
 - ✅ **Xác nhận `lb-apiserver.kubernetes.local` có trong SAN** — khớp hoàn toàn với output 3.0.
   Rủi ro ở issue #4 là **thật**: renew trần sẽ làm mất entry này.
-- ✅ **Xác nhận cơ chế LB cục bộ**: SAN có cả `127.0.0.1` **và** đủ 3 IP master. Đây là chữ ký của
-  kiểu "nginx cục bộ trên mỗi node proxy sang 3 master" — client nối `127.0.0.1:6443`, nginx
-  chuyển tiếp tới một trong 3 IP master, cert phải hợp lệ cho **cả hai đầu**.
-- ⚠️ **`10.208.137.68` — chưa rõ là gì.** Ba khả năng: (a) VIP keepalived, (b) node cũ đã gỡ,
-  (c) IP dự phòng khai sẵn lúc dựng. ❓ **chưa xác minh**.
-  ⇒ **Không cần biết nó là gì để renew** — chỉ cần **giữ nguyên** trong cert mới.
+- ⚠️ ~~Xác nhận cơ chế LB cục bộ: SAN có cả `127.0.0.1` và đủ 3 IP master~~
+  ❌ **KẾT LUẬN NÀY SAI — đã bác bỏ bởi output 3.7.** `127.0.0.1` gần như **luôn** có trong SAN
+  apiserver của mọi cluster (để truy cập từ chính node), **không** phải chữ ký của localhost-LB.
+  Cơ chế LB thật chỉ đọc được từ `/etc/hosts`. Xem Bài học #11.
+- ✅ **`10.208.137.68`** — đã xác định ở output 3.7: đây là **VIP / LB endpoint**
+  (`/etc/hosts` map `lb-apiserver.kubernetes.local` → IP này). Bắt buộc giữ nguyên trong cert mới.
 - Service CIDR `172.16.128.0/x` là **tùy biến**, không phải mặc định của kubeadm lẫn Kubespray.
   ⇒ Cluster này có cấu hình riêng ⇒ **càng khẳng định không được renew bằng default config.**
 - ⇒ **Loại trừ được:** cert hiện tại **không hỏng về nội dung** — SAN đầy đủ, thuật toán
   `sha256WithRSAEncryption` bình thường. Vấn đề **duy nhất** là hết hạn.
+
+---
+
+### 3.6 ⭐ Đối chiếu `certSANs` trong file config với SAN thật của cert
+
+**Node: 10.208.137.48 — `root`**
+
+```
+grep -A30 'certSANs' /etc/kubernetes/kubeadm-config.yaml
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `-A30` | In **30 dòng SAU** dòng khớp. **Vì sao 30 mà không phải 2** như lệnh `openssl` ở 3.5: `openssl` in SAN thành **một dòng dài** (18 entry cách nhau bởi dấu phẩy) nên `-A2` là đủ; còn YAML thì **mỗi entry một dòng** (`- ten`) — dùng `-A2` sẽ cắt mất 16 entry, đọc thiếu, soạn config sai |
+| `'certSANs'` | Khoá YAML trong `ClusterConfiguration.apiServer` chứa danh sách SAN **khai thủ công** |
+
+**Output:**
+
+```
+  certSANs:
+  - kubernetes
+  - kubernetes.default
+  - kubernetes.default.svc
+  - kubernetes.default.svc.vrp
+  - 172.16.128.1
+  - localhost
+  - 127.0.0.1
+  - vrp-kubeengine01
+  - vrp-kubeengine02
+  - vrp-kubeengine03
+  - lb-apiserver.kubernetes.local
+  - 10.208.137.68
+  - 10.208.137.48
+  - 10.208.137.49
+  - 10.208.137.50
+  - vrp-kubeengine01.vrp
+  - vrp-kubeengine02.vrp
+  - vrp-kubeengine03.vrp
+  timeoutForControlPlane: 5m0s
+controllerManager:
+  extraArgs:
+    node-monitor-grace-period: 40s
+    node-monitor-period: 5s
+    cluster-cidr: "172.16.0.0/17"
+    service-cluster-ip-range: "172.16.128.0/17"
+    node-cidr-mask-size: "24"
+    profiling: "False"
+    terminated-pod-gc-threshold: "12500"
+    bind-address: 0.0.0.0
+    leader-elect-lease-duration: 15s
+```
+
+**Đối chiếu 18 entry file config ↔ SAN cert thật (output 3.5):**
+
+| # | `certSANs` trong file (2023) | Có trong cert đang chạy? |
+|---|---|---|
+| 1-3 | `kubernetes`, `kubernetes.default`, `kubernetes.default.svc` | ✅ |
+| 4 | **`kubernetes.default.svc.vrp`** | ⚠️ **KHÔNG thấy** trong output 3.5 — xem ghi chú dưới |
+| 5 | `172.16.128.1` | ✅ |
+| 6-7 | `localhost`, `127.0.0.1` | ✅ |
+| 8-10 | `vrp-kubeengine01`, `02`, `03` | ✅ |
+| 11 | `lb-apiserver.kubernetes.local` | ✅ |
+| 12 | `10.208.137.68` | ✅ |
+| 13-15 | `10.208.137.48`, `.49`, `.50` | ✅ |
+| 16-18 | `vrp-kubeengine01.vrp`, `02.vrp`, `03.vrp` | ✅ |
+| — | `kubernetes.default.svc.cluster.local` | ✅ có trong cert, **KHÔNG có** trong file config |
+
+**Đọc được gì:**
+
+- ✅ **File config `kubeadm-config.yaml` (2023) KHỚP với cert đang chạy** — 17/18 entry trùng khít,
+  gồm cả `lb-apiserver.kubernetes.local` và IP `10.208.137.68`.
+  ⇒ **Nghi vấn "file 2023 lỗi thời" (issue #7) — BÁC BỎ.** Lần sửa `kube-apiserver.yaml` ngày
+  18/09/2024 **không đụng tới `certSANs`**.
+  ⇒ **Dùng được `--config /etc/kubernetes/kubeadm-config.yaml` để renew.** Đây là kết quả tốt nhất
+  có thể — không phải tự soạn file config.
+- ⚠️ **Một cặp entry lệch chiều nhau (không phải lỗi, nhưng phải biết):**
+
+  | Entry | File config | Cert thật |
+  |---|---|---|
+  | `kubernetes.default.svc.vrp` | ✅ có | ❌ không thấy ở output 3.5 |
+  | `kubernetes.default.svc.cluster.local` | ❌ không có | ✅ có |
+
+  Giải thích: kubeadm **tự động** thêm `kubernetes.default.svc.<clusterDomain>` vào SAN, độc lập
+  với `certSANs` khai trong file. Cluster domain thật của cụm này là `.vrp` (khớp hostname
+  `vrp-kubeengine01.vrp`), nhưng cert lại chứa `cluster.local` — giá trị **mặc định** của kubeadm.
+  ⇒ Suy ra: lần sinh cert gần nhất, kubeadm dùng `clusterDomain` mặc định `cluster.local`, còn
+  entry `.vrp` khai thủ công trong file **có thể đã không được áp dụng**.
+  ⇒ **Hệ quả khi renew kèm `--config`:** cert mới **có thể có thêm** `kubernetes.default.svc.vrp`.
+  Đây là **thêm** SAN, không phải mất — **vô hại**, nhưng phải biết trước để không hoảng khi so sánh.
+  ❓ **Chưa xác minh:** output 3.5 có thể bị cắt khi gõ lại từ screenshot. Cần kiểm lại bằng lệnh
+  đếm chính xác (mục A1-bis).
+- **Thông tin nền thu được thêm** (ngoài phạm vi cert nhưng đáng ghi):
+
+  | Tham số | Giá trị | Ý nghĩa |
+  |---|---|---|
+  | `cluster-cidr` | `172.16.0.0/17` | Dải IP cấp cho **pod** |
+  | `service-cluster-ip-range` | `172.16.128.0/17` | Dải IP cấp cho **service** — khớp ClusterIP `172.16.128.1` ở output 3.5 |
+  | `node-cidr-mask-size` | `24` | Mỗi node được cấp `/24` = 254 pod/node |
+  | `terminated-pod-gc-threshold` | `12500` | Ngưỡng dọn pod đã kết thúc — **cao bất thường** (mặc định 12500 là giá trị k8s mặc định, nhưng đáng chú ý) |
+  | `timeoutForControlPlane` | `5m0s` | Thời gian kubeadm chờ control-plane sẵn sàng |
+
+---
+
+### 3.7 🔴 Xác định cơ chế LB — phát hiện quan trọng, lật ngược giả định trước đó
+
+**Node: 10.208.137.48 — `root`**
+
+```
+grep lb-apiserver /etc/hosts
+```
+
+| Cờ / Thành phần | Ý nghĩa |
+|---|---|
+| `/etc/hosts` | File map hostname → IP ở **tầng OS**, được tra **TRƯỚC** DNS. Đây là nơi Kubespray ghi ánh xạ cho endpoint LB |
+| (không dùng cờ) | Chỉ cần khớp chuỗi đơn giản, không cần regex |
+
+**Output:**
+
+```
+10.208.137.68  lb-apiserver.kubernetes.local
+```
+
+**Đọc được gì:**
+
+- 🔴 ⭐ **`10.208.137.68` LÀ VIP / LB TẬP TRUNG** — ẩn số lớn nhất còn lại đã có lời giải.
+  Không phải node cũ, không phải IP dự phòng.
+- ❌ **GIẢ ĐỊNH TRƯỚC ĐÓ SAI:** đã dự đoán Kubespray dùng **localhost-LB**
+  (`127.0.0.1 lb-apiserver.kubernetes.local`, nginx cục bộ mỗi node). Thực tế cụm này dùng
+  **LB tập trung** tại `.68`. Xem Bài học #11.
+- ⭐ **Hệ quả TRỰC TIẾP tới kế hoạch restart** — khác hẳn kịch bản localhost-LB:
+
+  | | Localhost-LB (đã dự đoán sai) | **LB tập trung (thực tế)** |
+  |---|---|---|
+  | Đường đi của client | node → nginx cục bộ → 3 master | node → **`.68`** → 3 master |
+  | Restart master 48 | Node khác **tự failover** sang 49/50, không ai mất kết nối | **Phụ thuộc hoàn toàn** vào health-check của `.68` |
+  | Rủi ro | Thấp | **Nếu `.68` không health-check → 1/3 request rơi vào node đang restart** |
+
+  ⇒ **Việc mới bắt buộc:** phải xác minh `.68` có health-check không **trước khi** restart master.
+- ❓ **Chưa xác minh:** `.68` là keepalived VIP (nổi trên chính 3 master) hay LB vật lý/F5 riêng.
+  Phân biệt được bằng `ip addr | grep 137.68` trên từng master — xem mục A6.
+  Khác biệt quan trọng: nếu là **keepalived VIP nổi trên master**, thì restart node đang giữ VIP
+  sẽ làm VIP nhảy sang node khác (~vài giây gián đoạn); nếu là **LB ngoài**, master restart không
+  ảnh hưởng VIP.
 
 ---
 
@@ -540,7 +689,8 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
    | Dấu hiệu | Kết luận | Độ chắc |
    |---|---|---|
    | Endpoint tên `lb-apiserver.kubernetes.local` | **Kubespray** — đây là giá trị mặc định của biến `apiserver_loadbalancer_domain_name`. Kubeadm thuần **không bao giờ** tự sinh tên này | 🟠 Mạnh nhưng gián tiếp |
-   | SAN có **cả** `127.0.0.1` **và** đủ 3 IP master | Kiểu **localhost-LB**: nginx cục bộ mỗi node → 3 master. Không dùng VIP dùng chung | 🟠 Mạnh |
+   | ~~SAN có `127.0.0.1` + 3 IP master~~ | ~~Kiểu localhost-LB~~ | ❌ **DẤU HIỆU SAI — đã bác bỏ.** `127.0.0.1` gần như **luôn** có trong SAN apiserver của mọi cluster, không nói gì về cơ chế LB. Xem Bài học #11 |
+   | **`/etc/hosts` map endpoint → IP nào** | ⭐ **Đây mới là dấu hiệu đúng** về cơ chế LB: `127.0.0.1` = localhost-LB, IP khác = LB tập trung | ✅ **Chắc chắn** |
    | Tồn tại `/etc/kubernetes/kubeadm-config.yaml` | Công cụ tự động ghi config ra đĩa (kubeadm thuần thường không để lại) | 🟡 Vừa |
    | Hostname theo mẫu `vrp-kubeengine01..05` | Đặt tên tự động theo inventory | 🟡 Vừa |
    | Service CIDR `172.16.128.0/x` | **Tùy biến** — không phải mặc định của kubeadm (`10.96.0.0/12`) lẫn Kubespray (`10.233.0.0/18`) ⇒ có người khai riêng | ✅ Chắc |
@@ -564,6 +714,46 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
     **Rút ra:** đừng chỉ hỏi "file config có tồn tại không" — phải hỏi **"nó còn khớp thực tế
     không"**. Một `ls -l` xem mtime tốn 2 giây nhưng lộ ra rủi ro mà `cat` file không cho thấy.
     Nguồn sự thật cuối cùng là **cert đang chạy**, không phải file config.
+
+    **⚠️ Cập nhật sau output 3.6:** nghi vấn này **hoá ra là báo động giả** — `certSANs` trong file
+    2023 khớp khít cert đang chạy. Lần sửa 09/2024 không đụng tới SAN.
+    Nhưng **quy trình kiểm tra vẫn đúng**: chi phí kiểm là 1 lệnh `grep`, còn chi phí bỏ qua là
+    cert thiếu SAN làm hỏng toàn cụm. Báo động giả ở đây là **kết quả chấp nhận được**, không phải
+    lỗi suy luận.
+
+11. **🔴 GIẢ ĐỊNH SAI ĐÃ MẮC: đoán cơ chế LB từ việc nhận diện công cụ.**
+
+    **Đã kết luận sai:** "Kubespray dựng HA bằng **localhost-LB** — nginx cục bộ mỗi node,
+    `/etc/hosts` map `lb-apiserver.kubernetes.local → 127.0.0.1`". Đã ghi vào file ở output 3.0 và
+    3.5, còn dùng nó để lập luận rằng "SAN có cả `127.0.0.1` lẫn 3 IP master là chữ ký của
+    localhost-LB".
+
+    **Cái làm lộ ra là sai:** output 3.7 —
+
+    ```
+    10.208.137.68  lb-apiserver.kubernetes.local
+    ```
+
+    Trỏ tới **VIP tập trung**, không phải `127.0.0.1`.
+
+    **Vì sao sai:** localhost-LB đúng là **mặc định** của Kubespray, nhưng Kubespray **hỗ trợ cả
+    hai** chế độ (`loadbalancer_apiserver_localhost: true/false`). Cụm này chọn LB tập trung.
+    Sai lầm là **suy từ "mặc định của công cụ" ra "cấu hình thực tế"** — trong khi việc nhận diện
+    công cụ (Bài học #9) bản thân nó cũng mới chỉ là suy luận gián tiếp. **Hai tầng suy đoán chồng
+    lên nhau.**
+
+    Ngoài ra, lập luận "SAN có `127.0.0.1` là chữ ký localhost-LB" là **suy diễn ngược sai**:
+    `127.0.0.1` gần như **luôn** có trong SAN apiserver của mọi cluster (để truy cập từ chính node),
+    không nói lên gì về cơ chế LB.
+
+    **Hệ quả thực tế nếu không phát hiện:** đã kết luận "restart master 48 thì node khác tự
+    failover, rủi ro thấp". Với LB tập trung, điều đó **chỉ đúng nếu `.68` có health-check**.
+    Không có health-check thì 1/3 request rơi vào node đang restart → **gián đoạn thật trong lúc
+    thao tác**.
+
+    **Rút ra:** cấu hình thực tế phải đọc từ **file trên node**, không suy từ mặc định của công cụ.
+    Với LB/HA, `/etc/hosts` và cấu hình proxy là nguồn sự thật — kiểm **trước** khi lập kế hoạch
+    restart, không phải sau.
 
 ---
 
@@ -592,117 +782,89 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 - [x] ~~Tìm `kubeadm-config.yaml`~~ → ✅ **tồn tại, nhưng mtime 2023 — cần đối chiếu**
 - [x] ~~Xác định control-plane endpoint~~ → ✅ **`lb-apiserver.kubernetes.local:6443`** (output 3.0)
 
-### Bước kế tiếp — đối chiếu config trước khi renew (vẫn chỉ đọc, chạy trên 48)
+### Bước kế tiếp — ✅ đã xong phần config, còn phần LB
 
-- [ ] **A1** — ⭐ Đọc `certSANs` trong file config, so với SAN thật ở output 3.5
+- [x] ~~A1: đối chiếu `certSANs` với SAN cert~~ → ✅ **KHỚP** (output 3.6) ⇒ dùng được `--config`
+- [x] ~~A4: xác nhận cơ chế LB~~ → 🔴 **LB TẬP TRUNG tại `10.208.137.68`** (output 3.7), không phải localhost-LB
+
+### 🔴 Việc MỚI phát sinh — phải làm trước khi restart master
+
+> Xuất phát từ output 3.7. Với LB tập trung, restart master **không còn** là thao tác cục bộ.
+
+- [ ] **A6** — ⭐ VIP `.68` là keepalived nổi trên master, hay LB ngoài?
+
+  **Chạy trên cả 3 master 48, 49, 50 (lần lượt):**
 
   ```
-  grep -A30 'certSANs' /etc/kubernetes/kubeadm-config.yaml
+  ip addr | grep 137.68
   ```
 
   <details>
   <summary>Giải nghĩa</summary>
 
   ```
-  grep -A30 'certSANs' /etc/kubernetes/kubeadm-config.yaml
-  │    │      │         └─ file Kubespray ghi ra khi dựng cluster (06/07/2023)
-  │    │      └─ khoá YAML chứa danh sách SAN bổ sung cho cert apiserver
-  │    └─ -A30: in 30 dòng SAU dòng khớp. Chọn 30 vì SAN dạng YAML mỗi entry MỘT dòng
-  │       (`- ten`), 18 entry + lề an toàn. Dùng -A2 như lệnh openssl sẽ CẮT MẤT danh sách
-  └─ ⭐ VIỆC PHẢI LÀM: đối chiếu từng dòng với 18 entry ở output 3.5.
-     • Khớp đủ 18       → dùng --config file này để renew, AN TOÀN
-     • THIẾU entry nào  → file 2023 đã lỗi thời (khớp nghi vấn mtime 2024)
-                          → PHẢI tự soạn file config mới, bổ sung entry thiếu
-     ⚠️ Chú ý riêng 10.208.137.68 — nếu file config KHÔNG có IP này thì gần như
-        chắc chắn nó được thêm vào lần sửa 09/2024
+  ip addr | grep 137.68
+  │  │      └─ lọc ra dòng chứa IP VIP. Dùng grep thay vì `ip addr show to 10.208.137.68/32`
+  │  │         vì cú pháp ngắn, dễ gõ tay qua VDI, và vẫn đủ chính xác
+  │  └─ liệt kê TẤT CẢ địa chỉ IP trên MỌI interface của node (kể cả IP thứ cấp/VIP)
+  └─ ĐỌC KẾT QUẢ — chạy đủ 3 master rồi so:
+     • ĐÚNG 1 node có IP .68 → keepalived VIP đang NỔI trên node đó
+       ⇒ 🔴 Node giữ VIP phải restart SAU CÙNG. Restart nó làm VIP nhảy sang node khác,
+         gián đoạn vài giây. Ghi rõ node nào đang giữ VIP trước khi thao tác
+     • KHÔNG node nào có → LB nằm NGOÀI cụm (F5/HAProxy riêng)
+       ⇒ master restart không ảnh hưởng VIP, nhưng phải kiểm health-check của LB đó
+     • NHIỀU node cùng có → split-brain keepalived, sự cố riêng, DỪNG và báo
   ```
   </details>
 
-- [ ] **A2** — Xem toàn bộ cấu hình cluster để soạn file renew cho đúng
+- [ ] **A7** — Có keepalived/haproxy/nginx chạy trên master không?
 
   ```
-  cat /etc/kubernetes/kubeadm-config.yaml
-  ```
-
-  <details>
-  <summary>Giải nghĩa</summary>
-
-  ```
-  cat /etc/kubernetes/kubeadm-config.yaml
-  │   └─ file chỉ 4463 bytes (~120 dòng) — đủ ngắn để đọc hết một lần,
-  │      không cần phân trang
-  └─ CẦN SOI các khoá:
-     • kind: ClusterConfiguration     → phần kubeadm dùng khi renew
-     • controlPlaneEndpoint           → phải là lb-apiserver.kubernetes.local:6443
-     • apiServer.certSANs             → danh sách SAN (đối chiếu A1)
-     • etcd.external.endpoints        → xác nhận cụm etcd ngoài nằm ở đâu
-     • networking.serviceSubnet       → phải khớp 172.16.128.0/x (từ output 3.5)
-     • kubernetesVersion              → phải khớp version đang chạy, LỆCH LÀ NGUY HIỂM
-  ```
-  </details>
-
-- [ ] **A3** — Xác nhận version kubeadm khớp version cluster
-
-  ```
-  kubeadm version -o short
+  systemctl list-units --type=service --state=running | grep -Ei 'keepalived|haproxy|nginx'
   ```
 
   <details>
   <summary>Giải nghĩa</summary>
 
   ```
-  kubeadm version -o short
-  │               │  └─ chỉ in chuỗi version (vd v1.28.5) thay vì khối JSON dài
-  │               └─ -o: định dạng output. Bỏ cờ này sẽ ra JSON nhiều dòng
-  └─ ⚠️ VÌ SAO QUAN TRỌNG: kubeadm renew sinh cert theo logic của CHÍNH version nó.
-     Nếu binary kubeadm trên node đã được nâng cấp mà cluster vẫn chạy version cũ
-     (hoặc ngược lại), cert sinh ra có thể khác kỳ vọng.
-     Đối chiếu với `kubernetesVersion` trong file config (A2) và với image tag
-     trong /etc/kubernetes/manifests/kube-apiserver.yaml
-  ```
-  </details>
-
-- [ ] **A4** — Xác nhận cơ chế LB cục bộ (giải thích vì sao restart tuần tự là an toàn)
-
-  ```
-  grep lb-apiserver /etc/hosts
-  ```
-
-  <details>
-  <summary>Giải nghĩa</summary>
-
-  ```
-  grep lb-apiserver /etc/hosts
-  │                  └─ file map hostname → IP ở tầng OS, được tra TRƯỚC DNS
+  systemctl list-units --type=service --state=running | grep -Ei 'keepalived|haproxy|nginx'
+  │         │           │              │                  │    ││
+  │         │           │              │                  │    │└─ i: bỏ qua hoa/thường
+  │         │           │              │                  │    └─ E: regex mở rộng, `|` là OR
+  │         │           │              │                  └─ lọc 3 tiến trình LB phổ biến nhất
+  │         │           │              └─ chỉ unit ĐANG CHẠY, bỏ qua unit đã cài mà không bật
+  │         │           └─ chỉ loại service, bỏ mount/socket/timer cho gọn
+  │         └─ liệt kê unit systemd
   └─ ĐỌC KẾT QUẢ:
-     • "127.0.0.1 lb-apiserver.kubernetes.local"
-       ⇒ XÁC NHẬN nginx/haproxy cục bộ trên chính node này, upstream 3 master.
-         Hệ quả: restart master 48 KHÔNG làm client trên node khác mất kết nối —
-         LB cục bộ của node đó tự chuyển sang 49/50. Rất thuận lợi cho renew tuần tự
-     • trỏ tới IP thật (vd 10.208.137.68)
-       ⇒ LB tập trung → restart master phải kiểm health-check LB có loại node ra không
+     • Có keepalived → khớp kịch bản VIP nổi trên master (đối chiếu A6)
+     • Có haproxy/nginx → LB chạy ngay trên master, restart master = mất luôn 1 LB
+     • Không có gì → LB hoàn toàn ở ngoài cụm
+  Nếu node dùng container thay vì systemd: kiểm thêm bằng `crictl ps | grep -Ei 'haproxy|nginx'`
   ```
   </details>
 
-- [ ] **A5** — Làm rõ `10.208.137.68` là gì (không chặn renew, nhưng nên biết)
+- [ ] **A8** — Kiểm lại SAN cert có `kubernetes.default.svc.vrp` không (làm rõ điểm lệch ở 3.6)
 
   ```
-  ping -c 2 10.208.137.68
+  openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | grep -c 'DNS:\|IP Address:'
   ```
 
   <details>
   <summary>Giải nghĩa</summary>
 
   ```
-  ping -c 2 10.208.137.68
-  │    │  └─ gửi đúng 2 gói rồi dừng. KHÔNG có -c thì ping chạy vô hạn,
-  │    │     phải Ctrl-C — bất tiện khi thao tác qua VDI
-  │    └─ -c: count
-  └─ ĐỌC KẾT QUẢ:
-     • Có phản hồi  → IP đang sống, nhiều khả năng là VIP hoặc node còn hoạt động
-     • Không phản hồi → node cũ đã gỡ, hoặc IP dự phòng chưa dùng
-     ⚠️ DÙ KẾT QUẢ THẾ NÀO: cert mới VẪN PHẢI GIỮ IP này trong SAN.
-        Xoá đi là thay đổi hành vi cluster, ngoài phạm vi việc gia hạn cert
+  openssl ... | tr ',' '\n' | grep -c 'DNS:\|IP Address:'
+  │             │  │    │      │    │
+  │             │  │    │      │    └─ -c: chỉ ĐẾM số dòng khớp, không in nội dung
+  │             │  │    │      └─ khớp cả entry DNS lẫn IP
+  │             │  │    └─ thay bằng ký tự xuống dòng
+  │             │  └─ ký tự cần thay: dấu phẩy
+  │             └─ tr: đổi ký tự này thành ký tự khác. Ở đây tách MỘT dòng dài 18 entry
+  │                thành 18 dòng riêng → grep -c mới đếm đúng
+  └─ MỤC ĐÍCH: đếm chính xác số SAN entry, tránh sai sót do gõ lại từ screenshot.
+     • Ra 18 → khớp file config, KHÔNG có kubernetes.default.svc.vrp
+       ⇒ renew kèm --config sẽ THÊM entry này (vô hại, nhưng nên biết trước)
+     • Ra 19 → cert đã có sẵn, output 3.5 bị sót khi gõ tay
   ```
   </details>
 
@@ -715,7 +877,11 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
       → chứa `certSANs` gốc (biến `supplementary_addresses_in_ssl_keys`), là nguồn đáng tin nhất
 - [ ] **Ai sửa `/etc/kubernetes/manifests/kube-apiserver.yaml` ngày 18/09/2024, sửa gì?**
       → quyết định `kubeadm-config.yaml` (2023) còn dùng được không
-- [ ] **`10.208.137.68` là gì?** VIP, node đã gỡ, hay IP dự phòng?
+- [x] ~~**`10.208.137.68` là gì?**~~ → ✅ **VIP / LB endpoint** (output 3.7). Nhưng vẫn cần hỏi:
+- [ ] **VIP `.68` do ai quản?** keepalived trên chính 3 master, hay LB/F5 của đội hạ tầng mạng?
+      → nếu LB ngoài: **có health-check port 6443 không?** Đây là điều kiện an toàn để restart master
+- [ ] **Cluster domain là `.vrp` hay `cluster.local`?** File config khai `.vrp`, cert lại dùng
+      `cluster.local` (output 3.6). Cần biết bên nào đúng để không đổi hành vi cluster khi renew
 - [ ] **Có ai từng renew cert cụm này chưa?** Nếu có, làm bằng cách nào (kubeadm hay playbook Kubespray)
 - [ ] **Cửa sổ bảo trì** để thao tác — có gián đoạn ngắn API server khi restart
 
@@ -769,10 +935,12 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 
 | Rủi ro | Mức độ | Giảm thiểu |
 |---|---|---|
-| ⭐ **Cert mới mất SAN `lb-apiserver.kubernetes.local`** → **toàn cụm** hỏng nặng hơn hiện tại, không còn cert cũ để lùi | 🔴 **Cao — đã xác nhận, không còn là giả định** | Chụp SAN cũ (4.3) → tìm `kubeadm-config.yaml` trên đĩa (4.6) → renew **kèm `--config`** → so SAN trước/sau → chỉ restart khi SAN khớp |
+| ⭐ **Cert mới mất SAN `lb-apiserver.kubernetes.local`** → toàn cụm hỏng nặng hơn hiện tại | 🟠 **Hạ từ 🔴 — đã có cách gỡ** | ✅ Output 3.6: `kubeadm-config.yaml` còn khớp ⇒ renew **kèm `--config /etc/kubernetes/kubeadm-config.yaml`**. Vẫn so SAN trước/sau, chỉ restart khi khớp |
+| 🔴 **LB tập trung `.68` không health-check** → trong lúc restart master, request vẫn bị đẩy vào node chết | 🟠 Cao | Xác minh A6 + A7 **trước khi** restart. Nếu là keepalived: restart node giữ VIP **sau cùng** |
+| Nếu `.68` là keepalived VIP nổi trên master → restart node giữ VIP làm VIP nhảy, gián đoạn vài giây | 🟡 TB | Xác định node đang giữ VIP (A6), xếp nó **cuối** thứ tự 48→49→50 |
 | **5 worker `.51-.55` chưa được kiểm tra** — kubelet client cert có thể cũng hết hạn | 🟡 TB | Sau khi control-plane xanh, kiểm `kubelet-client-current.pem` trên từng worker |
-| ~~Là stacked etcd nhưng PKI mất thật~~ | ⚪ **Đã loại bỏ** | Output 3.4 xác nhận **etcd external**, không có `etcd.yaml`. Rủi ro này không tồn tại |
-| `kubeadm-config.yaml` (2023) lỗi thời so với apiserver manifest (2024) → renew bằng nó vẫn thiếu SAN | 🟠 Cao | Đối chiếu `certSANs` trong file với 18 entry ở output 3.5 (lệnh A1) **trước khi** dùng |
+| ~~Là stacked etcd nhưng PKI mất thật~~ | ⚪ **Đã loại bỏ** | Output 3.4: **etcd external**, không có `etcd.yaml` |
+| ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ **Đã loại bỏ** | Output 3.6: `certSANs` khớp khít cert đang chạy |
 | Cert của cụm **etcd external** cũng có thể sắp/đã hết hạn — sự cố riêng biệt chưa kiểm tra | 🟡 TB | Sau khi khôi phục control-plane, xác định endpoint etcd và kiểm hạn cert phía đó |
 | ~~Restart nhiều master cùng lúc → mất quorum etcd~~ | 🟢 **Hạ từ 🔴** | etcd **external** (output 3.4) ⇒ không có quorum trên master để mất. Vẫn giữ tuần tự 48→49→50 để còn đường rollback nếu cert mới sai SAN |
 | Node 49/50 có thể có tình trạng cert khác 48 (chưa kiểm tra) | 🟡 TB | Chạy `check-expiration` độc lập trên từng node trước khi thao tác |
