@@ -1,14 +1,19 @@
 # TRACKING — Cert K8s control-plane hết hạn
 
 > File sống. Cập nhật ngay sau mỗi lệnh chạy, không đợi cuối phiên.
-> Bắt đầu: 2026-08-19. Trạng thái tổng: 🔶 **OPEN — chưa thao tác sửa, mới chẩn đoán.**
+> Bắt đầu: 2026-08-19. Trạng thái tổng: 🔶 **OPEN — chẩn đoán XONG, quy trình renew đã soạn,
+> chưa thao tác sửa.**
+>
+> **➡️ Vào thẳng mục 7 → "⭐ QUY TRÌNH RENEW ĐẦY ĐỦ" để thực hiện.**
+> Mọi ẩn số chặn việc renew đã được giải (xem bảng "Điều kiện tiên quyết" ở đó).
 
 ---
 
 ## 1. Mục tiêu
 
 Gia hạn cert control-plane Kubernetes đã hết hạn để khôi phục truy cập `kubectl` và đảm bảo
-cluster HA hoạt động ổn định, **không làm mất quorum etcd và không làm hỏng HA qua VIP**.
+cluster HA hoạt động ổn định, **không làm cert mới thiếu SAN** (rủi ro lớn nhất — sẽ làm toàn cụm
+hỏng nặng hơn hiện tại).
 
 ### Số liệu triệu chứng ban đầu
 
@@ -57,7 +62,7 @@ cluster HA hoạt động ổn định, **không làm mất quorum etcd và khô
 
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
-| 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | 🔶 **OPEN** | `kubeadm certs renew` bằng CA còn hạn → restart static pod. Lần lượt 48→49→50 |
+| 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | 🔶 **OPEN — quy trình đã soạn** | `kubeadm certs renew all` **`--config /etc/kubernetes/kubeadm-config.yaml`** → so SAN → restart static pod. Lần lượt 48→49→50. ➡️ Xem mục 7 |
 | 2 | `kubectl` không chạy được dưới user `root` (thiếu kubeconfig) | 🟡 TB | 🔶 **OPEN** | Copy `admin.conf` → `~/.kube/config` **sau khi** renew xong |
 | 3 | ~~Toàn bộ PKI etcd báo `!MISSING!`~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.4: không có `etcd.yaml` ⇒ **etcd external** ⇒ `!MISSING!` chỉ là cosmetic |
 | 4 | `kubeadm` fallback default config → cert mới mất SAN | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | ✅ Output 3.6 xác nhận `kubeadm-config.yaml` còn đúng ⇒ renew **kèm `--config /etc/kubernetes/kubeadm-config.yaml`**. Cấm lệnh trần |
@@ -1000,41 +1005,531 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 - [ ] **Có ai từng renew cert cụm này chưa?** Nếu có, làm bằng cách nào (kubeadm hay playbook Kubespray)
 - [ ] **Cửa sổ bảo trì** để thao tác — có gián đoạn ngắn API server khi restart
 
-### Ngắn hạn — thao tác sửa (⚠️ chỉ chạy sau khi 4.1–4.5 xác nhận an toàn)
+### ⭐ QUY TRÌNH RENEW ĐẦY ĐỦ — 3 node, thực hiện tuần tự
 
-- [ ] Backup PKI + kubeconfig trên **cả 3 node**, trước khi động vào bất cứ node nào
-- [ ] Renew trên **48** → so sánh SAN mới với SAN đã chụp ở 4.3 → restart control-plane → verify
-- [ ] Chỉ khi 48 xanh hoàn toàn: lặp lại cho **49**
-- [ ] Chỉ khi 49 xanh hoàn toàn: lặp lại cho **50**
-- [ ] Copy `admin.conf` → `~/.kube/config` cho user vận hành (issue #2)
-- [ ] Kiểm tra kubelet client cert trên **5 worker `137.51 → .55`**:
+> **Trạng thái: chưa thực hiện.** Mọi output dưới đây là *kỳ vọng*, không phải kết quả thật.
+> Chạy tới đâu, dán output thật vào mục 3 tới đó (đánh số `3.10`, `3.11`...).
+>
+> **Nguyên tắc bất di bất dịch:** làm **XONG HẲN** node 48 (gồm cả verify) rồi mới sang 49;
+> xong 49 mới sang 50. **Không bao giờ** chạy song song 2 node.
 
-  ```
-  openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates
-  ```
+#### Điều kiện tiên quyết
 
-  <details>
-  <summary>Giải nghĩa</summary>
+| Điều kiện | Trạng thái | Nguồn |
+|---|---|---|
+| CA còn hạn | ✅ tới 2033 (`6y`) | Output 3.2 |
+| etcd external (không có quorum trên master để mất) | ✅ | Output 3.4 |
+| `kubeadm-config.yaml` còn khớp cert | ✅ 18/18 entry | Output 3.6 |
+| VIP ngoài cụm (restart master không đụng VIP) | ✅ | Output 3.8 + 3.9 |
+| Cửa sổ bảo trì đã thống nhất | ❓ **cần xác nhận với sếp trước khi bắt đầu** | — |
 
-  ```
-  openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates
-  │                │                     └─ symlink trỏ tới cert kubelet ĐANG dùng.
-  │                │                        Hậu tố -current là do cơ chế rotate: kubelet
-  │                │                        sinh file mới rồi đổi symlink, giữ file cũ lại
-  │                └─ PKI riêng của kubelet, KHÁC /etc/kubernetes/pki của control-plane
-  └─ -dates: in notBefore/notAfter. KHÔNG cần -text vì chỉ quan tâm hạn
-     ĐỌC KẾT QUẢ:
-     • notAfter còn hạn → kubelet đã tự rotate (rotateCertificates: true mặc định) ✔
-     • notAfter đã qua  → worker này tắt lâu ngày, bỏ lỡ cửa sổ rotate → phải join lại
-  ```
-  </details>
+---
 
-  > Kubelet **tự rotate** cert client nên bình thường không cần can thiệp. Rủi ro chỉ xảy ra với
-  > worker tắt/mất mạng dài ngày — bỏ lỡ cửa sổ rotate thì cert chết hẳn, phải `kubeadm join` lại.
+#### GIAI ĐOẠN 0 — Tiền kiểm (chỉ đọc, chạy trên node 48)
 
-> ⚠️ **Ràng buộc tuyệt đối:** không renew/restart 2 node cùng lúc. Nếu là stacked etcd, mất quorum
-> 2/3 = cluster chết hẳn, phải restore từ snapshot. Nếu external etcd thì rủi ro thấp hơn nhưng
-> vẫn giữ nguyên tắc tuần tự để còn đường rollback khi cert mới sai SAN.
+Gộp A8 + A9 vào đây, không cần round-trip riêng.
+
+**0.1 — Đếm chính xác số SAN entry của cert hiện tại**
+
+```
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+openssl x509 -in <cert> -noout -text | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
+│       │     │          │      │       │  │    │     │    ││
+│       │     │          │      │       │  │    │     │    │└─ E: regex mở rộng,
+│       │     │          │      │       │  │    │     │    │   `|` là OR không cần escape
+│       │     │          │      │       │  │    │     │    └─ c: chỉ ĐẾM dòng khớp,
+│       │     │          │      │       │  │    │     │       không in nội dung
+│       │     │          │      │       │  │    │     └─ khớp cả entry DNS lẫn IP
+│       │     │          │      │       │  │    └─ thay bằng ký tự xuống dòng
+│       │     │          │      │       │  └─ ký tự cần thay: dấu phẩy
+│       │     │          │      │       └─ tr: openssl in SAN thành MỘT dòng dài 18 entry.
+│       │     │          │      │          Không tách dòng thì `grep -c` luôn trả về 1
+│       │     │          │      └─ -text: decode cert sang dạng người đọc
+│       │     │          └─ -noout: không in lại khối PEM base64
+│       │     └─ đọc cert từ file
+│       └─ sub-command thao tác cert X.509
+└─ ⭐ GHI LẠI CON SỐ NÀY — dùng để so sánh sau khi renew (bước 4.1)
+   • Kỳ vọng 18 → khớp certSANs trong file config
+   • Ra 19 → cert đã có sẵn kubernetes.default.svc.vrp, output 3.5 bị sót khi gõ tay
+```
+</details>
+
+**0.2 — Xác nhận version kubeadm khớp version cluster**
+
+```
+kubeadm version -o short
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+kubeadm version -o short
+│               │  └─ chỉ in chuỗi version (vd v1.28.5)
+│               └─ -o: chọn định dạng. Bỏ cờ này ra khối JSON dài, khó đọc qua VDI
+└─ ⚠️ VÌ SAO QUAN TRỌNG: `kubeadm certs renew` sinh cert theo logic của CHÍNH binary này.
+   Binary nâng cấp mà cluster còn version cũ (hoặc ngược lại) → cert có thể khác kỳ vọng
+```
+</details>
+
+```
+grep image: /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+grep image: /etc/kubernetes/manifests/kube-apiserver.yaml
+│    │      └─ manifest static pod — nguồn sự thật về version ĐANG CHẠY
+│    └─ dòng `image: registry.k8s.io/kube-apiserver:v1.xx.x`
+└─ ⭐ ĐỐI CHIẾU với kết quả 0.2: hai version phải KHỚP.
+   Lệch minor version (vd kubeadm v1.29 vs apiserver v1.28) → DỪNG, hỏi lại trước khi renew
+```
+</details>
+
+**0.3 — Ghi lại SAN đầy đủ ra file để so sánh về sau**
+
+```
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -A3 'Alternative Name' > /root/san-truoc-renew-48.txt
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+openssl ... | grep -A3 'Alternative Name' > /root/san-truoc-renew-48.txt
+              │    │                       │ └─ tên file có hậu tố -48: mỗi node một file
+              │    │                       │    riêng, tránh ghi đè khi làm node 49/50
+              │    │                       └─ `>` GHI ĐÈ file (không phải `>>` nối thêm) —
+              │    │                          chạy lại lệnh sẽ tạo file sạch, không lẫn lộn
+              │    └─ -A3: 3 dòng sau (rộng hơn -A2 ở output 3.5 để chắc chắn không sót)
+              └─ lọc khối SAN
+└─ ⭐ VÌ SAO GHI RA FILE thay vì chỉ nhìn màn hình: bước 4.1 sẽ `diff` file này với SAN
+   sau renew. So bằng mắt 18 entry trên VDI rất dễ sót — máy so chính xác hơn người
+```
+</details>
+
+---
+
+#### GIAI ĐOẠN 1 — Backup (BẮT BUỘC, chạy trên CẢ 3 node trước khi renew node đầu tiên)
+
+> Backup cả 3 node **trước**, không backup từng node ngay trước khi renew nó.
+> Lý do: nếu node 48 hỏng và cần dựng lại, có thể vẫn cần đối chiếu PKI của 49/50.
+
+**Chạy trên từng node 48, 49, 50:**
+
+```
+tar czf /root/pki-backup-$(hostname)-$(date +%F-%H%M).tar.gz /etc/kubernetes/pki /etc/kubernetes/*.conf /etc/kubernetes/kubeadm-config.yaml
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+tar czf <đích> <nguồn1> <nguồn2> <nguồn3>
+│   │││  │
+│   │││  └─ $(hostname) → vrp-kubeengine01/02/03: biết file backup của node nào
+│   │││     $(date +%F-%H%M) → 2026-08-19-1430: chạy lại không ghi đè bản trước
+│   ││└─ f: chỉ định tên file đích. PHẢI đứng cuối cụm cờ, ngay trước tên file
+│   │└─ z: nén gzip
+│   └─ c: create archive
+└─ BA NGUỒN, thiếu cái nào cũng không rollback được:
+   • /etc/kubernetes/pki        → toàn bộ cert + key + CA
+   • /etc/kubernetes/*.conf     → admin.conf, kubelet.conf, controller-manager.conf,
+                                  scheduler.conf. Cert nhúng base64 BÊN TRONG, renew
+                                  cũng ghi đè các file này → phải backup
+   • kubeadm-config.yaml        → file dùng cho --config, mất là không renew đúng SAN được
+```
+</details>
+
+Kiểm tra backup thật sự đọc được (đừng tin file `.tar.gz` chỉ vì nó tồn tại):
+
+```
+tar tzf /root/pki-backup-$(hostname)-*.tar.gz | head -20
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+tar tzf <file> | head -20
+│   ││└─ f: đọc từ file
+│   │└─ z: giải nén gzip
+│   └─ t: LIỆT KÊ nội dung, KHÔNG giải nén ra đĩa (khác `x` là extract)
+└─ ⭐ VÌ SAO CẦN BƯỚC NÀY: `tar czf` có thể tạo file lỗi nếu hết dung lượng đĩa mà
+   không báo rõ. `tar tzf` chạy trót lọt = archive đọc được = rollback được.
+   head -20: chỉ xem 20 dòng đầu cho gọn, đủ để xác nhận có đường dẫn pki/
+```
+</details>
+
+---
+
+#### GIAI ĐOẠN 2 — Renew cert (node 48 trước)
+
+**2.1 — Renew kèm `--config`**
+
+```
+kubeadm certs renew all --config /etc/kubernetes/kubeadm-config.yaml
+```
+
+<details>
+<summary>Giải nghĩa lệnh — ⭐ LỆNH QUAN TRỌNG NHẤT CẢ QUY TRÌNH</summary>
+
+```
+kubeadm certs renew all --config /etc/kubernetes/kubeadm-config.yaml
+│       │     │     │    │
+│       │     │     │    └─ ⭐⭐ CỜ SỐNG CÒN. Xem giải thích bên dưới
+│       │     │     └─ renew MỌI cert: apiserver, apiserver-kubelet-client,
+│       │     │        front-proxy-client, + cert nhúng trong admin.conf /
+│       │     │        controller-manager.conf / scheduler.conf
+│       │     │        (KHÔNG có cert etcd vì cụm này dùng etcd external)
+│       │     └─ ký lại bằng CA hiện có trong /etc/kubernetes/pki/ca.key
+│       │        ⇒ CA KHÔNG đổi ⇒ kubelet worker KHÔNG cần join lại
+│       └─ nhóm lệnh quản lý PKI
+└─ Hạn mới = 1 năm KỂ TỪ LÚC CHẠY (không cộng dồn vào hạn cũ)
+
+⭐⭐ VÌ SAO BẮT BUỘC --config, KHÔNG ĐƯỢC DÙNG LỆNH TRẦN:
+   kubeadm đang KHÔNG đọc được ConfigMap kubeadm-config (API server chết vì cert hết
+   hạn) → nó fallback về DEFAULT CONFIG. Default config KHÔNG biết:
+     • lb-apiserver.kubernetes.local   ← endpoint MỌI node dùng
+     • 10.208.137.68                   ← VIP
+     • 172.16.128.1                    ← ClusterIP tuỳ biến
+   Chạy `kubeadm certs renew all` TRẦN ⇒ cert mới THIẾU 3 entry trên ⇒ mọi kubectl/helm
+   trên MỌI node báo `x509: certificate is valid for ..., not lb-apiserver.kubernetes.local`
+   ⇒ CLUSTER HỎNG NẶNG HƠN TRƯỚC KHI SỬA, và cert cũ đã bị ghi đè.
+```
+</details>
+
+**Output kỳ vọng** (chưa chạy — dán output thật vào mục 3 sau khi chạy):
+
+```
+certificate embedded in the kubeconfig file for the admin to use and for kubeadm itself renewed
+certificate for serving the Kubernetes API renewed
+certificate the apiserver uses to access etcd renewed        ← có thể KHÔNG xuất hiện (etcd external)
+certificate for the API server to connect to kubelet renewed
+certificate embedded in the kubeconfig file for the controller manager to use renewed
+certificate for the front proxy client renewed
+certificate embedded in the kubeconfig file for the scheduler manager to use renewed
+
+Done renewing certificates. You must restart the kube-apiserver, kube-controller-manager,
+kube-scheduler and etcd, so that they can use the new certificates.
+```
+
+> ⚠️ Dòng cuối chính là xác nhận: **renew KHÔNG tự restart**. Phải làm giai đoạn 3.
+
+---
+
+#### GIAI ĐOẠN 3 — ⭐ SO SÁNH SAN TRƯỚC/SAU (chốt chặn — DỪNG nếu không khớp)
+
+> **Đây là bước quyết định an toàn của cả quy trình.** Làm bước này **TRƯỚC** khi restart.
+> Cert mới đã ghi xuống đĩa nhưng static pod vẫn dùng cert cũ trong bộ nhớ → **vẫn còn cứu được**
+> bằng cách restore backup. Restart rồi mới phát hiện sai thì cluster đã hỏng.
+
+**3.1 — Chụp SAN của cert mới**
+
+```
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -A3 'Alternative Name' > /root/san-sau-renew-48.txt
+```
+
+**3.2 — So sánh bằng máy, không so bằng mắt**
+
+```
+diff /root/san-truoc-renew-48.txt /root/san-sau-renew-48.txt
+```
+
+<details>
+<summary>Giải nghĩa lệnh + cách đọc kết quả</summary>
+
+```
+diff <file cũ> <file mới>
+│    └─ THỨ TỰ QUAN TRỌNG: file cũ trước, file mới sau.
+│       Đảo ngược thì dấu `<` và `>` đổi nghĩa, dễ đọc nhầm
+└─ ĐỌC KẾT QUẢ:
+   • KHÔNG IN GÌ (exit 0)  → ✅ SAN giống hệt nhau → AN TOÀN, sang giai đoạn 4
+   • Dòng `>` có thêm `DNS:kubernetes.default.svc.vrp`
+                           → ✅ CHẤP NHẬN ĐƯỢC. Đây là entry THÊM (đã dự đoán ở output 3.6),
+                             không phải mất. Kubeadm áp certSANs từ file config
+   • Dòng `<` có entry mà `>` KHÔNG có
+                           → 🔴 DỪNG NGAY. Cert mới THIẾU SAN. KHÔNG restart.
+                             Chuyển sang giai đoạn ROLLBACK
+   ⭐ SOI KỸ 3 entry sống còn, cert mới BẮT BUỘC có đủ:
+     • DNS:lb-apiserver.kubernetes.local
+     • IP Address:10.208.137.68
+     • IP Address:172.16.128.1
+```
+</details>
+
+**3.3 — Kiểm hạn mới**
+
+```
+kubeadm certs check-expiration
+```
+
+<details>
+<summary>Cách đọc</summary>
+
+```
+Cột RESIDUAL TIME của mọi cert lá phải là 364d (hoặc ~1y), KHÔNG còn <invalid>.
+Các dòng !MISSING! của etcd VẪN CÒN — đúng như cũ, vì etcd external (output 3.4).
+Đây KHÔNG phải lỗi.
+```
+</details>
+
+---
+
+#### GIAI ĐOẠN 4 — Restart control-plane (chỉ khi giai đoạn 3 PASS)
+
+**4.1 — Tái tạo static pod bằng cách di chuyển manifest**
+
+```
+mv /etc/kubernetes/manifests /etc/kubernetes/manifests.off
+```
+
+<details>
+<summary>Giải nghĩa — vì sao dùng cách này thay vì restart kubelet</summary>
+
+```
+mv /etc/kubernetes/manifests /etc/kubernetes/manifests.off
+│  └─ kubelet WATCH thư mục này liên tục. Đổi tên = với kubelet là "manifest biến mất"
+│     → kubelet XOÁ 3 static pod (apiserver, controller-manager, scheduler)
+└─ ⭐ VÌ SAO KHÔNG DÙNG `systemctl restart kubelet`:
+     • restart kubelet ảnh hưởng MỌI pod trên node, mất ~30-60s
+     • cách này chỉ tái tạo đúng 3 static pod control-plane — phạm vi hẹp hơn, nhanh hơn
+     • với etcd external thì càng an toàn: không có etcd static pod để lo
+   ⚠️ KHÔNG làm đứt SSH — SSH không đi qua apiserver
+```
+</details>
+
+Chờ ~20 giây rồi kiểm tra pod đã bị xoá:
+
+```
+crictl ps | grep -E 'apiserver|scheduler|controller'
+```
+
+<details>
+<summary>Giải nghĩa</summary>
+
+```
+crictl ps | grep -E 'apiserver|scheduler|controller'
+│      │    │    └─ -E: regex mở rộng, `|` là OR
+│      │    └─ lọc 3 container control-plane
+│      └─ ps (KHÔNG có -a): chỉ container ĐANG CHẠY
+└─ KỲ VỌNG: output RỖNG = 3 pod đã bị xoá hết = kubelet đã nhận biết
+   Còn container → chờ thêm 10-20s rồi chạy lại. KHÔNG sang bước sau khi chưa rỗng
+Lỗi "connect endpoint": thêm -r unix:///run/containerd/containerd.sock
+```
+</details>
+
+**4.2 — Đưa manifest trở lại**
+
+```
+mv /etc/kubernetes/manifests.off /etc/kubernetes/manifests
+```
+
+<details>
+<summary>Giải nghĩa</summary>
+
+```
+mv /etc/kubernetes/manifests.off /etc/kubernetes/manifests
+└─ kubelet phát hiện manifest xuất hiện → tạo lại 3 static pod,
+   lần này ĐỌC CERT MỚI từ hostPath /etc/kubernetes/pki
+⚠️ Nếu quên bước này, control-plane node 48 sẽ không bao giờ chạy lại
+```
+</details>
+
+Chờ ~30-60 giây cho pod khởi động:
+
+```
+crictl ps | grep -E 'apiserver|scheduler|controller'
+```
+
+<details>
+<summary>Cách đọc</summary>
+
+```
+KỲ VỌNG: 3 container, cột STATE = Running, cột ATTEMPT thấp (0 hoặc 1)
+• ATTEMPT tăng dần → crashloop → xem log ngay:
+    crictl logs $(crictl ps -a --name kube-apiserver -q | head -1)
+• Chưa thấy container → chờ thêm, apiserver khởi động chậm hơn 2 cái kia
+```
+</details>
+
+---
+
+#### GIAI ĐOẠN 5 — Verify node 48 (bắt buộc PASS mới sang node 49)
+
+**5.1 — Cập nhật kubeconfig (cert cũ trong `~/.kube/config` đã hết hạn)**
+
+```
+cp /etc/kubernetes/admin.conf /root/.kube/config
+```
+
+<details>
+<summary>Giải nghĩa — vì sao phải làm bước này</summary>
+
+```
+cp /etc/kubernetes/admin.conf /root/.kube/config
+│  │                          └─ nơi kubectl tìm khi chạy dưới root
+│  └─ file này VỪA ĐƯỢC RENEW GHI ĐÈ ở giai đoạn 2 (cert nhúng base64 bên trong)
+└─ ⭐ Đây chính là issue #2 trong bảng tổng quan. Trước renew thì copy VÔ ÍCH vì
+   admin.conf cũng đã hết hạn (output 3.2 có dòng `admin.conf ... <invalid>`)
+Nếu /root/.kube/ chưa tồn tại: mkdir -p /root/.kube
+```
+</details>
+
+**5.2 — Kiểm tra cluster trả lời**
+
+```
+kubectl get nodes
+```
+
+<details>
+<summary>Cách đọc</summary>
+
+```
+KỲ VỌNG: bảng 8 node (3 master + 5 worker), STATUS = Ready
+• Vẫn `x509: certificate has expired` → kubeconfig chưa cập nhật (làm lại 5.1)
+• `Unable to connect ... connection refused` → apiserver chưa lên, chờ thêm
+• Một số node NotReady → BÌNH THƯỜNG ở giai đoạn này nếu đó là 49/50 (chưa renew).
+  Ghi lại node nào NotReady để đối chiếu sau khi làm xong cả 3
+```
+</details>
+
+**5.3 — Kiểm tra control-plane pod**
+
+```
+kubectl -n kube-system get pods -l tier=control-plane -o wide
+```
+
+<details>
+<summary>Giải nghĩa</summary>
+
+```
+kubectl -n kube-system get pods -l tier=control-plane -o wide
+│        │              │        │                     └─ -o wide: hiện thêm cột NODE
+│        │              │        │                        → biết pod nào của node nào
+│        │              │        └─ -l: lọc theo label. kubeadm gắn sẵn tier=control-plane
+│        │              │           cho 3 static pod
+│        │              └─ resource cần xem
+│        └─ namespace của thành phần hệ thống
+└─ KỲ VỌNG: pod của node 48 có AGE vài phút (vừa restart), READY 1/1, RESTARTS 0
+   Pod của 49/50 vẫn AGE cũ (chưa restart) — đúng, chưa tới lượt
+```
+</details>
+
+**5.4 — Kiểm tra qua chính endpoint LB (quan trọng nhất)**
+
+```
+curl -sS --cacert /etc/kubernetes/pki/ca.crt https://lb-apiserver.kubernetes.local:6443/version
+```
+
+<details>
+<summary>Giải nghĩa — vì sao bước này quý hơn kubectl</summary>
+
+```
+curl -sS --cacert /etc/kubernetes/pki/ca.crt https://lb-apiserver.kubernetes.local:6443/version
+     ││   │                                   │
+     ││   │                                   └─ ⭐ gọi qua ĐÚNG endpoint mọi client dùng,
+     ││   │                                      qua VIP .68 — thứ đã làm helm chết ban đầu
+     ││   └─ --cacert: dùng CA của cluster để verify cert server.
+     ││      KHÔNG dùng -k (bỏ qua verify) — vì mục đích chính LÀ verify cert!
+     │└─ S: vẫn hiện lỗi khi có (nếu chỉ -s thì lỗi bị nuốt luôn)
+     └─ s: tắt thanh tiến trình cho gọn output
+└─ ⭐ VÌ SAO QUÝ HƠN `kubectl get nodes`: kubectl có thể đi đường khác tuỳ kubeconfig.
+   Lệnh này kiểm ĐÚNG đường mà helm/kubectl trên worker đi → chứng minh SAN mới hợp lệ
+   cho tên lb-apiserver.kubernetes.local
+   KỲ VỌNG: JSON {"major":"1","minor":"xx",...}
+   • `certificate is valid for ..., not lb-apiserver.kubernetes.local` → 🔴 cert thiếu SAN,
+     ROLLBACK ngay
+```
+</details>
+
+> ✅ **Chỉ khi 5.1→5.4 đều PASS mới sang node 49.** Lặp lại GIAI ĐOẠN 2→5 trên node 49
+> (đổi hậu tố file thành `-49`), rồi node 50.
+
+---
+
+#### GIAI ĐOẠN 6 — Sau khi xong cả 3 node
+
+**6.1 — Kiểm tra toàn cụm**
+
+```
+kubectl get nodes -o wide
+```
+
+**6.2 — Kiểm cert kubelet trên 5 worker `137.51 → .55`**
+
+```
+openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates
+```
+
+<details>
+<summary>Giải nghĩa</summary>
+
+```
+openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates
+│                │                     └─ symlink trỏ tới cert kubelet ĐANG dùng.
+│                │                        Hậu tố -current do cơ chế rotate: kubelet sinh
+│                │                        file mới rồi đổi symlink, giữ file cũ lại
+│                └─ PKI RIÊNG của kubelet, khác /etc/kubernetes/pki của control-plane
+└─ -dates: chỉ in notBefore/notAfter, không cần -text
+   • Còn hạn → kubelet đã tự rotate (rotateCertificates mặc định true) ✔
+   • Hết hạn → worker tắt lâu ngày, bỏ lỡ cửa sổ rotate → phải kubeadm join lại
+```
+</details>
+
+**6.3 — Chạy lại việc gốc: upgrade RAGFlow (issue #6)**
+
+**Trên worker `vrp-kubeengine04`, user `app`:**
+
+```
+helm upgrade ragflow . -n ragflow -f values.yaml
+```
+
+**6.4 — Dọn backup sau khi cluster ổn định vài ngày**
+
+> ⚠️ **KHÔNG xoá ngay.** Giữ ít nhất 1 tuần — cert mới có thể lộ vấn đề sau vài ngày.
+
+---
+
+#### 🔴 ROLLBACK — khi giai đoạn 3 phát hiện SAN thiếu, hoặc pod crashloop
+
+> Chỉ dùng khi **chưa restart** (giai đoạn 3 fail) hoặc **đã restart nhưng hỏng** (giai đoạn 4/5 fail).
+
+**R1 — Nếu CHƯA restart (dễ):**
+
+```
+tar xzf /root/pki-backup-$(hostname)-<timestamp>.tar.gz -C /
+```
+
+<details>
+<summary>Giải nghĩa</summary>
+
+```
+tar xzf <file> -C /
+│   ││└─ f: đọc từ file
+│   │└─ z: giải nén gzip
+│   └─ x: EXTRACT (khác `t` là liệt kê, `c` là tạo)
+└─ -C /: giải nén tương đối với thư mục gốc `/`.
+   Archive lưu đường dẫn dạng `etc/kubernetes/pki/...` (không có `/` đầu) nên cần -C /
+   để file về đúng /etc/kubernetes/pki/
+⚠️ Thay <timestamp> bằng tên file thật — chạy `ls /root/pki-backup-*` để xem
+Vì chưa restart, static pod vẫn dùng cert cũ trong bộ nhớ ⇒ restore xong là như chưa có gì
+```
+</details>
+
+**R2 — Nếu ĐÃ restart và hỏng:** restore như R1, rồi làm lại giai đoạn 4 (di chuyển manifest)
+để static pod nạp lại cert cũ.
+
+**R3 — Nếu node 48 hỏng hẳn:** cluster vẫn còn 49/50 phục vụ qua VIP. Không hoảng —
+dừng lại, báo cáo, xử lý node 48 riêng. **Tuyệt đối không** tiếp tục làm 49/50 khi 48 đang hỏng.
 
 ### Dài hạn — chống tái diễn (issue #5, nợ kỹ thuật)
 
