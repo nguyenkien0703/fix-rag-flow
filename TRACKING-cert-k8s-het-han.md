@@ -1459,7 +1459,81 @@ certificate for serving the Kubernetes API renewed
 
 ---
 
-### 3.23 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.23 — [Node 48 / GĐ3] ✅✅ SO SÁNH SAN: **PASS** — cert mới giữ nguyên 18 entry
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~11:29 +07 ngày 19/08**
+
+**a) Chụp SAN cert mới**
+
+```
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -A3 'Alternative Name' > /root/san-sau-renew-48.txt
+```
+
+**b) So sánh trước/sau**
+
+```
+diff /root/san-truoc-renew-48.txt /root/san-sau-renew-48.txt
+```
+
+**Output:**
+
+```
+4c4
+<       a4:6f:63:3e:3a:40:63:01:ab:29:eb:2a:12:50:38:14:68:48:
+---
+>       83:b5:28:99:ea:74:26:a3:a9:c8:66:3e:72:de:a9:1f:c9:aa:
+```
+
+**c) Đếm lại số SAN entry**
+
+```
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | grep -cE 'DNS:|IP Address:'
+```
+
+**Output:**
+
+```
+18
+```
+
+**Đọc được gì:**
+
+- ✅✅ ⭐ **PASS — kubeadm ĐÃ ĐỌC ĐƯỢC `--config`.** Cert mới giữ **nguyên vẹn toàn bộ SAN**.
+- **Phân tích dòng `diff` khác nhau — KHÔNG phải SAN:**
+
+  `4c4` = chỉ dòng thứ 4 khác. Nội dung là **chuỗi hex**, không phải `DNS:` hay `IP Address:`.
+  Đây là **Subject Key Identifier** (hoặc byte đầu của chữ ký) — nằm ngay sau khối SAN nên bị
+  `grep -A3` kéo vào phạm vi.
+
+  ⭐ **Chuỗi này là fingerprint dẫn xuất từ public key. Cert mới có key khác ⇒ chuỗi BẮT BUỘC
+  phải khác.** Nói cách khác: **dòng này khác chính là BẰNG CHỨNG cert đã thực sự được ký lại.**
+  Nếu nó giống hệt thì mới đáng lo — nghĩa là cert không hề đổi.
+
+- ✅ ⭐ **KHÔNG có dòng `<` nào chứa `DNS:` hoặc `IP Address:`** ⇒ **không mất entry SAN nào.**
+  Ba entry sống còn đều còn nguyên:
+  `lb-apiserver.kubernetes.local`, `10.208.137.68`, `172.16.128.1`.
+- ✅ **Kiểm chéo độc lập: `18` entry — bằng ĐÚNG trước renew** (output 3.10).
+  ⇒ Nếu kubeadm rơi về default config, con số phải tụt xuống **~8** (chỉ còn SAN mặc định:
+  `kubernetes`, `kubernetes.default`, `.svc`, `.svc.cluster.local`, ClusterIP, IP node).
+  Giữ nguyên 18 ⇒ `certSANs` từ `/root/cluster-config-renew.yaml` **đã được áp dụng**.
+  ⇒ **Bẫy ở output 3.11 (kubeadm im lặng rơi về default) KHÔNG xảy ra.**
+- ⚠️ **DỰ ĐOÁN CỦA TÔI SAI — nhưng theo hướng vô hại:**
+
+  Ở output 3.10 và 3.12 tôi dự đoán SAN sẽ thành **19** vì `dnsDomain: vrp` (output 3.12) sẽ
+  khiến kubeadm thêm `kubernetes.default.svc.vrp`. Thực tế **vẫn 18**.
+
+  **Vì sao sai:** kubeadm v1.23 **không** tự sinh `kubernetes.default.svc.<dnsDomain>` — nó chỉ
+  dùng đúng danh sách `certSANs` khai trong file, cộng SAN mặc định. Entry
+  `kubernetes.default.svc.vrp` có trong `certSANs` (output 3.6) nhưng cert cũ cũng đã không có nó
+  ⇒ nhiều khả năng kubeadm bỏ qua entry này vì trùng dạng với `kubernetes.default.svc.cluster.local`.
+
+  **Hệ quả:** không có. Giữ nguyên 18 **an toàn hơn** là thêm entry mới. Ghi lại để không hoang
+  mang khi thấy con số khác dự đoán.
+- ⇒ ✅ **ĐỦ ĐIỀU KIỆN chạy 2.2 (`renew all`)** cho 5 cert còn lại.
+
+---
+
+### 3.24 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
