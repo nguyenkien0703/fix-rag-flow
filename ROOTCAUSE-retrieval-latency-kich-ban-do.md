@@ -1540,3 +1540,107 @@ Sau đó tôi tìm trong source code RAGFlow xem câu DELETE đó nằm ở dòn
 `─────────────────────────────────────────────────`
 
 Nói ngắn gọn: **không đoán** — hỏi thẳng MySQL "vừa deadlock ở đâu" bằng lệnh chẩn đoán tích hợp sẵn, MySQL trả lời chính xác câu SQL và bảng liên quan.
+
+---
+
+# 14. ✅ FIX ĐÃ TRIỂN KHAI — ISSUE ĐÓNG (2026-08-19)
+
+## 14.1. Cách triển khai: codePatch qua Helm, KHÔNG build image
+
+Mở rộng cơ chế `codePatch` sẵn có trong chart (trước chỉ chạy được `sed` 1 dòng)
+thêm nhánh `fullFile` — mount file `.py` đầy đủ từ ConfigMap.
+
+**5 thay đổi trong `helm_ragflow_v0.26.4/`:**
+
+| File | Nội dung |
+|---|---|
+| `files/code-patch/api/db/services/document_service.py` | Bản đã patch (1268 dòng) |
+| `files/code-patch/api/db/services/pipeline_operation_log_service.py` | Bản đã patch (332 dòng) |
+| `templates/ragflow-code-patch-src.yaml` | ConfigMap mới, `.Files.Glob` đóng gói 2 file trên |
+| `templates/ragflow.yaml` | +26 dòng: nhánh `fullFile`, kiểm `md5sum`, `py_compile` |
+| `values.yaml` | +58 dòng: `hasFullFiles: true` + khai báo 2 patch |
+
+**Ba cửa kiểm tra trong initContainer** (có `set -e`, fail 1 cửa là pod không lên):
+1. `md5sum` file gốc khớp `baseMd5` → đúng nền tảng, image đổi thì fail có thông báo
+2. `grep -q` chuỗi `verify` → nội dung sửa thực sự có mặt
+3. `python3 -m py_compile` → cú pháp hợp lệ
+
+## 14.2. Kết quả deploy
+
+```
+$ kubectl -n ragflow logs $POD -c ragflow-code-patch
+PATCH OK: api/db/services/pipeline_operation_log_service.py
+PATCH OK: api/db/services/document_service.py
+PATCH OK: rag/nlp/query.py
+PATCH OK: api/db/services/file_service.py
+```
+
+Code mới đã vào container chính:
+```
+grep -c "cap is not None"  document_service.py               -> 1
+grep -c "_trim_logs"       pipeline_operation_log_service.py -> 2  (def + chỗ gọi)
+```
+
+## 14.3. 🎯 SỐ LIỆU CUỐI CÙNG
+
+**Query đếm task (`get_pending_task_count`):**
+```
+CAP500 RUN1| 0.098s  count=500
+CAP500 RUN2| 0.010s  count=500
+CAP500 RUN3| 0.006s  count=500
+```
+Trước: **6.133s** → Sau: **0.006–0.098s**
+
+**Latency `/api/v1/retrieval` (10 request):**
+```
+0.012  0.010  0.010  0.009  0.007  0.011  0.009  0.009  0.009  0.010
+```
+
+| | Trước | Sau mitigation | **Sau fix đầy đủ** |
+|---|---|---|---|
+| min | 3.328s | 3.170s | **0.007s** |
+| max | **22.290s** | 11.391s | **0.012s** |
+| trung bình | ~10.0s | 7.7s | **0.0096s** |
+| biên độ | 6.7× | 3.6× | **1.7×** |
+| Deadlock | 44 dòng/10s | 0 | 0 |
+
+⟹ **Nhanh hơn ~1000 lần so với lúc tệ nhất, và latency đã ỔN ĐỊNH.**
+
+> Kết quả vượt xa dự đoán (~2-3s). Lý do: khi MySQL không còn bị hai query đắt
+> chiếm dụng, 5-7 query SQL của retrieval trở lại đúng chi phí thật của chúng
+> (vài ms), và ES vốn đã nhanh sẵn (§7 đã đo: `_search` ~0.2-3s tuỳ tải, phần
+> lớn thời gian trước đây là **chờ**, không phải **tính**).
+
+## 14.4. Ghi chú vận hành — initContainer
+
+Pod giờ có **2 container** nhưng thuộc 2 loại:
+
+| | `ragflow-code-patch` | `ragflow` |
+|---|---|---|
+| Loại | **initContainer** | container thường |
+| Khi chạy | Trước, phải Completed | Sau, chạy mãi |
+| Vòng đời | Xong thì Terminated | Sống suốt đời pod |
+
+`kubectl get pods` hiển thị **`1/1`** (chỉ đếm container thường), KHÔNG phải `2/2`.
+`kubectl describe pod` có mục **`Init Containers:`** RIÊNG, nằm TRÊN mục `Containers:`.
+
+```bash
+# Liệt kê initContainers
+kubectl -n ragflow get pod $POD -o jsonpath='{range .spec.initContainers[*]}{.name}{"\n"}{end}'
+# Liệt kê containers thường
+kubectl -n ragflow get pod $POD -o jsonpath='{range .spec.containers[*]}{.name}{"\n"}{end}'
+# Trạng thái initContainer
+kubectl -n ragflow get pod $POD -o jsonpath='{range .status.initContainerStatuses[*]}{.name}{" -> "}{.state}{"\n"}{end}'
+# Log initContainer (BẮT BUỘC có -c, vì mặc định lấy container chính)
+kubectl -n ragflow logs $POD -c ragflow-code-patch
+```
+
+## 14.5. Việc còn lại
+
+| # | Việc | Ghi chú |
+|---|---|---|
+| 1 | **Rotate Bearer token** | Token đã lộ trong PR #8 trên GitHub — rủi ro tăng theo thời gian |
+| 2 | Gỡ mitigation `PIPELINE_OPERATION_LOG_LIMIT=100000000` | Patch đã fix gốc; trả về `1000` để trim hoạt động lại. Kiểm `Cleaned ... old logs` xuất hiện và deadlock vẫn = 0 |
+| 3 | Theo dõi khi RAGFlow lên bản mới | initContainer sẽ fail md5 → phải xem lại patch (đúng thiết kế) |
+| 4 | Rò rỉ CLOSE_WAIT tới LiteLLM (227 conn) | Bug thật nhưng KHÔNG gây chậm — tách riêng |
+| 5 | Đề xuất upstream | Cả 2 fix đều là bug thật của RAGFlow v0.26.4, đáng gửi PR |
