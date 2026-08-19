@@ -75,7 +75,7 @@ hỏng nặng hơn hiện tại).
 | # | Issue | Mức độ | Trạng thái | Hướng xử lý |
 |---|---|---|---|---|
 | 1 | Cert lá control-plane hết hạn 18/08/2026 | 🔴 Cao | ✅ **FIXED** — cả 3 master renew + restart + verify xong (output 3.25→3.30) | `kubeadm certs renew all` **`--config /root/cluster-config-renew.yaml`** (file TÁCH ở GĐ0-ter, không phải file gốc) → so SAN → restart. Lần lượt 48→49→50 |
-| 2 | `kubectl` không chạy được dưới **`vt_admin`** (thiếu kubeconfig). `root` CÓ file nhưng cert bên trong đã hết hạn | 🟡 TB | 🔶 **OPEN** | ✅ Output 3.27 làm rõ: root có sẵn `/root/.kube/config`. Backup rồi ghi đè bằng `admin.conf` vừa renew |
+| 2 | kubeconfig hết hạn: `vt_admin`(master), `app`(worker `04`) | 🟡 TB | ✅ **FIXED** — output 3.27 (master) + 3.32 (worker `04`). ⚠️ Worker `05`–`08` chưa kiểm | ✅ Output 3.27 làm rõ: root có sẵn `/root/.kube/config`. Backup rồi ghi đè bằng `admin.conf` vừa renew |
 | 3 | ~~Toàn bộ PKI etcd báo `!MISSING!`~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.4: không có `etcd.yaml` ⇒ **etcd external** ⇒ `!MISSING!` chỉ là cosmetic |
 | 4 | `kubeadm` fallback default config → cert mới mất SAN | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | ✅ Output 3.6 xác nhận `kubeadm-config.yaml` còn đúng ⇒ renew **kèm `--config /etc/kubernetes/kubeadm-config.yaml`**. Cấm lệnh trần |
 | 5 | Không có cảnh báo trước khi cert hết hạn | 🟡 TB | ⚠️ **WORKAROUND** | ✅ Output 3.31: systemd timer chạy hàng ngày trên cả 3 master, ngưỡng 30 ngày. **Nhưng chỉ ghi journald, chưa có kênh gửi ra ngoài** ⇒ cảnh báo yếu |
@@ -2152,6 +2152,134 @@ Thu 2026-08-20 00:47:14 +07   12h left  n/a  n/a    k8s-cert-check.timer    k8s-
 
 ---
 
+### 3.32 — [Worker `vrp-kubeengine04`] ✅ Cấp lại kubeconfig cho user `app` (issue #2)
+
+**📍 Worker `vrp-kubeengine04` — user `app` và `root`, ~12:19–12:27 +07 ngày 19/08**
+
+**a) Chẩn đoán — kubeconfig của `app` dùng cert nhúng đã hết hạn**
+
+```
+grep -E 'server:|client-certificate|token:' ~/.kube/config
+```
+
+**Output (rút gọn):**
+
+```
+    server: https://lb-apiserver.kubernetes.local:6443
+    client-certificate-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURJVENDQWdTZ0F3SUJBZ0lJVkttRXgyYmQ2eEF3RFFZSktvWklodmNOQVFFTEJRQXdGVEVUTUJFR0ExVUUKQXhNS2EzVmlaWEp1WlhSbGN6QWVGdzB5TXpBM0l1EWXdPREV4TkRWYUZ3TXHlOakE0TVRneE1UVXpNVFJhTURReApGekFWQmdOVkJB...
+```
+
+```
+grep client-certificate-data ~/.kube/config | awk '{print $2}' | base64 -d | openssl x509 -noout -dates -subject
+```
+
+**Output:**
+
+```
+notBefore=Jul  6 08:11:45 2023 GMT
+notAfter=Aug 18 11:53:14 2026 GMT
+subject= /O=system:masters/CN=kubernetes-admin
+```
+
+**b) Kubelet cert trên chính node đó — KHÔNG bị ảnh hưởng**
+
+```
+sudo openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates
+```
+
+**Output:**
+
+```
+notBefore=Dec 24 14:02:23 2025 GMT
+notAfter=Dec 24 14:02:23 2026 GMT
+```
+
+**c) Cấp lại — copy `admin.conf` đã renew từ master sang**
+
+📍 **Worker `vrp-kubeengine04`** — user **`root`** (file đã đưa sang `/home/app/cert_new/`):
+
+```
+cp -a /home/app/.kube/config /home/app/.kube/config.bak-$(date +%F-%H%M)
+```
+
+```
+\cp -f /home/app/cert_new/admin-new.conf /home/app/.kube/config
+```
+
+```
+chown app:app /home/app/.kube/config && chmod 600 /home/app/.kube/config
+```
+
+**d) Verify — user `app`**
+
+```
+kubectl get nodes
+```
+
+```
+NAME               STATUS   ROLES                  AGE     VERSION
+vrp-kubeengine01   Ready    control-plane,master   3y44d   v1.23.2
+vrp-kubeengine02   Ready    control-plane,master   3y44d   v1.23.2
+vrp-kubeengine03   Ready    control-plane,master   3y44d   v1.23.2
+vrp-kubeengine04   Ready    <none>                 3y44d   v1.23.2
+vrp-kubeengine05   Ready    <none>                 3y44d   v1.23.2
+vrp-kubeengine06   Ready    <none>                 3y44d   v1.23.2
+vrp-kubeengine07   Ready    <none>                 3y44d   v1.23.2
+vrp-kubeengine08   Ready    <none>                 3y44d   v1.23.2
+```
+
+```
+kubectl get pods -n ragflow
+```
+
+```
+NAME                       READY   STATUS    RESTARTS   AGE
+ragflow-568c66dc75-955jn   1/1     Running   0          19h
+ragflow-568c66dc75-brm8v   1/1     Running   0          19h
+ragflow-568c66dc75-gmj78   1/1     Running   0          20h
+ragflow-minio-0            1/1     Running   0          4d18h
+ragflow-mysql-0            1/1     Running   0          5d12h
+ragflow-redis-0            1/1     Running   0          4d18h
+```
+
+**Đọc được gì:**
+
+- ✅ **Nguyên nhân `Unauthorized` đã rõ:** kubeconfig của `app` chứa
+  `client-certificate-data` — **cert nhúng base64**, hết hạn `Aug 18 11:53:14 2026`,
+  **cùng đợt** với cert control-plane (output 3.2).
+  ⇒ Đây là **bản copy của `admin.conf` cũ`**. `kubeadm certs renew` chỉ renew file trên master;
+  bản copy trên worker là file độc lập, **không được cập nhật theo**.
+- ⭐ **Vì sao lỗi là `Unauthorized` chứ không phải `x509: certificate has expired`:**
+  TLS bắt tay **thành công** (cert **server** đã mới sau renew), nhưng cert **client** hết hạn
+  nên apiserver từ chối **xác thực**. Hai tầng khác nhau:
+
+  | Tầng | Cert nào | Trạng thái sau renew |
+  |---|---|---|
+  | TLS handshake | Cert **server** (apiserver) | ✅ Đã mới |
+  | Authentication | Cert **client** (trong kubeconfig) | 🔴 Còn cũ → `Unauthorized` |
+
+- ✅ **`subject= /O=system:masters/CN=kubernetes-admin`** — cert này có **quyền admin đầy đủ**
+  toàn cluster (`system:masters` là group bypass mọi RBAC).
+  ⇒ ⚠️ **Nợ kỹ thuật**: user `app` chạy `helm` trên worker đang giữ quyền admin toàn cluster.
+  Nên cấp cert với RBAC hạn chế (chỉ namespace `ragflow`) thay vì copy `admin.conf`.
+- ✅ ⭐ **Kubelet cert `notAfter = Dec 24 2026` — còn ~4 tháng, KHÔNG bị ảnh hưởng.**
+  `notBefore = Dec 24 2025` ⇒ kubelet **đã tự rotate** (`rotateCertificates: true`).
+  ⇒ Giải thích vì sao worker vẫn `Ready` suốt sự cố. **Không cần đụng vào worker.**
+  ⇒ Xác nhận dự đoán ban đầu: CA không đổi nên worker không phải join lại.
+- ✅ **Sau khi cấp lại: `kubectl` chạy được dưới `app`**, 8/8 node Ready.
+- ⭐ **PHÁT HIỆN QUAN TRỌNG — workload KHÔNG HỀ bị ảnh hưởng suốt sự cố:**
+  Pod RAGFlow `AGE = 19-20h`, MySQL `5d12h`, Redis/MinIO `4d18h`, **`RESTARTS = 0`**.
+  ⇒ Cert hết hạn từ 18/08 nhưng pod chạy liên tục qua đó, **không restart lần nào**.
+  ⇒ Xác nhận: cert control-plane chỉ chặn **client nói chuyện với apiserver**
+  (kubectl, helm, controller). Pod đang chạy **không quan tâm** — chúng không gọi apiserver
+  để tiếp tục sống.
+  ⇒ Đây là lý do sự cố **không gây downtime dịch vụ**, chỉ chặn thao tác vận hành.
+- 📌 **Ghi chú thao tác:** `su` dưới user `app` báo `Permission denied` — chỉ vì `app` không
+  biết mật khẩu root, **không** phải Kiên không có quyền root trên node đó (Kiên SSH bằng
+  tài khoản khác vẫn `sudo` được). Suy luận sai đã được đính chính.
+
+---
+
 ### 3.28 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
@@ -2620,6 +2748,9 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 | Không rõ ai sửa `kube-apiserver.yaml` ngày 18/09/2024 và sửa gì | Không có changelog/git cho `/etc/kubernetes` | Không biết cấu hình hiện tại lệch bao nhiêu so với file config gốc |
 | Thư mục cert quyền `755` thay vì `700` mặc định | Kubespray cấu hình | Mọi user trên node đọc được danh sách file cert. Cần kiểm quyền file `.key` bên trong có phải `600` không |
 | **apiserver đã restart 215 lần** kể từ khi node 48 boot (output 3.26) | ATTEMPT counter của containerd | ❓ Chưa rõ nguyên nhân: OOM? liveness probe fail? Ngoài phạm vi renew cert nhưng đáng điều tra — restart nhiều có thể là dấu hiệu cấu hình sai hoặc thiếu tài nguyên |
+| **User `app` trên worker giữ cert `O=system:masters`** — quyền admin toàn cluster | Copy nguyên `admin.conf` sang worker (output 3.32) | Bất kỳ ai truy cập được user `app` đều có toàn quyền cluster. Nên cấp cert với RBAC hạn chế chỉ trong namespace `ragflow` |
+| Cảnh báo cert chỉ ghi journald, không gửi ra ngoài | Timer dựng ở output 3.31 | Phải chủ động `journalctl` mới biết — mà chủ động kiểm thì không cần cảnh báo. Cần mail/webhook/Prometheus |
+| Kubeconfig worker là bản copy độc lập, không tự cập nhật khi master renew | Thiết kế sẵn có | Mỗi lần renew cert phải nhớ cấp lại thủ công cho từng worker. Dễ bỏ sót |
 | Vai trò IP `10.208.137.68` không rõ | Có trong SAN cert nhưng không thuộc danh sách node | Có thể là VIP hoặc node đã gỡ. Không rõ thì không dám bỏ, cũng không dám dựa vào |
 | Không có tài liệu `certSANs` gốc của cluster | ConfigMap `kubeadm-config` là nơi duy nhất, mà nó chỉ đọc được khi cluster sống | Cluster chết = mất luôn thông tin cần để sửa cluster. Vòng lặp chết |
 | `~/.kube/config` không được setup cho user vận hành | Thao tác qua `su root` | Mỗi lần sự cố phải mò lại; dễ nhầm lỗi kubeconfig thành lỗi cluster |
