@@ -55,7 +55,8 @@ hỏng nặng hơn hiện tại).
 | Cluster CIDR (pod) | `172.16.0.0/17` | ✅ Output 3.6 |
 | Service CIDR | `172.16.128.0/17` | ✅ Output 3.6 |
 | ✅ **Cluster domain** | **`vrp`** (`dnsDomain: vrp`) — cert hiện tại dùng `cluster.local` mặc định ⇒ renew sẽ **thêm** `kubernetes.default.svc.vrp` | ✅ Output 3.12 |
-| 🔴 **`certificatesDir`** | **`/etc/kubernetes/ssl`** — KHÔNG phải `/etc/kubernetes/pki` mặc định. ❓ `pki` có phải symlink tới `ssl`? | ✅ Output 3.12 — xác minh ở GĐ0-quater |
+| ✅ **`certificatesDir`** | `/etc/kubernetes/ssl` — **`pki` là symlink tới nó** ⇒ dùng đường dẫn nào cũng đúng | ✅ Output 3.13 |
+| Owner thư mục cert | `kube:root`, quyền `755` (kubeadm mặc định `700`) | ✅ Output 3.13 |
 | ✅ **etcd endpoints** | `https://10.208.137.48/49/50:2379`, cert riêng ở `/etc/ssl/etcd/ssl/` | ✅ Output 3.12 |
 | `clusterName` | `vrp` | ✅ Output 3.12 |
 | Người dựng cụm | ❓ **Không phải Kiên** (nhân viên mới, phụ trách deploy service). Cần hỏi sếp nếu cần | Kiên xác nhận |
@@ -77,7 +78,7 @@ hỏng nặng hơn hiện tại).
 | 7 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.6: `certSANs` khớp cert đang chạy ⇒ **dùng được `--config`** |
 | 9 | 🔴 **File `kubeadm-config.yaml` có 4 YAML document — v1.23 không parse được cho `--config`** | 🔴 Cao | 🔶 **OPEN — đã có cách gỡ** | Output 3.11. Tách file chỉ chứa `ClusterConfiguration` → GĐ0-ter |
 | 10 | Kubernetes **v1.23.2 đã EOL** (02/2023, quá hạn 3 năm) | 🟠 Cao | 🔶 **OPEN — ngoài phạm vi việc này** | Không chặn renew. Cần lên kế hoạch nâng cấp riêng, bàn với sếp |
-| 11 | 🔴 **`certificatesDir: /etc/kubernetes/ssl`** — mọi lệnh trong quy trình đang dùng `/etc/kubernetes/pki` | 🔴 Cao | 🔶 **OPEN** | Output 3.12. Xác minh `pki` có phải symlink tới `ssl` (GĐ0-quater 0q.1). Nếu là 2 thư mục riêng → phải sửa mọi đường dẫn |
+| 11 | ~~`certificatesDir: /etc/kubernetes/ssl`~~ | ⚪ Không phải issue | ✅ **ĐÓNG** | Output 3.13: `pki` là **symlink** tới `ssl` ⇒ hai tên một thư mục ⇒ quy trình không phải sửa |
 | 12 | Cert cụm **etcd external** chưa kiểm hạn | 🟡 TB | 🔶 **OPEN — ngoài phạm vi** | Cert ở `/etc/ssl/etcd/ssl/`, không do `kubeadm certs renew` quản. Kiểm sau khi khôi phục control-plane |
 | 8 | LB tập trung `.68` — chưa rõ có health-check không | 🟡 **TB (hạ từ 🟠)** | 🔶 **OPEN — bị chặn bởi phạm vi** | ✅ Output 3.8: VIP **ngoài cụm**, master restart không đụng VIP. Còn lại: hỏi đội mạng về health-check port 6443 |
 
@@ -894,7 +895,48 @@ grep -n '^---\|^kind:' /etc/kubernetes/kubeadm-config.yaml
 
 ---
 
-### 3.13 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.13 — [Node 48 / GĐ0-quater] ✅ `pki` là symlink tới `ssl` — quy trình KHÔNG phải sửa
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `vt_admin`** (lệnh chỉ đọc, không cần root)
+
+```
+ls -ld /etc/kubernetes/pki /etc/kubernetes/ssl
+```
+
+**Output:**
+
+```
+lrwxrwxrwx 1 root root   19 Jul  6  2023 /etc/kubernetes/pki -> /etc/kubernetes/ssl
+drwxr-xr-x 2 kube root 4096 Jul  6  2023 /etc/kubernetes/ssl
+```
+
+**Đọc được gì:**
+
+- ✅ ⭐ **`/etc/kubernetes/pki` là SYMLINK trỏ tới `/etc/kubernetes/ssl`.**
+  Bằng chứng: ký tự đầu dòng là **`l`** (không phải `d`), kèm ký hiệu `-> /etc/kubernetes/ssl`,
+  và kích thước `19` chính là độ dài chuỗi đường dẫn đích.
+  ⇒ **Hai tên, MỘT thư mục.**
+- ✅ ⇒ **Issue #11 ĐÓNG. Quy trình KHÔNG phải sửa gì:**
+  - Mọi lệnh `openssl ... /etc/kubernetes/pki/apiserver.crt` **vẫn đọc đúng** cert đang chạy
+  - File mốc `/root/san-truoc-renew-48.txt` (output 3.10) **đúng file**
+  - Bước `diff` ở GĐ3 sẽ **so đúng file**, phát hiện được nếu cert mới thiếu SAN
+  - Lệnh backup PKI ở GĐ1 (`tar czf ... /etc/kubernetes/pki`) vẫn gói đúng nội dung
+- ⚠️ **Chi tiết phụ 1 — owner là `kube:root`, không phải `root:root`.**
+  Kubespray tạo user hệ thống `kube` để chạy control-plane.
+  ⇒ `kubeadm certs renew` chạy dưới `root` sẽ ghi cert mới với owner **`root:root`**, khác owner
+  hiện tại. Với quyền thư mục `755` thì static pod **vẫn đọc được** (chạy privileged, mount
+  hostPath) ⇒ **không chặn renew**.
+  ⇒ Ghi lại để **không hoang mang** nếu thấy owner đổi sau renew — đó là bình thường.
+- ⚠️ **Chi tiết phụ 2 — quyền thư mục `drwxr-xr-x` (755).**
+  Kubeadm mặc định đặt `700` cho thư mục cert. `755` nghĩa là **mọi user trên node đọc được
+  danh sách file** trong đó. Các file `.key` bên trong vẫn cần là `600` — ❓ chưa kiểm.
+  ⇒ **Ngoài phạm vi việc renew**, nhưng là nợ kỹ thuật đáng ghi.
+- 📌 **Ghi chú thao tác:** lệnh này chạy dưới `vt_admin` (không phải `root`) vẫn ra kết quả, vì
+  `ls -ld` chỉ đọc metadata thư mục — không cần quyền đọc nội dung bên trong.
+
+---
+
+### 3.14 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -1243,6 +1285,7 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 | **Không có tài liệu bàn giao cluster** — người vận hành hiện tại không phải người dựng | Kiên là nhân viên mới, phụ trách deploy service | Mọi sự cố hạ tầng đều phải chẩn đoán lại từ đầu. **Đây là nợ lớn nhất**, sinh ra mọi ẩn số khác trong phiên này |
 | Không biết repo Kubespray/Ansible inventory ở đâu | Không có bàn giao | `certSANs` gốc và mọi cấu hình cluster nằm ở đó. Không có repo = không thể dựng lại cluster, không thể nâng cấp đúng cách |
 | Không rõ ai sửa `kube-apiserver.yaml` ngày 18/09/2024 và sửa gì | Không có changelog/git cho `/etc/kubernetes` | Không biết cấu hình hiện tại lệch bao nhiêu so với file config gốc |
+| Thư mục cert quyền `755` thay vì `700` mặc định | Kubespray cấu hình | Mọi user trên node đọc được danh sách file cert. Cần kiểm quyền file `.key` bên trong có phải `600` không |
 | Vai trò IP `10.208.137.68` không rõ | Có trong SAN cert nhưng không thuộc danh sách node | Có thể là VIP hoặc node đã gỡ. Không rõ thì không dám bỏ, cũng không dám dựa vào |
 | Không có tài liệu `certSANs` gốc của cluster | ConfigMap `kubeadm-config` là nơi duy nhất, mà nó chỉ đọc được khi cluster sống | Cluster chết = mất luôn thông tin cần để sửa cluster. Vòng lặp chết |
 | `~/.kube/config` không được setup cho user vận hành | Thao tác qua `su root` | Mỗi lần sự cố phải mò lại; dễ nhầm lỗi kubeconfig thành lỗi cluster |
@@ -1603,7 +1646,7 @@ crictl images | grep kube-apiserver
 > không phải `/etc/kubernetes/pki` mà mọi lệnh trong quy trình đang dùng.
 > **Nếu sai thư mục, bước `diff` SAN ở GĐ3 sẽ so nhầm file và không phát hiện được cert hỏng.**
 
-**0q.1 — ⭐ `pki` và `ssl` là một hay hai thư mục khác nhau?**
+**0q.1 — ✅ ĐÃ CHẠY (output 3.13): `pki` là SYMLINK tới `ssl`** — quy trình không phải sửa đường dẫn
 
 📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
@@ -1630,25 +1673,8 @@ ls -ld /etc/kubernetes/pki /etc/kubernetes/ssl
 ```
 </details>
 
-Nếu là hai thư mục riêng, so tiếp cert nào mới hơn:
-
-📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
-
-```
-ls -l /etc/kubernetes/pki/apiserver.crt /etc/kubernetes/ssl/apiserver.crt
-```
-
-<details>
-<summary>Cách đọc</summary>
-
-```
-So cột mtime và kích thước:
-• Cùng inode/kích thước/mtime → nhiều khả năng hardlink hoặc bản sao giống hệt
-• Khác mtime → 🔴 file trong `ssl` là bản ĐANG DÙNG (theo certificatesDir),
-  file trong `pki` là bản cũ/thừa ⇒ output 3.10 đã đọc NHẦM file
-  ⇒ phải chạy lại 0.1 và 0.3 với đường dẫn /etc/kubernetes/ssl/
-```
-</details>
+> ✅ **Không cần lệnh so cert bổ sung** — vì là symlink nên chỉ có MỘT file duy nhất.
+> Rủi ro "so nhầm file ở GĐ3" đã được loại bỏ.
 
 **0q.2 — Backup file config gốc (trước khi tách)**
 
@@ -2369,7 +2395,7 @@ dừng lại, báo cáo, xử lý node 48 riêng. **Tuyệt đối không** ti�
 | **5 worker `.51-.55` chưa được kiểm tra** — kubelet client cert có thể cũng hết hạn | 🟡 TB | Sau khi control-plane xanh, kiểm `kubelet-client-current.pem` trên từng worker |
 | ~~Là stacked etcd nhưng PKI mất thật~~ | ⚪ **Đã loại bỏ** | Output 3.4: **etcd external**, không có `etcd.yaml` |
 | ~~`kubeadm-config.yaml` (2023) lỗi thời~~ | ⚪ **Đã loại bỏ** | Output 3.6: `certSANs` khớp khít cert đang chạy |
-| 🔴 **`diff` SAN ở GĐ3 so nhầm file** nếu cert thật nằm ở `/etc/kubernetes/ssl` mà lệnh đọc `/etc/kubernetes/pki` → không phát hiện được cert hỏng | 🔴 Cao | Xác minh 0q.1 **trước khi** renew. Nếu 2 thư mục riêng → chạy lại 0.1/0.3 với đường dẫn đúng |
+| ~~`diff` SAN ở GĐ3 so nhầm file do `certificatesDir` khác~~ | ⚪ **Đã loại bỏ** | Output 3.13: `pki` → symlink → `ssl`. Mọi đường dẫn trong quy trình đọc đúng file |
 | Cert cụm **etcd external** (`/etc/ssl/etcd/ssl/`) chưa kiểm hạn — sự cố riêng biệt | 🟡 TB | Kiểm sau khi khôi phục control-plane. Không do `kubeadm certs renew` quản |
 | ~~Restart nhiều master cùng lúc → mất quorum etcd~~ | 🟢 **Hạ từ 🔴** | etcd **external** (output 3.4) ⇒ không có quorum trên master để mất. Vẫn giữ tuần tự 48→49→50 để còn đường rollback nếu cert mới sai SAN |
 | Node 49/50 có thể có tình trạng cert khác 48 (chưa kiểm tra) | 🟡 TB | Chạy `check-expiration` độc lập trên từng node trước khi thao tác |
