@@ -936,7 +936,53 @@ drwxr-xr-x 2 kube root 4096 Jul  6  2023 /etc/kubernetes/ssl
 
 ---
 
-### 3.14 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.14 — [Node 48 / GĐ0-quater + 0-ter] Backup + tách file config
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ngày 19/08**
+
+**a) Backup file config gốc**
+
+```
+cp -a /etc/kubernetes/kubeadm-config.yaml /root/kubeadm-config.yaml.bak-$(date +%F-%H%M)
+```
+
+**b) Backup thư mục manifests (GĐ4 sẽ đổi tên nó)**
+
+```
+cp -a /etc/kubernetes/manifests /root/manifests-backup-$(date +%F-%H%M)
+```
+
+**c) Tách khối `ClusterConfiguration` ra file riêng**
+
+```
+sed -n '14,119p' /etc/kubernetes/kubeadm-config.yaml > /root/cluster-config-renew.yaml
+```
+
+**Output:** cả 3 lệnh **không in gì**, quay lại prompt sạch.
+
+**Đọc được gì:**
+
+- ✅ **Cả 3 lệnh chạy thành công.** `cp` và `sed` theo triết lý Unix chỉ lên tiếng khi có lỗi
+  ⇒ im lặng = không lỗi. Không có `No such file`, `Permission denied`, hay `No space left`.
+- ✅ Đã có 2 bản backup ở `/root/` theo quy tắc backup Kiên đặt.
+- ⚠️ ⭐ **NHƯNG: rỗng KHÔNG chứng minh nội dung file tách ra là ĐÚNG.**
+
+  Áp dụng đúng Bài học #12 — *"output rỗng là bằng chứng, nhưng phải biết trước rỗng nghĩa là gì"*.
+  Ở đây **rỗng = không lỗi cú pháp/quyền**, KHÔNG phải **rỗng = file có đủ `certSANs`**.
+
+  **Kịch bản hỏng cụ thể:** nếu số dòng `14,119` đọc nhầm từ screenshot (VDI, chữ nhỏ), file cắt
+  ra có thể **thiếu `certSANs`** hoặc **lẫn document khác** — mà lệnh `sed` **vẫn chạy thành công,
+  vẫn im lặng**. Kubeadm sau đó đọc file sai rồi **im lặng rơi về default config** (bẫy đã bàn ở
+  output 3.11) ⇒ cert mới mất SAN ⇒ toàn cụm hỏng.
+
+  ⇒ **Bước verify 0t.4 là chỗ DUY NHẤT bắt được lỗi này trước khi cert bị ghi đè.**
+  Không được bỏ qua.
+
+- ❓ **Chưa xác minh:** nội dung `/root/cluster-config-renew.yaml`. Xem mục 3.15.
+
+---
+
+### 3.15 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -1863,6 +1909,64 @@ KỲ VỌNG: đủ 18 entry, giống hệt output 3.6. ⭐ SOI KỸ 3 entry số
   - 10.208.137.68
   - 172.16.128.1
 Thiếu bất kỳ entry nào → cắt sai → làm lại 0t.3, KHÔNG renew
+```
+</details>
+
+**Đếm chính xác thay vì đếm bằng mắt** (18 dòng trên VDI rất dễ sót):
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+sed -n '/certSANs:/,/timeoutForControlPlane/p' /root/cluster-config-renew.yaml | grep -c '^  - '
+```
+
+<details>
+<summary>Giải nghĩa lệnh</summary>
+
+```
+sed -n '/certSANs:/,/timeoutForControlPlane/p' <file> | grep -c '^  - '
+│   │   │            │                          │       │    │
+│   │   │            │                          │       │    └─ khớp dòng bắt đầu bằng
+│   │   │            │                          │       │       ĐÚNG 2 dấu cách + "- "
+│   │   │            │                          │       │       = đúng mức thụt lề của
+│   │   │            │                          │       │       entry certSANs. Dùng `^  - `
+│   │   │            │                          │       │       thay vì `- ` để KHÔNG đếm
+│   │   │            │                          │       │       nhầm entry ở mức khác
+│   │   │            │                          │       └─ -c: ĐẾM, không in
+│   │   │            │                          └─ giới hạn phạm vi: chỉ trong khối certSANs
+│   │   │            └─ mốc KẾT THÚC: dòng ngay sau danh sách SAN (xem output 3.12, dòng 97)
+│   │   └─ mốc BẮT ĐẦU: dòng `certSANs:`
+│   └─ -n + p: chỉ in dải giữa hai mốc (xem giải nghĩa -n ở 0t.3)
+└─ ⭐ KỲ VỌNG: 18 — khớp output 3.6 và output 3.10 (SAN cert hiện tại cũng 18)
+   • Ra 18 → ✅ file tách đúng, sang GĐ1
+   • Ra < 18 → 🔴 cắt thiếu, file config sai → LÀM LẠI 0t.3, KHÔNG renew
+   • Ra > 18 → cắt lẫn danh sách khác → kiểm lại ranh giới dòng
+```
+</details>
+
+**Kiểm file có parse được như YAML hợp lệ không:**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
+
+```
+tail -3 /root/cluster-config-renew.yaml
+```
+
+<details>
+<summary>Cách đọc</summary>
+
+```
+tail -3 <file>
+│    │
+│    └─ 3 dòng CUỐI file
+└─ ⭐ MỤC ĐÍCH: xác nhận file kết thúc ĐÚNG CHỖ, không cắt cụt giữa chừng.
+   KỲ VỌNG (theo output 3.12, dòng 117-119):
+       hostPath: /etc/kubernetes/kubescheduler-config.yaml
+       mountPath: /etc/kubernetes/kubescheduler-config.yaml
+       readOnly: true
+   • Thấy dấu `---` ở cuối     → 🔴 cắt lố sang document sau, sửa lại thành '14,119p'
+   • Thấy `kind: KubeProxy...` → 🔴 cắt lố nhiều, sai hoàn toàn
+   • Dòng cuối cụt giữa chừng  → 🔴 cắt thiếu
 ```
 </details>
 
