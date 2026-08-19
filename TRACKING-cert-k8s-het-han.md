@@ -1533,7 +1533,62 @@ openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | tr ',' '\n' | 
 
 ---
 
-### 3.24 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.24 — [Node 48 / GĐ2.2] ✅ Renew 6 cert — không có cert etcd, đúng dự đoán
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~11:32 +07 ngày 19/08**
+
+```
+kubeadm certs renew all --config /root/cluster-config-renew.yaml
+```
+
+**Output:**
+
+```
+certificate embedded in the kubeconfig file for the admin to use and for kubeadm itself renewed
+certificate for serving the Kubernetes API renewed
+certificate for the API server to connect to kubelet renewed
+certificate embedded in the kubeconfig file for the controller manager to use renewed
+certificate for the front proxy client renewed
+certificate embedded in the kubeconfig file for the scheduler manager to use renewed
+
+Done renewing certificates. You must restart the kube-apiserver, kube-controller-manager, kube-scheduler and etcd, so that they can use the new certificates.
+```
+
+**Đối chiếu 6 dòng với cert thật:**
+
+| Dòng output | Cert tương ứng | Có `certSANs`? |
+|---|---|---|
+| `...kubeconfig file for the admin...` | `admin.conf` (cert nhúng base64) | Không |
+| `...for serving the Kubernetes API` | **`apiserver`** — ký lại **lần 2** | ✅ **Có** |
+| `...for the API server to connect to kubelet` | `apiserver-kubelet-client` | Không |
+| `...kubeconfig file for the controller manager` | `controller-manager.conf` | Không |
+| `...for the front proxy client` | `front-proxy-client` | Không |
+| `...kubeconfig file for the scheduler manager` | `scheduler.conf` | Không |
+
+**Đọc được gì:**
+
+- ✅ **Đủ 6 cert renewed**, không lỗi. Khớp chính xác danh sách kỳ vọng.
+- ✅ ⭐ **KHÔNG có dòng `certificate the apiserver uses to access etcd renewed`.**
+  Đây là **bằng chứng dương** (không phải suy luận) cho việc cụm dùng **etcd external**:
+  kubeadm biết nó không quản cert etcd nên không đụng tới.
+  ⇒ Củng cố output 3.4 (không có `etcd.yaml`) và 3.12 (`etcd.external` trong config).
+  ⇒ Cert etcd ở `/etc/ssl/etcd/ssl/` **không bị ảnh hưởng** bởi thao tác này.
+- ✅ **Dòng cuối `Done renewing certificates. You must restart...`** — xác nhận điều đã ghi ở
+  Bài học #5: **renew KHÔNG tự restart**. Static pod vẫn đang chạy cert cũ trong bộ nhớ.
+  (Dòng này nhắc cả `etcd` là do kubeadm in thông báo cố định, không có nghĩa cụm này có etcd
+  cần restart.)
+- ⚠️ **`apiserver` đã bị ký lại LẦN THỨ HAI.** Lần 1 ở output 3.22 (verify PASS ở 3.23), lần này
+  `all` bao gồm cả nó.
+  ⇒ **Vô hại về chức năng** — chỉ là hạn 1 năm tính lại từ bây giờ, và key mới lần nữa.
+  ⇒ **NHƯNG phải so SAN LẠI**: kết quả PASS ở output 3.23 chỉ chứng minh cho cert của lần 1.
+  Về lý thuyết cùng file config thì cùng kết quả, nhưng **không được suy đoán** — chi phí kiểm
+  là 2 lệnh, chi phí bỏ qua là restart với cert hỏng.
+- ❓ **Chưa xác minh:** SAN của cert `apiserver` sau lần ký thứ 2. **KHÔNG restart** trước khi có
+  kết quả.
+
+---
+
+### 3.25 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
