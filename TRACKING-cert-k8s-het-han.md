@@ -78,6 +78,30 @@ hỏng nặng hơn hiện tại).
 > ⚠️ Chỉ ghi lệnh **đã có output thật**. Lệnh chưa chạy nằm ở mục 7.
 > Đánh số theo **thứ tự thời gian thực tế**: 3.0 xảy ra trước 3.1.
 
+### 📋 Giao ước cập nhật khi thực hiện quy trình mục 7
+
+> Chốt với Kiên 2026-08-19. **Tách rõ 2 nhịp khác nhau** — đây là điểm dễ nhầm:
+
+| Việc | Nhịp | Lý do |
+|---|---|---|
+| **Kiên gửi output** | **Ngay sau MỖI lệnh** | ⭐ Để còn cứu được nếu sai. Chạy hết cả giai đoạn rồi mới gửi thì lỗi ở GĐ3 chỉ lộ ra khi đã restart ở GĐ4 — **cửa sổ rollback đã đóng** |
+| **Ghi vào file này** | Gom cụm ~3-5 lệnh, hoặc **ngay lập tức** nếu có bất thường | Tránh quên; nhưng không làm gián đoạn nhịp thao tác |
+
+**Quy tắc đánh số:** output thật của quy trình mục 7 ghi tiếp từ **`3.10`**, theo thứ tự thời gian.
+Mỗi mục ghi rõ **node nào** và **thuộc giai đoạn nào** (vd: `3.12 — [Node 48 / GĐ2] Renew cert`).
+
+**Node 49 và 50:** node 48 ghi **đầy đủ** làm chuẩn. Node 49/50 **chỉ ghi điểm KHÁC** so với 48
+(hoặc bất thường). Giống hệt thì ghi một dòng xác nhận `"đã chạy, kết quả giống node 48"` —
+**không lặp lại output**, nhưng cũng **không được bỏ trống** như thể chưa chạy.
+
+**Điểm dừng bắt buộc — Kiên PHẢI chờ xác nhận trước khi chạy tiếp:**
+
+| Sau bước | Vì sao phải dừng |
+|---|---|
+| **GĐ2** (renew xong) | Cert mới đã ghi đĩa nhưng pod vẫn dùng cert cũ — còn cứu được |
+| **GĐ3** (so SAN) | 🔴 **Chốt chặn quan trọng nhất.** SAN thiếu mà vẫn restart = hỏng toàn cụm, mất luôn cert cũ |
+| **GĐ5** (verify node 48) | Node 48 chưa xanh mà sang 49 = hỏng 2 node cùng lúc |
+
 ### 3.0 ⭐ Lệnh làm lộ ra sự cố — deploy RAGFlow bằng Helm
 
 **Node: `vrp-kubeengine04` (worker) — user `app`, ~08:49 +07 ngày 19/08**
@@ -619,6 +643,32 @@ systemctl list-units --type=service --state=running | grep -Ei 'keepalived|hapro
 
 ---
 
+### 3.10 → ... — [CHƯA CHẠY] Output thực hiện quy trình mục 7
+
+> 🔶 **Khu vực này còn TRỐNG vì quy trình chưa được thực hiện.**
+> Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
+> không ước lượng, không tái tạo từ trí nhớ.
+>
+> Khi Kiên chạy và gửi output, các mục sẽ được thêm vào đây theo thứ tự thời gian:
+
+| Mục dự kiến | Node | Giai đoạn | Nội dung |
+|---|---|---|---|
+| `3.10` | 48 | GĐ0 | Tiền kiểm: đếm SAN entry, version kubeadm vs apiserver |
+| `3.11` | 48, 49, 50 | GĐ1 | Backup PKI + verify archive đọc được |
+| `3.12` | 48 | GĐ2 | 🛑 Renew kèm `--config` — **điểm dừng 1** |
+| `3.13` | 48 | GĐ3 | 🛑🛑 `diff` SAN trước/sau + `check-expiration` — **điểm dừng 2** |
+| `3.14` | 48 | GĐ4 | Restart static pod, trạng thái container |
+| `3.15` | 48 | GĐ5 | 🛑 Verify: `get nodes`, control-plane pods, `curl` qua LB — **điểm dừng 3** |
+| `3.16` | 49 | GĐ2-5 | **Chỉ điểm khác** so với node 48 |
+| `3.17` | 50 | GĐ2-5 | **Chỉ điểm khác** so với node 48 |
+| `3.18` | 51-55 | GĐ6 | Cert kubelet trên 5 worker |
+| `3.19` | 04 | GĐ6 | Chạy lại `helm upgrade ragflow` (issue #6) |
+
+**Số thứ tự trên là dự kiến** — thực tế có thể lệch nếu phát sinh lệnh chẩn đoán giữa chừng.
+Nguyên tắc: đánh số **theo thứ tự thời gian thực tế**, không theo thứ tự trong quy trình.
+
+---
+
 ## 4. Issue chi tiết
 
 ### Issue #1 — Cert lá control-plane hết hạn 🔶 OPEN
@@ -1012,6 +1062,10 @@ khai báo lại `apiServer.certSANs`, **không dùng lệnh renew trần**.
 >
 > **Nguyên tắc bất di bất dịch:** làm **XONG HẲN** node 48 (gồm cả verify) rồi mới sang 49;
 > xong 49 mới sang 50. **Không bao giờ** chạy song song 2 node.
+>
+> 📋 **Nhịp làm việc** (chốt với Kiên): gửi output **ngay sau mỗi lệnh**, chờ xác nhận rồi mới
+> chạy lệnh tiếp. Ba điểm 🛑 dưới đây là **bắt buộc dừng**, không được tự chạy tiếp.
+> Chi tiết ở mục 3 → "Giao ước cập nhật".
 
 #### Điều kiện tiên quyết
 
@@ -1224,6 +1278,12 @@ kube-scheduler and etcd, so that they can use the new certificates.
 
 > ⚠️ Dòng cuối chính là xác nhận: **renew KHÔNG tự restart**. Phải làm giai đoạn 3.
 
+> ## 🛑 ĐIỂM DỪNG 1 — gửi output renew, chờ xác nhận
+>
+> Cert mới **đã ghi xuống đĩa**, nhưng static pod **vẫn đang dùng cert cũ trong bộ nhớ**.
+> Đây là trạng thái **còn cứu được hoàn toàn** bằng restore backup.
+> **Chưa chạy giai đoạn 3 khi chưa gửi output này.**
+
 ---
 
 #### GIAI ĐOẠN 3 — ⭐ SO SÁNH SAN TRƯỚC/SAU (chốt chặn — DỪNG nếu không khớp)
@@ -1281,6 +1341,19 @@ Các dòng !MISSING! của etcd VẪN CÒN — đúng như cũ, vì etcd externa
 Đây KHÔNG phải lỗi.
 ```
 </details>
+
+---
+
+> ## 🛑🛑 ĐIỂM DỪNG 2 — QUAN TRỌNG NHẤT CẢ QUY TRÌNH
+>
+> Gửi output `diff` (bước 3.2) và `check-expiration` (bước 3.3), **chờ xác nhận rồi mới restart**.
+>
+> **Vì sao đây là điểm không thể quay lại:** restart xong, static pod nạp cert mới. Nếu cert
+> thiếu SAN thì **mọi client trên mọi node** mất kết nối — và cert cũ đã bị ghi đè từ GĐ2.
+> Lúc đó chỉ còn đường restore backup trong tình trạng cluster đang hỏng, khó hơn nhiều.
+>
+> ✅ `diff` không in gì, hoặc chỉ thêm `DNS:kubernetes.default.svc.vrp` → được phép restart
+> 🔴 `diff` cho thấy **mất** entry → **KHÔNG restart**, chuyển sang ROLLBACK
 
 ---
 
@@ -1451,8 +1524,13 @@ curl -sS --cacert /etc/kubernetes/pki/ca.crt https://lb-apiserver.kubernetes.loc
 ```
 </details>
 
-> ✅ **Chỉ khi 5.1→5.4 đều PASS mới sang node 49.** Lặp lại GIAI ĐOẠN 2→5 trên node 49
-> (đổi hậu tố file thành `-49`), rồi node 50.
+> ## 🛑 ĐIỂM DỪNG 3 — gửi output verify node 48, chờ xác nhận
+>
+> **Chỉ khi 5.1→5.4 đều PASS mới sang node 49.** Node 48 chưa xanh mà đã đụng vào 49
+> = hỏng 2 node cùng lúc, cluster chỉ còn 1 master.
+>
+> Sau khi xác nhận: lặp lại GIAI ĐOẠN 2→5 trên node 49 (đổi hậu tố file thành `-49`),
+> rồi node 50. **Với 49/50 chỉ cần gửi output nào KHÁC node 48** — giống hệt thì báo một dòng.
 
 ---
 
