@@ -1,0 +1,16 @@
+{{- if and .Values.ragflow.codePatch.enabled .Values.ragflow.codePatch.hasFullFiles }}
+# Nguon cho cac patch kieu `fullFile`: ban .py DA SUA day du, doc tu
+# files/code-patch/ trong chart. InitContainer ragflow-code-patch copy tu day
+# de len /patched sau khi doi chieu md5 cua file goc trong image.
+#
+# Khoa ConfigMap phai la ten file phang (khong co "/"), nen cac patch trong
+# values.yaml dung `fullFile: <ten-file>` con `file:` van la duong dan day du.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ragflow.fullname" . }}-code-patch-src
+  labels:
+    {{- include "ragflow.labels" . | nindent 4 }}
+data:
+{{ (.Files.Glob "files/code-patch/**.py").AsConfig | indent 2 }}
+{{- end }}

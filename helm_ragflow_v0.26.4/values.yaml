@@ -194,7 +194,65 @@ ragflow:
   # pod van Running voi code CHUA duoc patch. Co verify thi pod se Init:Error.
   codePatch:
     enabled: true
+    # Bat khi co patch kieu `fullFile` - tao ConfigMap -code-patch-src va mount
+    # vao initContainer. De false neu chi dung `expr` (sed) de bot 1 ConfigMap.
+    hasFullFiles: true
     patches:
+      # ================================================================
+      # Issue #4 / Issue 10 - /api/v1/retrieval cham 2s <-> 22s (18/08/2026)
+      # Chi tiet do dac: ROOTCAUSE-retrieval-latency-kich-ban-do.md muc 9-12
+      #
+      # Hai patch duoi day dung `fullFile` thay vi `expr` vi chung sua nhieu
+      # dong va them ham moi - sed khong lam duoc an toan.
+      # File .py day du nam o files/code-patch/, dong goi thanh ConfigMap.
+      #
+      # baseMd5 = md5 file GOC trong image. InitContainer doi chieu truoc khi
+      # de len: image doi (build moi / len v0.27) => pod fail co thong bao,
+      # thay vi AM THAM de mat code moi bang code cu.
+      # ================================================================
+
+      # --- Nguyen nhan #1: MySQL deadlock tu trim pipeline_operation_log ---
+      # DELETE ... WHERE kb_id=X AND id NOT IN (1000 ids) chay MOI document
+      # parse xong, ben trong DB.atomic(). NOT IN khong dung duoc index nen
+      # khoa toan range kb_id; nhieu worker song song cung kb => deadlock.
+      # Do duoc: 44 dong (1213, 'Deadlock found') trong 10 giay.
+      #
+      # Sua: DELETE ra ngoai transaction; NOT IN -> create_time < cutoff
+      # (dung index); chi trim khi vuot limit*1.5; GET_LOCK(name,0) chan
+      # worker trung lap. Giu nguyen ngu nghia "keep latest N logs".
+      #
+      # Da kiem chung tren MySQL production: GIU LAI=1000, SE XOA=0,
+      # EXPLAIN type=ref key=pipelineoperationlog_kb_id, GET_LOCK=1.
+      - file: api/db/services/pipeline_operation_log_service.py
+        fullFile: pipeline_operation_log_service.py
+        baseMd5: b5932a3cc34a049906f62f38f1708381
+        verify: '_trim_logs'
+
+      # --- Nguyen nhan #2: get_pending_task_count quet 180k hang ---
+      # SELECT COUNT ... FROM task JOIN document WHERE progress=0 mat 5.1-6.8s
+      # MOI LAN. Index task_progress CO va DUOC DUNG, nhung rows=180,788, moi
+      # hang mot PK lookup (eq_ref) vao document (1.97M) => KHONG fix duoc
+      # bang them index.
+      # Cache TTL 3s vo hieu vi query mat 6s > TTL => moi lan goi deu miss.
+      # Short-circuit lag<=0 vo hieu vi ingest 1.9M docs => lag luon > 0.
+      # 3 pod = 3 luong COUNT chay lien tuc (thay trong innodb_trx).
+      #
+      # Sua: get_pending_task_count(priority, cap). get_queue_length truyen
+      # cap=lag vi ket qua chi dung cho min(lag, pending) - khong can dem
+      # chinh xac khi pending > lag. LIMIT trong subquery, COUNT boc ngoai.
+      # Ket qua capped KHONG cache (cap khac nhau theo caller).
+      #
+      # Da kiem chung tren MySQL production:
+      #   UNCAPPED  6.133s count=82581
+      #   CAP=100   0.010s count=100   min(lag,pending) van dung: True
+      #   CAP=500   0.024s count=500   min(lag,pending) van dung: True
+      #   CAP=5000  0.610s count=5000  min(lag,pending) van dung: True
+      # => 613x nhanh hon o cap=100, ket qua cuoi KHONG doi.
+      - file: api/db/services/document_service.py
+        fullFile: document_service.py
+        baseMd5: 385f077cba931eaaa12940311b313dbe
+        verify: 'cap is not None'
+
       # LUU Y: code v0.26 DA CO SAN minimum_should_match (rag/nlp/query.py dong
       # 92/165/229). Patch nay co the da thua - can verify lai sau khi deploy:
       #   kubectl -n <ns> exec <pod> -c ragflow -- grep -n minimum_should_match /ragflow/rag/nlp/query.py
