@@ -1252,7 +1252,53 @@ etc/kubernetes/kubeadm-config.yaml
 
 ---
 
-### 3.19 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.19 — [Node 48 / GĐ1] 🔴 XÁC NHẬN: backup KHÔNG chứa cert nào — phải làm lại
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ~11:16 +07 ngày 19/08**
+
+**a) Đếm số mục trong archive**
+
+```
+tar tzf /root/pki-backup-$(hostname)-*.tar.gz | wc -l
+```
+
+**Output:**
+
+```
+6
+```
+
+**b) Tìm 3 file cert sống còn**
+
+```
+tar tzf /root/pki-backup-$(hostname)-*.tar.gz | grep -E 'apiserver.crt|ca.crt|ca.key'
+```
+
+**Output:**
+
+```
+(rỗng — không in ra dòng nào)
+```
+
+**Đọc được gì:**
+
+- 🔴 ⭐ **XÁC NHẬN DỨT KHOÁT: archive KHÔNG chứa cert nào.** Nghi vấn ở output 3.18 là **đúng**.
+- **`6` mục** — khớp chính xác 6 dòng đã thấy ở output 3.18, **không có gì thêm**. Nếu tar gói
+  được nội dung thư mục `ssl/`, con số phải là **30-60** (hàng chục cert + key).
+- **`grep` RỖNG** — đây là **bằng chứng phủ định dứt khoát**, không phải "chưa tìm thấy":
+  `apiserver.crt`, `ca.crt`, `ca.key` là 3 file **bắt buộc phải có** trong mọi PKI của kubeadm.
+  Không có chúng ⇒ archive chỉ chứa **symlink `pki` rỗng** + 5 file `.conf`/`.yaml`.
+  (Áp dụng Bài học #12: rỗng là bằng chứng, khi đã biết trước "rỗng nghĩa là gì".)
+- ⇒ **Cả 3 node đều vậy** — cùng lệnh, cùng kết quả 11K (output 3.18).
+- 🔴 **Trạng thái thực tế: HIỆN KHÔNG CÓ BACKUP CERT NÀO.** Tuyệt đối **không được renew**
+  cho tới khi có backup thật.
+- 📌 **Nguyên nhân — lỗi khi soạn lệnh:** lệnh backup thiếu cờ `-h`, trong khi chính output 3.13
+  đã xác định `pki` là symlink. Biết symlink nhưng không nối được sang hệ quả "tar cần `-h`".
+  Xem Bài học #16.
+
+---
+
+### 3.20 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -2863,7 +2909,7 @@ dừng lại, báo cáo, xử lý node 48 riêng. **Tuyệt đối không** ti�
 | Node 49/50 có thể có tình trạng cert khác 48 (chưa kiểm tra) | 🟡 TB | Chạy `check-expiration` độc lập trên từng node trước khi thao tác |
 | ~~Registry nội bộ không truy cập được khi restart~~ | ⚪ **Đã loại bỏ (node 48)** | ✅ Output 3.11: image `kube-apiserver:v1.23.2` **có trong cache cục bộ** ⇒ kubelet không cần gọi registry. ⚠️ Nên kiểm lại tương tự trên 49/50 |
 | 🔴 **`--config` trỏ file gốc 4-document → kubeadm v1.23 rơi về default → cert mất SAN → toàn cụm hỏng** | 🔴 **Cao — đã xác nhận** | ✅ Output 3.11. Gỡ bằng GĐ0-ter (tách file). ⚠️ Nguy hiểm vì kubeadm có thể **im lặng** bỏ qua, vẫn báo "renewed" — chỉ `diff` SAN ở GĐ3 mới lộ ra |
-| 🔴 **Backup GĐ1 (11:07-11:09) có thể KHÔNG chứa cert** do thiếu cờ `-h` với symlink `pki` → tưởng có đường lùi nhưng không có | 🔴 **Cao — đang xác minh** | Đếm mục trong archive + `grep` đích danh `ca.key` (mục 3.19). Nếu thiếu → **làm lại backup với `tar czhf` và đường dẫn `/etc/kubernetes/ssl`** trước khi renew |
+| 🔴 **Backup GĐ1 lần 1 (11:07-11:09) KHÔNG chứa cert** — đã xác nhận | 🔴 **Cao — ĐANG XỬ LÝ** | ✅ Output 3.19 xác nhận: 6 mục, `grep` cert rỗng. **Phải backup lại bằng `tar czhf ... /etc/kubernetes/ssl`** trên cả 3 node. **CẤM renew** cho tới khi verify đạt |
 | Không có snapshot etcd gần đây để rollback nếu hỏng | 🟡 **Hạ từ 🔴** | etcd external ⇒ việc renew cert control-plane **không đụng tới dữ liệu etcd**. Backup PKI (mục Ngắn hạn) mới là bản lùi cần thiết |
 | Gián đoạn API server lúc restart static pod | 🟡 TB | Thực hiện trong cửa sổ bảo trì đã thống nhất với quản lý |
 | Worker node tắt lâu ngày, kubelet cert hết hạn không tự rotate được | 🟢 Thấp | Kiểm tra sau khi control-plane khôi phục; node nào hỏng thì join lại |
