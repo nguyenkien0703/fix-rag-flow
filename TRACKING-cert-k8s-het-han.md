@@ -1047,7 +1047,48 @@ tail -3 /root/cluster-config-renew.yaml
 
 ---
 
-### 3.16 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.16 — [Node 48 / GĐ0-ter] `--dry-run` KHÔNG được hỗ trợ ở kubeadm v1.23
+
+**📍 Node 48 (`vrp-kubeengine01`) — user `root`, ngày 19/08**
+
+```
+kubeadm certs renew apiserver --config /root/cluster-config-renew.yaml --dry-run
+```
+
+**Output:**
+
+```
+unknown flag: --dry-run
+To see the stack trace of this error execute with --v=5 or higher
+```
+
+**Đọc được gì:**
+
+- ✅ **Không phải lỗi thao tác.** Đây là khả năng **đã lường trước** khi soạn bước 0t.5:
+  `--dry-run` được thêm cho `kubeadm certs renew` ở bản **v1.26+**; v1.23.2 chưa có.
+  ⇒ Thêm một biểu hiện cụ thể của việc chạy version EOL (Bài học #15).
+- ✅ **Loại trừ được: KHÔNG có gì bị thay đổi.** Kubeadm dừng ngay ở khâu **parse tham số dòng
+  lệnh**, chưa hề mở file config, chưa đụng tới `/etc/kubernetes/ssl`.
+  ⇒ Cert thật nguyên vẹn, không cần rollback.
+- ⚠️ ⭐ **NHƯNG: lỗi này KHÔNG nói gì về việc file config đúng hay sai.**
+  Kubeadm chưa đọc tới file. ⇒ **Mất phép kiểm cuối cùng** — không còn cách nào xác nhận kubeadm
+  nuốt được `/root/cluster-config-renew.yaml` **trước khi** nó ghi đè cert.
+- 🔴 **Hệ quả: bước so SAN ở GĐ3 từ "chốt chặn quan trọng" thành PHÉP KIỂM DUY NHẤT.**
+  Nó vẫn đủ an toàn vì cert mới chỉ nằm **trên đĩa**, static pod vẫn chạy cert cũ **trong bộ nhớ**
+  cho tới khi restart ở GĐ4. Nhưng không còn lớp phòng thủ nào phía trước nữa.
+- ⭐ **Điều chỉnh GĐ2 để thu hẹp rủi ro** (xem quy trình đã cập nhật):
+  thay vì `renew all` một phát, tách thành **2 bước**:
+  1. `renew apiserver` — **chỉ một cert**, rồi so SAN ngay
+  2. Đúng thì mới `renew all` cho phần còn lại
+
+  **Vì sao chia được:** `apiserver` là cert **DUY NHẤT** có `certSANs`. Các cert khác
+  (`apiserver-kubelet-client`, `front-proxy-client`, cert nhúng trong `*.conf`) **không có SAN**
+  ⇒ không chịu rủi ro "mất SAN do rơi về default config".
+  ⇒ Nếu bước 1 hỏng, chỉ 1 cert bị ghi đè thay vì 6 — rollback nhẹ hơn hẳn.
+
+---
+
+### 3.17 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -2035,7 +2076,7 @@ tail -3 <file>
 ```
 </details>
 
-**0t.5 — Kiểm kubeadm parse được file mới (thử nghiệm KHÔ, không sửa gì)**
+**0t.5 — ❌ ĐÃ THỬ, KHÔNG DÙNG ĐƯỢC (output 3.16): v1.23 không hỗ trợ `--dry-run`**
 
 📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
@@ -2126,11 +2167,56 @@ tar tzf <file> | head -20
 
 #### GIAI ĐOẠN 2 — Renew cert (node 48 trước)
 
-**2.1 — Renew kèm `--config`**
+> ⚠️ **GĐ2 đã ĐIỀU CHỈNH sau output 3.16** (`--dry-run` không dùng được ở v1.23).
+> Chia làm **2 bước** thay vì `renew all` một phát, để thu hẹp thiệt hại nếu file config
+> vẫn không được kubeadm chấp nhận.
+
+**2.1 — ⭐ Renew RIÊNG cert `apiserver` trước (cert duy nhất có SAN)**
 
 📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 > 🔴 Node 49/50 làm **sau**, khi node 48 đã verify xong.
+
+```
+kubeadm certs renew apiserver --config /root/cluster-config-renew.yaml
+```
+
+<details>
+<summary>Giải nghĩa — vì sao tách riêng `apiserver`</summary>
+
+```
+kubeadm certs renew apiserver --config /root/cluster-config-renew.yaml
+│                   │          └─ file đã tách + verify ở output 3.15
+│                   └─ ⭐ CHỈ cert `apiserver`, KHÔNG phải `all`
+└─ VÌ SAO CHIA 2 BƯỚC:
+   `apiserver` là cert DUY NHẤT có certSANs. Các cert còn lại
+   (apiserver-kubelet-client, front-proxy-client, cert trong admin.conf /
+   controller-manager.conf / scheduler.conf) KHÔNG có SAN
+   ⇒ chúng không chịu rủi ro "mất SAN do kubeadm rơi về default config"
+   ⇒ Nếu bước này hỏng: chỉ 1 cert bị ghi đè thay vì 6 → rollback nhẹ hơn hẳn
+   ⇒ Mất --dry-run (output 3.16) nên đây là cách thu hẹp rủi ro tốt nhất còn lại
+```
+</details>
+
+**Output kỳ vọng:**
+
+```
+certificate for serving the Kubernetes API renewed
+
+Done renewing certificates. You must restart the kube-apiserver, kube-controller-manager, kube-scheduler and etcd, so that they can use the new certificates.
+```
+
+> ## 🛑🛑 DỪNG NGAY TẠI ĐÂY — so SAN trước khi renew tiếp
+>
+> Chạy **GIAI ĐOẠN 3** (so SAN) **NGAY BÂY GIỜ**, trước khi chạy 2.2.
+> Chỉ khi `diff` cho kết quả đúng mới quay lại chạy 2.2.
+>
+> **Lý do:** đây là lúc duy nhất biết được kubeadm có đọc `--config` hay không, mà mới chỉ
+> 1 cert bị ảnh hưởng.
+
+**2.2 — Renew các cert còn lại (CHỈ chạy sau khi GĐ3 PASS)**
+
+📍 **Node 48** (`vrp-kubeengine01`) — user **`root`**
 
 ```
 kubeadm certs renew all --config /root/cluster-config-renew.yaml
@@ -2187,13 +2273,22 @@ kube-scheduler and etcd, so that they can use the new certificates.
 >
 > Cert mới **đã ghi xuống đĩa**, nhưng static pod **vẫn đang dùng cert cũ trong bộ nhớ**.
 > Đây là trạng thái **còn cứu được hoàn toàn** bằng restore backup.
-> **Chưa chạy giai đoạn 3 khi chưa gửi output này.**
+>
+> ⚠️ **Thứ tự đúng sau khi GĐ2 chia 2 bước (output 3.16):**
+> `2.1 renew apiserver` → **GĐ3 so SAN** → nếu PASS → `2.2 renew all` → **GĐ3 lần 2** → GĐ4 restart.
+> **Không** chạy 2.2 trước khi so SAN lần 1.
 
 ---
 
 #### GIAI ĐOẠN 3 — ⭐ SO SÁNH SAN TRƯỚC/SAU (chốt chặn — DỪNG nếu không khớp)
 
-> **Đây là bước quyết định an toàn của cả quy trình.** Làm bước này **TRƯỚC** khi restart.
+> **Đây là bước quyết định an toàn của cả quy trình** — và sau output 3.16 (`--dry-run` không
+> dùng được) nó là **PHÉP KIỂM DUY NHẤT** còn lại.
+>
+> ⚠️ **Chạy GĐ3 HAI LẦN:** lần 1 ngay sau `2.1 renew apiserver` (quan trọng nhất — lúc này mới
+> 1 cert bị ghi đè), lần 2 sau `2.2 renew all` để xác nhận lần cuối.
+>
+> Làm bước này **TRƯỚC** khi restart.
 > Cert mới đã ghi xuống đĩa nhưng static pod vẫn dùng cert cũ trong bộ nhớ → **vẫn còn cứu được**
 > bằng cách restore backup. Restart rồi mới phát hiện sai thì cluster đã hỏng.
 
