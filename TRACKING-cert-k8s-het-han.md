@@ -1368,7 +1368,52 @@ ls -lh /root/pki-backup-*.tar.gz
 
 ---
 
-### 3.21 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
+### 3.21 — [Node 49, 50 / GĐ1] ✅ Backup verify ĐẠT — GIAI ĐOẠN 1 HOÀN TẤT
+
+**📍 Node 49 (`vrp-kubeengine02`) và node 50 (`vrp-kubeengine03`) — user `root`, ~11:24 +07**
+
+```
+tar tzf /root/pki-backup-$(hostname)-2026-08-19-1118.tar.gz | wc -l
+```
+
+```
+tar tzf /root/pki-backup-$(hostname)-2026-08-19-1118.tar.gz | grep -E 'apiserver.crt|ca.crt|ca.key'
+```
+
+**Output — giống hệt nhau trên cả node 49 và 50:**
+
+```
+18
+```
+
+```
+etc/kubernetes/ssl/front-proxy-ca.key
+etc/kubernetes/ssl/ca.crt
+etc/kubernetes/ssl/apiserver.crt
+etc/kubernetes/ssl/ca.key
+etc/kubernetes/ssl/front-proxy-ca.crt
+```
+
+**Đọc được gì:**
+
+- ✅ **Node 49 và 50 đều `18` mục** — khớp chính xác node 48 (output 3.20).
+- ✅ **Đủ 3 file sống còn** `apiserver.crt`, `ca.crt`, `ca.key` trên cả hai node.
+- ✅ **Lệnh dùng `$(hostname)` chạy đúng trên cả hai node** mà không phải sửa tay — xác nhận
+  cách gỡ ở Bài học #17 là đúng.
+- ✅ ⭐ **GIAI ĐOẠN 1 HOÀN TẤT.** Cả 3 master đã có backup **thật sự dùng được**:
+
+  | Node | File backup | Số mục | Size | Verify |
+  |---|---|---|---|---|
+  | 48 `vrp-kubeengine01` | `pki-backup-vrp-kubeengine01-2026-08-19-1118.tar.gz` | 18 | 22K | ✅ |
+  | 49 `vrp-kubeengine02` | `pki-backup-vrp-kubeengine02-2026-08-19-1118.tar.gz` | 18 | 22K | ✅ |
+  | 50 `vrp-kubeengine03` | `pki-backup-vrp-kubeengine03-2026-08-19-1118.tar.gz` | 18 | 22K | ✅ |
+
+  ⚠️ **Bản `-1107/-1108/-1109` (11K) là bản HỎNG** — giữ lại nhưng **KHÔNG dùng để rollback**.
+- ⇒ **Đủ điều kiện an toàn để sang GĐ2 (renew).** Đường lùi đã có thật, không phải giả định.
+
+---
+
+### 3.22 → ... — [CHƯA CHẠY] Output các giai đoạn tiếp theo
 
 > 🔶 **Khu vực này còn TRỐNG.**
 > Đúng nguyên tắc của skill: **không có output thật thì không ghi** — không điền trước,
@@ -2951,7 +2996,7 @@ helm upgrade ragflow . -n ragflow -f values.yaml
 📍 **Node đang gặp sự cố** — user **`root`**
 
 ```
-tar xzf /root/pki-backup-$(hostname)-<timestamp>.tar.gz -C /
+tar xzf /root/pki-backup-$(hostname)-2026-08-19-1118.tar.gz -C /
 ```
 
 <details>
@@ -2965,7 +3010,9 @@ tar xzf <file> -C /
 └─ -C /: giải nén tương đối với thư mục gốc `/`.
    Archive lưu đường dẫn dạng `etc/kubernetes/pki/...` (không có `/` đầu) nên cần -C /
    để file về đúng /etc/kubernetes/pki/
-⚠️ Thay <timestamp> bằng tên file thật — chạy `ls /root/pki-backup-*` để xem
+⚠️ TIMESTAMP PHẢI LÀ `-1118` — đây là bản backup ĐÚNG (18 mục, 22K, output 3.20/3.21).
+   TUYỆT ĐỐI KHÔNG dùng bản `-1107/-1108/-1109` (11K): chúng KHÔNG chứa cert nào
+   (output 3.19), restore bằng chúng sẽ không khôi phục được gì
 Vì chưa restart, static pod vẫn dùng cert cũ trong bộ nhớ ⇒ restore xong là như chưa có gì
 ```
 </details>
@@ -3002,7 +3049,7 @@ dừng lại, báo cáo, xử lý node 48 riêng. **Tuyệt đối không** ti�
 | Node 49/50 có thể có tình trạng cert khác 48 (chưa kiểm tra) | 🟡 TB | Chạy `check-expiration` độc lập trên từng node trước khi thao tác |
 | ~~Registry nội bộ không truy cập được khi restart~~ | ⚪ **Đã loại bỏ (node 48)** | ✅ Output 3.11: image `kube-apiserver:v1.23.2` **có trong cache cục bộ** ⇒ kubelet không cần gọi registry. ⚠️ Nên kiểm lại tương tự trên 49/50 |
 | 🔴 **`--config` trỏ file gốc 4-document → kubeadm v1.23 rơi về default → cert mất SAN → toàn cụm hỏng** | 🔴 **Cao — đã xác nhận** | ✅ Output 3.11. Gỡ bằng GĐ0-ter (tách file). ⚠️ Nguy hiểm vì kubeadm có thể **im lặng** bỏ qua, vẫn báo "renewed" — chỉ `diff` SAN ở GĐ3 mới lộ ra |
-| 🔴 **Backup GĐ1 lần 1 (11:07-11:09) KHÔNG chứa cert** — đã xác nhận | 🔴 **Cao — ĐANG XỬ LÝ** | ✅ Output 3.19 xác nhận: 6 mục, `grep` cert rỗng. **Phải backup lại bằng `tar czhf ... /etc/kubernetes/ssl`** trên cả 3 node. **CẤM renew** cho tới khi verify đạt |
+| ~~Backup GĐ1 lần 1 (11:07-11:09) không chứa cert~~ | ⚪ **ĐÃ XỬ LÝ** | ✅ Output 3.20+3.21: backup lại bằng `tar czhf ... /etc/kubernetes/ssl` — cả 3 node đạt **18 mục, 22K**, đủ `apiserver.crt`/`ca.crt`/`ca.key`. Bản `-1107/08/09` (11K) giữ lại nhưng **không dùng để rollback** |
 | Không có snapshot etcd gần đây để rollback nếu hỏng | 🟡 **Hạ từ 🔴** | etcd external ⇒ việc renew cert control-plane **không đụng tới dữ liệu etcd**. Backup PKI (mục Ngắn hạn) mới là bản lùi cần thiết |
 | Gián đoạn API server lúc restart static pod | 🟡 TB | Thực hiện trong cửa sổ bảo trì đã thống nhất với quản lý |
 | Worker node tắt lâu ngày, kubelet cert hết hạn không tự rotate được | 🟢 Thấp | Kiểm tra sau khi control-plane khôi phục; node nào hỏng thì join lại |
