@@ -43,6 +43,10 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
+      # Thoi gian cho pod tu thoat khi bi xoa/rolling update.
+      # Mac dinh k8s la 30s. Pod nay chay task_executor dang xu ly file ingest
+      # => cat giua chung co the de lai task do dang. Nang len cho no ket thuc tu te.
+      terminationGracePeriodSeconds: {{ .Values.ragflow.deployment.terminationGracePeriodSeconds | default 60 }}
       {{- if .Values.ragflow.codePatch.enabled }}
       initContainers:
         - name: ragflow-code-patch
@@ -137,6 +141,32 @@ spec:
         envFrom:
           - secretRef:
               name: {{ include "ragflow.fullname" . }}-env-config
+        # --- Probes (them 2026-08-21) -----------------------------------------
+        # VAN DE TRUOC DO: KHONG co probe nao. K8s mac dinh coi container
+        # "Ready" ngay khi process start => Service them pod vao Endpoints =>
+        # nginx forward request vao pod CHUA ket noi duoc MySQL/ES/Redis/MinIO
+        # => 502. Nang hon khi rolling update: pod cu bi giet ngay khi pod moi
+        # bao "Ready" (that ra chua san sang) => co thoi diem KHONG pod nao phuc vu.
+        #
+        # Endpoint doc tu SOURCE v0.26.4 (khong doan):
+        #   api/apps/restful_apis/system_api.py:229  @manager.route("/system/healthz")
+        #   api/apps/restful_apis/system_api.py:38   @manager.route("/system/ping")
+        #   api/apps/__init__.py:363  url_prefix = "/api/v1" cho restful_apis
+        #   => duong dan day du: /api/v1/system/healthz va /api/v1/system/ping
+        # Ca hai KHONG co @login_required => goi duoc khong can token.
+        # (Nguoc lai /system/version CO ApiKeyAuth => KHONG dung lam probe duoc.)
+        {{- with .Values.ragflow.deployment.readinessProbe }}
+        readinessProbe:
+          {{- . | toYaml | nindent 10 }}
+        {{- end }}
+        {{- with .Values.ragflow.deployment.livenessProbe }}
+        livenessProbe:
+          {{- . | toYaml | nindent 10 }}
+        {{- end }}
+        {{- with .Values.ragflow.deployment.startupProbe }}
+        startupProbe:
+          {{- . | toYaml | nindent 10 }}
+        {{- end }}
         {{- with .Values.ragflow.deployment.resources }}
         resources:
           {{- . | toYaml | nindent 10 }}
@@ -150,13 +180,48 @@ spec:
             name: ragflow-service-config
         {{- if .Values.ragflow.codePatch.enabled }}
         - name: code-patch-volume
-          emptyDir: {}
+          # sizeLimit: emptyDir mac dinh KHONG gioi han => ghi bao nhieu cung duoc
+          # va tinh vao disk NODE. Dat tran de mot pod loi khong the lam day node.
+          # Vuot tran => kubelet evict rieng pod do (thay vi ca node vao DiskPressure).
+          emptyDir:
+            sizeLimit: {{ .Values.ragflow.codePatch.sizeLimit | default "256Mi" }}
         {{- if .Values.ragflow.codePatch.hasFullFiles }}
         - name: code-patch-src-volume
           configMap:
             name: {{ include "ragflow.fullname" . }}-code-patch-src
         {{- end }}
         {{- end }}
+{{- if .Values.ragflow.deployment.podDisruptionBudget.enabled }}
+---
+# PodDisruptionBudget (them 2026-08-21)
+# VAN DE TRUOC DO: redis CO pdb (redis.yaml), ragflow thi KHONG.
+# => `kubectl drain` mot node (bao tri, no disk, upgrade) co the xoa CA 3 pod
+#    ragflow cung luc neu chung tinh co nam chung node => downtime toan bo.
+# podAntiAffinity chi la "preferred" (mem) nen KHONG bao dam 3 pod o 3 node khac nhau.
+#
+# minAvailable: k8s se TU CHOI eviction neu so pod Ready tut xuong duoi muc nay.
+# Voi replicas=3, minAvailable=2 cho phep drain lan luot tung node ma van con 2 pod phuc vu.
+# LUU Y: PDB chi chan EVICTION CO CHU DICH (drain, descheduler).
+# KHONG chan duoc kubelet evict do DiskPressure/MemoryPressure - do la eviction
+# cuong buc o tang node. Chong loai do bang resources.requests (QoS Burstable).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ragflow.fullname" . }}-pdb
+  labels:
+    {{- include "ragflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ragflow
+spec:
+  {{- if .Values.ragflow.deployment.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.ragflow.deployment.podDisruptionBudget.minAvailable }}
+  {{- else if .Values.ragflow.deployment.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.ragflow.deployment.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ragflow.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ragflow
+{{- end }}
 ---
 apiVersion: v1
 kind: Service
