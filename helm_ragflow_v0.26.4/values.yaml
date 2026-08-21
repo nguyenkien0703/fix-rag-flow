@@ -129,8 +129,121 @@ ragflow:
     # xu ly trung). Web/API stateless theo request.
     replicas: 3
 
+    # --- Rolling update strategy (them 2026-08-21) -------------------------
+    # TRUOC DO de trong => k8s dung mac dinh maxUnavailable=25%, maxSurge=25%.
+    # Voi replicas=3: 25% lam tron len = 1 => cho phep 1 pod chet trong luc
+    # update. Ket hop voi viec KHONG co readinessProbe (da sua ben duoi) thi
+    # pod moi bi coi la Ready ngay lap tuc => pod cu bi giet khi pod moi CHUA
+    # thuc su phuc vu duoc => 502 trong suot qua trinh deploy.
+    #
+    # maxUnavailable: 0 = KHONG duoc phep giam so pod dang phuc vu.
+    # maxSurge: 1      = tao them 1 pod moi, doi no Ready THAT SU (qua
+    #                    readinessProbe /api/v1/system/healthz) roi moi giet pod cu.
+    # Danh doi: update lau hon (tuan tu tung pod) va can du tai nguyen cho
+    # replicas+1 pod trong luc update. Doi lai: khong downtime.
     strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 1
+
+    # --- Resources (them 2026-08-21) ---------------------------------------
+    # TRUOC DO de trong => pod khong co requests/limits => QoS class =
+    # **BestEffort** => khi node DiskPressure/MemoryPressure, kubelet evict
+    # BestEffort **DAU TIEN**.
+    # ⭐ Day chinh la mot nguyen nhan cua vu disk vua xu ly: ~20 pod litellm/
+    #    signoz bi Evicted hang loat (co pod ton dong 24 ngay). Moi pod Evicted
+    #    lai de lai mot snapshot container khong duoc don => gop vao 22G
+    #    snapshots do duoc tren .51 => vong lap tu nuoi: disk day -> evict ->
+    #    snapshot rac -> disk day hon.
+    # Dat requests => QoS len **Burstable** => duoc uu tien giu lai.
+    #
+    # ephemeral-storage: chan mot pod ghi tran disk NODE (log, temp, emptyDir).
+    # Vuot limits => kubelet evict RIENG pod do, thay vi ca node vao DiskPressure.
+    # Day la lop bao ve truc tiep cho van de disk.
+    #
+    # Con so: node worker 8C/16G (.51/.52/.54) va 16C/32G (.53/.55).
+    # replicas=3 voi requests 2C/4Gi => tong dat cho 6C/12Gi, vua voi cum.
+    # ⚠️ Nen do lai bang `kubectl top pod` sau vai ngay va chinh theo p95 thuc te.
     resources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+        ephemeral-storage: 2Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+        ephemeral-storage: 10Gi
+
+    # --- Probes (them 2026-08-21) ------------------------------------------
+    # Endpoint LAY TU SOURCE v0.26.4 trong repo (ragflow-0.26.4/), khong doan:
+    #   api/apps/restful_apis/system_api.py:229 -> route("/system/healthz")
+    #   api/apps/restful_apis/system_api.py:38  -> route("/system/ping")
+    #   api/apps/__init__.py:363 -> url_prefix = "/api/v1" cho restful_apis
+    #   => /api/v1/system/healthz , /api/v1/system/ping
+    # Ca hai KHONG co @login_required => probe goi duoc khong can token.
+    # (/system/version CO ApiKeyAuth => KHONG dung lam probe duoc.)
+    #
+    # healthz chay run_health_checks() (api/utils/health_utils.py:295) kiem:
+    #   db (MySQL) + redis + doc_engine (Elasticsearch) + storage (MinIO)
+    # Tra 200 neu TAT CA ok, 500 neu bat ky cai nao hong. Dung chuan readiness.
+    #
+    # ⭐ VI SAO readiness dung healthz con liveness dung ping:
+    #   - readiness = "co phuc vu duoc khong". ES ngoai cum chap chon => pod bi
+    #     rut khoi Endpoints, tu quay lai khi ES hoi. Khong restart.
+    #   - liveness  = "process co chet khong". Neu dung healthz cho liveness thi
+    #     ES chap chon se lam kubelet GIET VA RESTART pod - trong khi loi nam o
+    #     ES chu khong phai pod => restart loop vo nghia, con lam tinh hinh te hon.
+    #   ⟹ Ranh gioi nay quan trong, dung gop hai probe vao mot endpoint.
+    readinessProbe:
+      httpGet:
+        path: /api/v1/system/healthz
+        port: 9380
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      # failureThreshold 3 = hong 3 lan lien tiep (30s) moi rut khoi Endpoints.
+      # Khong de 1 vi ES/MySQL co the nhay mot nhip ngan.
+      failureThreshold: 3
+      successThreshold: 1
+
+    livenessProbe:
+      httpGet:
+        path: /api/v1/system/ping
+        port: 9380
+      # initialDelay cao hon readiness: chi giet pod khi that su treo,
+      # va phai cho qua giai doan khoi dong (load model, ket noi).
+      initialDelaySeconds: 60
+      periodSeconds: 20
+      timeoutSeconds: 5
+      # 6 lan x 20s = 2 phut treo lien tuc moi restart. Cao co chu dich:
+      # restart pod ragflow rat dat (image 7-8GB, phai load lai).
+      failureThreshold: 6
+
+    # startupProbe: cho pod khoi dong cham ma KHONG bi liveness giet oan.
+    # 30 x 10s = toi da 5 phut de start. Trong luc startupProbe chua pass,
+    # liveness/readiness BI TAM DUNG => tranh vong lap giet-restart luc boot.
+    startupProbe:
+      httpGet:
+        path: /api/v1/system/ping
+        port: 9380
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 30
+
+    # Cho task_executor ket thuc task ingest dang do dang truoc khi bi giet.
+    terminationGracePeriodSeconds: 60
+
+    # --- PodDisruptionBudget (them 2026-08-21) ------------------------------
+    # redis DA CO pdb tu truoc, ragflow thi khong => drain node co the xoa ca
+    # 3 pod cung luc (podAntiAffinity chi la "preferred", khong bao dam trai node).
+    # minAvailable=2 voi replicas=3 => drain lan luot van con 2 pod phuc vu.
+    # ⚠️ PDB chi chan eviction CO CHU DICH (drain/descheduler), KHONG chan
+    #    kubelet evict do DiskPressure - loai do phai chong bang resources.requests.
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 2
+      # maxUnavailable: 1    # dung cai nay HOAC minAvailable, khong dung ca hai
 
     # De trong = pod chay duoc tren MOI node (image da copy len tat ca node
     # worker). Neu chi copy len mot so node, dat lai label o day de gioi han.
@@ -194,6 +307,10 @@ ragflow:
   # pod van Running voi code CHUA duoc patch. Co verify thi pod se Init:Error.
   codePatch:
     enabled: true
+    # Tran dung luong cho emptyDir chua file da patch (mac dinh emptyDir KHONG
+    # gioi han => ghi bao nhieu cung duoc va tinh vao disk NODE).
+    # Cac file patch chi vai chuc KB nen 256Mi la du rong.
+    sizeLimit: 256Mi
     # Bat khi co patch kieu `fullFile` - tao ConfigMap -code-patch-src va mount
     # vao initContainer. De false neu chi dung `expr` (sed) de bot 1 ConfigMap.
     hasFullFiles: true
