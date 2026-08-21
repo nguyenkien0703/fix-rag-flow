@@ -1017,6 +1017,88 @@ FATA[0000] unknown subcommand "df" for "system"   ← nerdctl bản này KHÔNG 
 ⟹ **Đòn bẩy có thể lớn hơn dự tính:** 23G + 16G + 3.4G ≈ **42G tiềm năng**, so với việc
 dọn image nerdctl. Nhưng phải biết chúng là GÌ trước — xem lệnh **1.14**.
 
+### 2.2c-bis ✅ BÓC XONG TOÀN BỘ DISK `.51` — không còn ẩn số
+
+```
+$ du -shx /var/* | sort -rh | head
+58G     /var/lib
+1.3G    /var/spool
+454M    /var/cache
+325M    /var/log
+
+$ du -shx /var/lib/* | sort -rh | head
+38G     /var/lib/containerd
+20G     /var/lib/nerdctl        ← ⭐ MỚI LỘ RA, chưa từng nằm trong danh sách nghi phạm
+192M    /var/lib/rpm
+20M     /var/lib/yum
+352K    /var/lib/kubelet
+
+$ du -shx /home/* /root/* | sort -rh | head
+15G     /home/app               ← ⭐ tarball + backup + pgdata n8n
+3.4G    /root/images            ← ⭐ tarball
+388M    /home/vt_admin
+9.2M    /root/sd-agent-4.8.rpm
+188K×N  /home/backup_2026MMDD   ← ~15 thư mục, mỗi cái chỉ 184-188K, không đáng kể
+```
+
+**Bảng cân đối cuối cùng cho 83G used:**
+
+| Mục | Size | Dọn được? |
+|---|---|---|
+| `/var/lib/containerd` | 38G | Một phần (xem 2.2d) |
+| `/var/lib/nerdctl` | **20G** | 🔴 **PHẦN LỚN LÀ DATA n8n — KHÔNG ĐỤNG** |
+| `/home/app` | 15G | ✅ ~13G tarball/backup — trừ pgdata sống |
+| `/root/images` | 3.4G | ✅ tarball RAGFlow |
+| `/usr` | 3.0G | ❌ hệ điều hành |
+| `/var/spool` + `/var/cache` + `/var/log` | ~2G | Một phần |
+
+⚠️ **`/var/lib/nerdctl` 20G là phát hiện quan trọng:** đây là nơi nerdctl lưu **volume data +
+metadata**, TÁCH BIỆT khỏi `/var/lib/containerd`. Khớp với `nerdctl namespace ls` báo
+`default` có **2 volume** ⟹ chính là data của n8n + postgres.
+🔴 **TUYỆT ĐỐI KHÔNG `nerdctl volume prune` / không xóa `/var/lib/nerdctl`.**
+
+### 2.2c-ter ⭐ DANH SÁCH TARBALL/BACKUP DỌN ĐƯỢC (~13-14G)
+
+```
+$ find /home /root -xdev -type f -size +200M -exec ls -lh {} \; | sort -rh
+3.4G  Jul 31 10:55  /root/images/ragflow-v0264_custom.tar
+1.4G  Mar 30 17:30  /home/app/workspace/n8n_nerdctl/n8n_backup_2026-03-30.sql
+1.2G  May  8 17:16  /home/app/workspace/images/n8n.tar
+1.2G  May 13 17:34  /home/app/workspace/images/n8n_nerdctl/n8n-curl.tar
+1.2G  Mar 30 16:43  /home/app/workspace/images/n8nio.tar
+1.2G  Aug  7 10:35  /home/app/rag_flow_backup_20260807.sql
+1.1G  Dec 25 2025   /home/app/workspace/images/n8n_1_122_5.tar
+1.0G  Aug 21 12:00  /home/app/persistent-data/n8n_20251218_2006/postgres/pgdata/base/16384/24993
+862M  Jun 15 2025   /home/app/workspace/langfuse/langfuse-3.68.tar
+700M  May 25 16:35  /home/app/signoz/signoz-images/signoz_images.zip
+594M  Jul 27 16:01  /home/app/open-notebook/open-notebook-images.zip
+567M  Jul 27 15:21  /home/app/open-notebook/open-notebook.tar
+369M  Jul  7 16:02  /home/app/signoz-migrate/metrics_samples.native
+263M  Apr  7 10:55  /home/app/workspace/images/n8n_curl.tar
+261M  May 26 08:14  /home/app/signoz/ctr_signoz_images/zookeeper.tar
+261M  May 25 16:35  /home/app/signoz/signoz-images/signoz_zookeeper_3.7.1.tar
+256M  Jul  7 16:02  /home/app/signoz-migrate/metrics_timeseries.native
+```
+
+**Phân loại:**
+
+| Nhóm | Ước tính | Đánh giá |
+|---|---|---|
+| **Image tarball** (`.tar`, `.zip`) — ragflow, n8n ×5, langfuse, signoz, open-notebook | **~10G** | ✅ **Rác thuần túy** nếu image đã import vào containerd. Verify bằng `nerdctl images` / `ctr -n k8s.io images ls` xem image tương ứng đã có chưa |
+| **Backup SQL** — `n8n_backup_2026-03-30.sql` (1.4G), `rag_flow_backup_20260807.sql` (1.2G) | **~2.6G** | ⚠️ **Quyết định nghiệp vụ** — backup có nơi lưu khác không? Nếu đây là bản duy nhất thì phải chuyển đi trước khi xóa |
+| **signoz-migrate `.native`** | ~0.6G | ⚠️ Dữ liệu migrate — hỏi còn cần không |
+
+🔴🔴 **FILE TUYỆT ĐỐI KHÔNG ĐƯỢC ĐỤNG:**
+```
+1.0G  Aug 21 12:00  /home/app/persistent-data/n8n_20251218_2006/postgres/pgdata/base/16384/24993
+```
+- `pgdata/base/...` = **file dữ liệu PostgreSQL SỐNG** của n8n.
+- **`Aug 21 12:00` = đang được GHI ngay lúc chạy lệnh** (hôm nay).
+- ⚠️ **BẪY:** tên thư mục `n8n_20251218_2006` trông như backup cũ tháng 12/2025 —
+  **nhưng timestamp nói ngược lại.** Đây là thư mục data đang hoạt động, chỉ đặt tên theo
+  ngày khởi tạo. **Xóa = mất toàn bộ workflow n8n.**
+- ⟹ Khi dọn `/home/app`, **PHẢI loại trừ `persistent-data/`.**
+
 ### 2.2d ⚠️ Image nerdctl: mỗi image có 2 TAG, chưa chắc là 2 BẢN SAO
 
 `nerdctl images` cho thấy mọi image xuất hiện **2 lần** — tag ngắn và tag đầy đủ, **cùng size**:
@@ -1036,14 +1118,42 @@ dọn image nerdctl. Nhưng phải biết chúng là GÌ trước — xem lệnh
 Nếu đúng vậy: **xóa bớt một tag KHÔNG thu về GB nào** — layer chỉ thực sự được giải phóng
 khi tag CUỐI CÙNG trỏ tới nó bị xóa.
 
-⟹ **PHẢI xác nhận bằng Image ID trước khi ước lượng lợi ích** — xem lệnh **1.15**.
-Ở lần đo trước (`nerdctl images` mặc định) đã thấy dấu hiệu này:
-`bitnami/kafka` và `10.208.137.65:8890/vmlp/bitnami/kafka` **cùng IMAGE ID `5a85aeb27ffa`**
-⟹ **gần như chắc chắn là cùng image, khác tag.** Cần verify diện rộng.
+### 2.2d-bis ✅ ĐÃ VERIFY — kết quả thật
 
-**Hệ quả:** con số "69 image" ở `nerdctl namespace ls` có thể chỉ tương ứng ~35 image thật.
-Lợi ích dọn dẹp namespace `default` **nhỏ hơn ước tính ban đầu** — nhưng vẫn đáng làm vì
-image tuổi 22-24 tháng, không container nào dùng.
+```
+$ echo "So dong: $(nerdctl images -q | wc -l)"
+So dong: 71
+$ echo "So Image ID duy nhat: $(nerdctl images --format '{{.ID}}' | sort -u | wc -l)"
+So Image ID duy nhat: 47
+
+$ du -sh /var/lib/containerd/io.containerd.content.v1.content
+17G     .../io.containerd.content.v1.content          ← blob layer image
+$ du -sh /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
+22G     .../io.containerd.snapshotter.v1.overlayfs    ← ⭐ rootfs container
+```
+
+**Đọc ra được gì:**
+
+1. **71 dòng / 47 Image ID** ⟹ có **24 tag thừa**, nhưng vẫn có **47 image thật**.
+   Cảnh báo "đếm trùng" ở trên là **đúng nhưng không nghiêm trọng như lo ngại** —
+   không phải 69→35, mà là 71→47.
+
+2. ⭐⭐ **`snapshots` (22G) > `content` (17G)** — đây mới là phát hiện quan trọng.
+   - `content` = blob layer của image ⟹ `nerdctl rmi` / `crictl rmi` dọn phần này.
+   - `snapshots` = **filesystem của từng container** đang/đã chạy.
+     Snapshot chỉ được giải phóng khi **CONTAINER bị xóa**, KHÔNG phải khi image bị xóa.
+   - 35 container `k8s.io` + 2 container `default` + container chết chưa dọn đang giữ 22G.
+
+   ⟹ 🔴 **`nerdctl rmi` / image GC một mình sẽ cho kết quả đáng thất vọng** —
+   chỉ với tới được 17G, và chỉ phần không container nào tham chiếu.
+   **Muốn thu hồi 22G snapshots thì phải dọn CONTAINER trước** (pod Evicted tồn đọng!).
+
+   ⟹ Điều này cũng **giải thích vì sao image GC của kubelet chạy mãi mà disk không giảm**:
+   nó xóa image (content) nhưng snapshot của container chết vẫn nằm nguyên đó.
+
+3. **Liên hệ với ~20 pod `Evicted` tuổi 8-24 ngày:** mỗi pod Evicted vẫn còn container
+   ở trạng thái exited, mỗi container giữ một snapshot ⟹ **dọn pod Evicted có thể thu về
+   một phần đáng kể trong 22G**, và đây là việc **rủi ro rất thấp**.
 
 ### 2.3 Output thật
 
@@ -1083,22 +1193,285 @@ image tuổi 22-24 tháng, không container nào dùng.
 - [ ] Đề xuất fix triệt để — **chưa viết, chờ số liệu**
 - [ ] Cải thiện Helm chart RAGFlow v0.26.4 (**Kiên chưa liệt kê cụ thể — xem mục 4**)
 
-### 💡 Hướng fix đang hình thành (chưa chốt, cần số liệu xác nhận)
+### 💡 KẾ HOẠCH FIX cho `.51` — đã đủ số liệu, xếp theo (lợi ích ÷ rủi ro)
 
-| # | Việc | Đòn bẩy | Rủi ro |
-|---|---|---|---|
-| 1 | **Dọn `/home` 16G + phần rác trong `/var` 23G** (tarball, backup, docker cũ) | ⭐⭐⭐ Lớn nhất, ~42G | Rất thấp NẾU là tarball/backup — cần Kiên xác nhận không ai cần |
-| 2 | Dọn image rác namespace `default`, chừa 2 image n8n | ⭐⭐ Nhắm đúng thủ phạm GC không với tới | Thấp — nhưng **lợi ích chưa rõ**, chờ lệnh 1.15 |
-| ~~2b~~ | ~~Thu hồi 45G fd rác~~ | ❌ **ĐÃ LOẠI** — chỉ 0.02G | — |
-| 3 | Nâng `imageMinimumGCAge` 2m → dài hơn, cho cụm airgap | ⭐⭐ Chặn GC xóa image không kéo lại được | Disk phải dọn đường khác |
-| 4 | Dọn pod `Evicted` tồn đọng | ⭐ Giải phóng slot `maxPods=50` | Rất thấp |
-| 5 | Pre-pull image thiết yếu về node sau khi dọn | ⭐⭐ Chặn tái diễn | Cần node thông registry |
+> Nguyên tắc: **làm từ việc rủi ro thấp nhất trước**, đo lại `df -h /` sau mỗi bước.
+> Mục tiêu: đưa `.51` từ 88% xuống dưới 80% (dưới `imageGCLowThreshold`) ⟹ GC ngừng hẳn,
+> `DiskPressure` tự hết.
+> **Cần giải phóng tối thiểu ~8G** (88%→80% của 99G). Các bước dưới thừa sức đạt.
+
+| # | Việc | Thu hồi | Rủi ro | Cần ai quyết |
+|---|---|---|---|---|
+| **1** | **Xóa image tarball `.tar`/`.zip`** đã import xong (ragflow 3.4G, n8n ×5 ~4.9G, langfuse, signoz, open-notebook) | **~10G** | 🟢 **Rất thấp** — verify image đã có trong containerd trước | Không (kỹ thuật) |
+| **2** | **Dọn pod `Evicted`** (~20 pod, 8-24 ngày) ⟹ giải phóng snapshot | **? trong 22G** | 🟢 Rất thấp | Không |
+| **3** | **Xóa 24 tag thừa + image không container nào dùng** trong `default` | ? phần của 17G | 🟡 Thấp — chừa 2 image n8n | Không |
+| **4** | Xử lý backup SQL (`n8n_backup` 1.4G, `rag_flow_backup` 1.2G) | ~2.6G | 🟡 **Quyết định nghiệp vụ** | ⚠️ **Kiên/anh Cường** |
+| **5** | `signoz-migrate/*.native` (~0.6G) | ~0.6G | 🟡 Hỏi còn cần không | ⚠️ Kiên |
+| **6** | Nâng `imageMinimumGCAge` 2m → 168h (chống tái diễn) | 0 | 🟡 Cần restart kubelet | Không |
+| **7** | Pre-pull image thiết yếu sau khi dọn | 0 | 🟢 | Không |
+
+**🔴 DANH SÁCH CẤM ĐỤNG (nhắc lại, đã có đủ bằng chứng):**
+- `/var/lib/nerdctl` (20G) — volume data n8n + postgres
+- `/home/app/persistent-data/` — **pgdata SỐNG của n8n**, đang ghi lúc 12:00 hôm nay
+- Image `docker.io/n8nio/n8n:1.123.38-curl` và `10.208.137.65:8890/vmlp/postgres:16.4`
+- **KHÔNG** `nerdctl volume prune`, **KHÔNG** `nerdctl system prune -a`
+
+### ⚠️ Vì sao image GC chạy mãi mà disk không giảm — đã giải thích được
+
+`snapshots 22G > content 17G`. GC xóa **image (content)** nhưng **snapshot của container chết
+vẫn nằm nguyên**. Cộng thêm 20G `/var/lib/nerdctl` + 18G tarball/backup mà GC **hoàn toàn
+không với tới được** ⟹ GC xóa sạch image k8s (còn 12) mà disk vẫn 88%
+⟹ tiếp tục xóa ⟹ **ImagePullBackOff toàn cụm.**
+
+Nói cách khác: **GC đang bị giao một việc bất khả thi.** 58/83G nằm ngoài tầm với của nó.
+Fix đúng là **giải phóng phần GC không với tới được** (bước 1, 4, 5), chứ không phải
+chỉnh GC (bước 6 chỉ là chống tái diễn).
+
+## 3b. LỆNH THỰC THI FIX trên `.51` (user root)
+
+> ⚠️ **CHƯA CHẠY BƯỚC XÓA NÀO cho tới khi verify xong.** Mỗi bước có phần VERIFY trước,
+> XÓA sau, và ĐO LẠI. Đo `df -h /` trước khi bắt đầu để có mốc so sánh.
+
+```bash
+df -h /
+```
+
+### Bước 0 — VERIFY: image trong tarball đã nằm trong containerd chưa?
+
+Chỉ khi image đã có sẵn thì tarball mới là rác. Chạy trước khi xóa bất cứ `.tar` nào.
+
+```bash
+nerdctl images | grep -iE "ragflow|n8n|langfuse|signoz|open-notebook|zookeeper"
+```
+
+```bash
+ctr -n k8s.io images list -q | grep -iE "ragflow|signoz|langfuse"
+```
+
+<details>
+<summary>Giải nghĩa bước 0</summary>
+
+```
+Mục đích: chứng minh tarball là BẢN SAO THỪA, không phải bản duy nhất.
+
+Logic: `.tar` sinh ra từ `docker save`/`ctr images export` để chuyển image vào cụm airgap.
+Sau khi `ctr images import` xong thì image nằm trong containerd, tarball hết nhiệm vụ.
+NHƯNG nếu image ĐÃ BỊ GC XÓA MẤT mà tarball vẫn còn ⟹ tarball là bản CỨU HỘ duy nhất
+⟹ 🔴 KHÔNG ĐƯỢC XÓA, thậm chí phải dùng nó để import lại.
+
+⭐ Đây chính là tình huống dễ xảy ra ở cụm này (GC đã quét sạch k8s.io còn 12 image).
+   `/root/images/ragflow-v0264_custom.tar` 3.4G có thể là thứ CỨU được pod ragflow
+   đang Init:ImagePullBackOff — đừng vội xóa.
+
+grep -iE "ragflow|n8n|..." : -i không phân biệt hoa thường, -E bật regex mở rộng cho dấu `|`.
+```
+</details>
+
+### Bước 1 — Dọn pod `Evicted` (rủi ro thấp nhất, làm trước)
+
+Chạy bằng user **`app`** (kubectl):
+
+```bash
+kubectl get pods -A --field-selector=status.phase=Failed -o wide | head -30
+```
+
+```bash
+kubectl get pods -A --field-selector=status.phase=Failed -o json | jq -r '.items[] | select(.status.reason=="Evicted") | "\(.metadata.namespace) \(.metadata.name)"' | wc -l
+```
+
+Sau khi xem danh sách và thấy hợp lý, mới xóa:
+
+```bash
+kubectl get pods -A --field-selector=status.phase=Failed -o json | jq -r '.items[] | select(.status.reason=="Evicted") | "kubectl delete pod -n \(.metadata.namespace) \(.metadata.name)"' > /tmp/del-evicted.sh
+```
+
+```bash
+cat /tmp/del-evicted.sh | head -20
+```
+
+```bash
+bash /tmp/del-evicted.sh
+```
+
+<details>
+<summary>Giải nghĩa bước 1</summary>
+
+```
+Vì sao SINH RA FILE .sh rồi mới chạy, thay vì pipe thẳng vào `xargs kubectl delete`:
+⭐ Để ĐỌC ĐƯỢC danh sách sẽ xóa TRƯỚC KHI xóa. Pipe thẳng = xóa mù.
+   Đây là thao tác ghi trên cụm production ⟹ luôn tách "sinh lệnh" khỏi "chạy lệnh".
+
+select(.status.reason=="Evicted")
+└─ Lọc CHÍNH XÁC pod bị evict. ⚠️ QUAN TRỌNG: `status.phase=Failed` bao gồm cả pod fail
+   vì lý do KHÁC (OOMKilled, lỗi app). Chỉ xóa đúng Evicted, đừng xóa nhầm pod đang
+   được điều tra vì lý do khác.
+
+Vì sao dọn pod Evicted lại thu hồi disk:
+├─ Mỗi pod Evicted vẫn còn container ở trạng thái exited trên node
+├─ Mỗi container exited giữ một SNAPSHOT trong containerd (phần 22G)
+└─ Snapshot chỉ giải phóng khi container bị xóa ⟹ xóa pod ⟹ kubelet xóa container
+   ⟹ snapshot được thu hồi.
+   ⭐ Đây là lý do bước này vừa an toàn vừa có tác dụng thật lên 22G snapshots.
+
+Lợi ích phụ: giải phóng slot trong `maxPods=50` (trần thấp, ~20 pod rác đang chiếm chỗ).
+```
+</details>
+
+### Bước 2 — Xóa image tarball đã import (thu ~10G)
+
+⚠️ **Chỉ chạy sau khi bước 0 xác nhận image tương ứng ĐÃ CÓ trong containerd.**
+
+Xem lại danh sách + tổng dung lượng trước:
+
+```bash
+find /home /root -xdev -type f \( -name "*.tar" -o -name "*.zip" \) -size +100M -exec ls -lh {} \; 2>/dev/null | awk '{s+=$5; print $5"\t"$9} END {print "---"}' | sort -rh
+```
+
+```bash
+find /home /root -xdev -type f \( -name "*.tar" -o -name "*.zip" \) -size +100M -not -path "*/persistent-data/*" 2>/dev/null | tee /tmp/tarball-to-delete.txt | wc -l
+```
+
+```bash
+cat /tmp/tarball-to-delete.txt
+```
+
+Chuyển sang thư mục chờ xóa (an toàn hơn xóa thẳng — có thể hoàn tác):
+
+```bash
+mkdir -p /home/PENDING_DELETE_20260821
+```
+
+```bash
+while read -r f; do mv -v "$f" /home/PENDING_DELETE_20260821/; done < /tmp/tarball-to-delete.txt
+```
+
+```bash
+df -h /
+```
+
+<details>
+<summary>Giải nghĩa bước 2</summary>
+
+```
+find ... \( -name "*.tar" -o -name "*.zip" \) ...
+│         │  │              │
+│         │  │              └─ -o : HOẶC (OR). Không có -o thì find hiểu là AND ⟹ tìm file
+│         │  │                 vừa .tar vừa .zip = không bao giờ khớp.
+│         │  └─ -name "*.tar" : khớp theo TÊN. Dấu nháy kép bắt buộc để shell không bung
+│         │     `*` thành tên file trong thư mục hiện tại trước khi find nhận được.
+│         └─ \( ... \) : nhóm điều kiện. Phải escape ngoặc bằng `\` vì `(` `)` là ký tự
+│            đặc biệt của shell. Không nhóm thì `-size +100M` chỉ áp cho vế cuối.
+│
+-not -path "*/persistent-data/*"
+└─ ⭐⭐ LÁ CHẮN SỐNG CÒN. Loại trừ mọi đường dẫn chứa `persistent-data`
+   ⟹ pgdata SỐNG của n8n không bao giờ lọt vào danh sách xóa.
+   (`-not` còn viết được là `!`, nhưng `!` phải escape trong shell ⟹ dùng `-not` cho an toàn.)
+
+⭐ VÌ SAO `mv` SANG THƯ MỤC CHỜ, KHÔNG `rm` THẲNG:
+   `mv` trong CÙNG filesystem chỉ đổi đường dẫn, KHÔNG giải phóng disk ngay —
+   nhưng cho phép HOÀN TÁC nếu phát hiện xóa nhầm.
+   ⚠️ HỆ QUẢ: `df` sẽ KHÔNG giảm sau bước mv. Disk chỉ thực sự thu hồi khi `rm` thư mục
+   PENDING sau vài ngày chạy ổn định.
+   ⟹ Nếu cần giải phóng disk NGAY (đang DiskPressure), phải `rm` thật:
+      `while read -r f; do rm -v "$f"; done < /tmp/tarball-to-delete.txt`
+      Chỉ làm sau khi bước 0 xác nhận chắc chắn.
+
+mv -v : -v (--verbose) in từng file được chuyển ⟹ có nhật ký để đối chiếu, biết chính xác
+        cái gì đã bị di chuyển.
+
+while read -r f; do ... done < FILE
+├─ -r : ⭐ KHÔNG diễn giải dấu `\` trong tên file. Bắt buộc khi xử lý đường dẫn.
+└─ Đọc từng dòng an toàn hơn `for f in $(cat FILE)` — cách sau vỡ khi tên file có dấu cách.
+   "$f" luôn phải trong nháy kép, cùng lý do.
+```
+</details>
+
+### Bước 3 — Xóa image không container nào dùng trong `default` (chừa n8n)
+
+```bash
+nerdctl ps -a --format '{{.Image}}'
+```
+
+```bash
+nerdctl images --format '{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}' | sort -u
+```
+
+<details>
+<summary>Giải nghĩa bước 3</summary>
+
+```
+nerdctl ps -a --format '{{.Image}}'
+└─ Liệt kê image ĐANG ĐƯỢC container dùng (kể cả container đã dừng, nhờ -a).
+   ⭐ Đây là DANH SÁCH BẢO VỆ. Kỳ vọng chỉ ra 2 dòng:
+      docker.io/n8nio/n8n:1.123.38-curl
+      10.208.137.65:8890/vmlp/postgres:16.4
+
+Cách làm an toàn: đối chiếu thủ công 2 danh sách, chọn ra image cần xóa, rồi
+`nerdctl rmi <ID>` TỪNG CÁI. KHÔNG dùng prune tự động.
+
+🔴 TUYỆT ĐỐI KHÔNG:
+   ├─ `nerdctl system prune -a`  → xóa mọi image không gắn container ĐANG CHẠY.
+   │                                Ở cụm airgap = mất vĩnh viễn, không pull lại được.
+   └─ `nerdctl volume prune`     → xóa volume ⟹ MẤT DATA n8n (20G /var/lib/nerdctl).
+
+⚠️ Nhắc lại từ 2.2d-bis: xóa image chỉ đụng tới `content` (17G).
+   Phần `snapshots` (22G) chỉ giảm khi xóa CONTAINER ⟹ bước 1 mới là bước có tác dụng ở đó.
+   Đừng kỳ vọng bước 3 trả về nhiều GB.
+```
+</details>
+
+### Bước 4 — Chống tái diễn: nâng `imageMinimumGCAge`
+
+⚠️ Chỉ làm sau khi disk đã về dưới 80% và cụm ổn định. Cần restart kubelet (có rủi ro).
+
+```bash
+grep -nE "imageMinimumGCAge|imageGCHighThresholdPercent|imageGCLowThresholdPercent|evictionHard" /var/lib/kubelet/config.yaml
+```
+
+<details>
+<summary>Giải nghĩa bước 4</summary>
+
+```
+Đọc TRƯỚC khi sửa — để biết đang dùng mặc định hay đã tuỳ chỉnh, và có mốc để hoàn tác.
+
+Mặc định k8s 1.23:
+├─ imageMinimumGCAge           = 2m0s  ⟹ image mới hơn 2 phút thì tha
+├─ imageGCHighThresholdPercent = 85    ⟹ vượt 85% bắt đầu xóa image
+└─ imageGCLowThresholdPercent  = 80    ⟹ xóa cho tới khi về 80%
+
+⭐ ĐỀ XUẤT cho cụm airgap: `imageMinimumGCAge: 168h` (7 ngày).
+   Lý do: ở cụm airgap, image bị xóa là MẤT VĨNH VIỄN (node không thông registry).
+   2 phút quá ngắn — image vừa pull về, pod chưa kịp ổn định đã bị GC xóa.
+
+⚠️ ĐÁNH ĐỔI PHẢI HIỂU RÕ: nâng giá trị này khiến GC gần như không dọn được gì nữa
+   ⟹ disk BẮT BUỘC phải được dọn bằng cách khác (bước 1-3 + giám sát định kỳ).
+   Nếu chỉ nâng mà không dọn ⟹ disk đầy 100% ⟹ node NotReady ⟹ tệ hơn hiện tại.
+   ⟹ Đây là bước CUỐI CÙNG, không phải bước đầu.
+
+Sau khi sửa file phải: `systemctl restart kubelet` ⟹ ⚠️ pod trên node bị gián đoạn ngắn.
+Trên `.51` có n8n (nerdctl, NGOÀI k8s) ⟹ restart kubelet KHÔNG ảnh hưởng n8n. ✅
+```
+</details>
+
+---
 
 ## 4. Câu hỏi còn treo cho Kiên
 
 1. Helm chart v0.26.4 "chưa có" những gì cần bổ sung? (resource limits? PVC sizing?
    nodeSelector/affinity? log rotation? imagePullPolicy? priorityClass?)
-   ⟹ Cần Kiên liệt kê để làm đúng phạm vi, không tự đoán.
+   ⟹ Cần Kiên liệt kê để làm đúng phạm vi, không tự đoán. **VẪN CHƯA CÓ CÂU TRẢ LỜI.**
+
+4. ⚠️ **Backup SQL — quyết định nghiệp vụ, cần Kiên/anh Cường:**
+   - `/home/app/workspace/n8n_nerdctl/n8n_backup_2026-03-30.sql` (1.4G, 30/3)
+   - `/home/app/rag_flow_backup_20260807.sql` (1.2G, 7/8)
+   ⟹ Có nơi lưu backup khác không? Nếu đây là bản duy nhất thì **phải chuyển đi trước khi xóa**.
+
+5. `/home/app/signoz-migrate/*.native` (~0.6G) — việc migrate signoz xong chưa, còn cần không?
+
+6. `/root/images/ragflow-v0264_custom.tar` (3.4G) — ⚠️ **có thể là bản cứu hộ duy nhất**
+   của image RAGFlow custom (pod ragflow đang `Init:ImagePullBackOff`).
+   **Kiểm tra image đã có trong containerd chưa TRƯỚC KHI xóa** — nếu chưa, đây chính là
+   thứ dùng để `ctr images import` cứu pod ragflow.
 2. ~~SSH từ `.51` sang node khác~~ ✅ **ĐƯỢC** (xác nhận 2026-08-21). Hoặc SSH thẳng vào
    từng node cũng được — chỉ 5 worker, ít node.
 3. RAGFlow đang chạy trên cụm vRP này hay cụm khác? (memory ghi endpoint `10.208.137.54:8999`
