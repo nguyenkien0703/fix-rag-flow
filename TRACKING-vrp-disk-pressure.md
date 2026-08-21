@@ -802,10 +802,40 @@ Nguồn: `kubectl get nodes -o custom-columns=...` (user `app` trên `.51`).
 | vrp-kubeengine02 | .49 | master | 4 | 8008424Ki (~7.6G) | 51473868Ki (~49G) | ? | ? | False | ? |
 | vrp-kubeengine03 | .50 | master | 4 | 8008432Ki (~7.6G) | 51473868Ki (~49G) | ? | ? | False | ? |
 | **vrp-kubeengine04** | **.51** | worker ⚠️ n8n | 8 | 16265348Ki (~15.5G) | 103079844Ki (~98G) | **88%** | 24% | 🔴 **True** | ✅ **HTTP=401, 0.208s** |
-| vrp-kubeengine05 | .52 | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | ? | ? | False | ? |
-| vrp-kubeengine06 | .53 | worker | 16 | 32778180Ki (~31G) | 206291924Ki (~197G) | ? | ? | False | ? |
-| vrp-kubeengine07 | .54 | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | ? | ? | False | ? |
-| vrp-kubeengine08 | .55 | worker | 16 | 32778180Ki (~31G) | 206291924Ki (~197G) | ? | ? | False | ? |
+| vrp-kubeengine05 | .52 | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | ✅ **25%** | ? | False | ? |
+| **vrp-kubeengine06** | **.53** | worker | 16 | 32778180Ki (~31G) | 206291924Ki (~197G) | 🔴 **78%** (147G) | ? | False | ? |
+| **vrp-kubeengine07** | **.54** | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | 🔴 **84%** | ? | False | ? |
+| vrp-kubeengine08 | .55 | worker | 16 | 32778180Ki (~31G) | 206291924Ki (~197G) | 66% | ? | False | ? |
+
+### 2.1f ⭐⭐ SO SÁNH 5 WORKER — mẫu hình toàn cụm, không phải sự cố một node
+
+```
+Node   Disk  Used  Use%   /home    containerd  nerdctl
+.51     99G   83G   88%    15G        38G        20G     🔴 DiskPressure=True
+.52     99G   23G   25%   714M        15G          -     ✅ khoẻ nhất
+.53    197G  147G   78%  🔴 92G        12G        28K     🔴 /home phinh bat thuong
+.54     99G   79G   84%   1.2G        26G        11G     🔴 sat nguong
+.55    197G  123G   66%   3.7G       5.3G          -     ổn
+```
+
+**Đọc ra được gì:**
+
+1. 🔴🔴 **`.53` có 92G trong `/home`** — gần **một nửa** disk 197G, gấp **7 lần** containerd (12G).
+   Bất thường hơn `.51` rất nhiều. ⭐ **Đây chính là node đang chạy pod ragflow.**
+   Chưa `DiskPressure` nhưng 147/197G đã dùng ⟹ **cần bóc `/home` node này ngay.**
+
+2. 🔴 **`.54` đang 84%** — sát ngưỡng GC 85%, sắp lặp lại kịch bản `.51`.
+   Có **11G `/var/lib/nerdctl`** ⟹ **`.51` KHÔNG phải node duy nhất chạy nerdctl.**
+   ⚠️ Phải kiểm `.54` có container nerdctl nào quan trọng không trước khi dọn.
+
+3. ✅ `.52` chỉ 25% — khoẻ nhất, **có thể dùng làm nơi tạm chuyển dữ liệu** khi cần
+   giải phóng gấp node khác.
+
+4. ⭐ **MẪU HÌNH:** `/home` phình to vì **tarball import tay** — hệ quả trực tiếp của airgap.
+   Mỗi lần đưa image vào cụm, ai đó `scp` file `.tar` lên node rồi import, **không ai xóa**.
+   ⟹ Đây là **nợ vận hành có tính hệ thống**, không phải sự cố đơn lẻ.
+   ⟹ Fix bền vững phải là **quy trình** (import xong thì xóa / dùng registry thay tarball),
+   không chỉ dọn một lần.
 
 - **`maxPods = 50` trên MỌI node** (không phải 110 mặc định) ⟹ trần pod thấp, đáng lưu ý khi
   hàng chục pod `Evicted` không được dọn vẫn chiếm slot.
@@ -1227,6 +1257,71 @@ Nói cách khác: **GC đang bị giao một việc bất khả thi.** 58/83G n�
 Fix đúng là **giải phóng phần GC không với tới được** (bước 1, 4, 5), chứ không phải
 chỉnh GC (bước 6 chỉ là chống tái diễn).
 
+## 3a. KẾT QUẢ VERIFY BƯỚC 0
+
+```
+$ ctr -n k8s.io images list -q | grep -iE "ragflow|signoz|langfuse"
+(TRỐNG — không trả về gì)
+```
+
+> ⚠️ **ĐÍNH CHÍNH (Kiên xác nhận 2026-08-21):** kết quả trống này **KHÔNG có nghĩa là image
+> ragflow đã mất khỏi cụm**. Lệnh chạy trên **`.51`**, mà **pod ragflow chạy trên `.53` và `.52`**
+> ⟹ `.51` không có image ragflow là **hoàn toàn bình thường**, không phải dấu hiệu bất thường.
+>
+> **Suy luận sai đã mắc:** từ "image không có trên MỘT node" kết luận thành "image mất khỏi
+> CỤM". Ở k8s, image được kéo về **từng node theo nhu cầu** — node không chạy pod đó thì
+> không có image đó.
+>
+> **Cách đáng lẽ phải làm:** chạy `ctr -n k8s.io images list` trên **đúng node đang chạy pod**
+> (`.53`), không phải node đang tiện tay gõ lệnh.
+
+### ✅ `/root/images/ragflow-v0264_custom.tar` (3.4G) — XÓA ĐƯỢC
+
+Kiên xác nhận:
+- Pod ragflow chạy trên **node 05 (`.52`) và node 06 (`.53`)**, không phải `.51`.
+- **Image đã được push lên registry rồi** ⟹ kéo lại được, tarball không phải bản duy nhất.
+⟹ ✅ **Xóa an toàn, thu ngay 3.4G.**
+
+**Bài học vẫn giữ nguyên giá trị (chỉ là không áp dụng cho ca này):** ở cụm airgap, `.tar`
+là rác **chỉ khi** image tương ứng còn kéo lại được — hoặc còn trong containerd, hoặc còn
+trên registry. Nếu **cả hai đều không** thì tarball là bản duy nhất.
+⟹ Verify phải hỏi đủ **hai** câu: *image có trên registry không?* và *node cần nó có kéo được không?*
+
+### Phân loại tarball sau verify
+
+```
+$ nerdctl images | grep -iE "ragflow|n8n|langfuse|signoz|open-notebook|zookeeper"
+n8nio/n8n            1.123.38-curl  b3c147fbfb46  3 months   1.4 GiB
+n8nio/n8n            1.123.38       610dfb7d4c25  3 months   1.4 GiB
+n8nio/n8n            1.123.27-curl  3731c5dabada  4 months   1.4 GiB
+n8nio/n8n            1.123.27       9e6ea5ed2fe2  4 months   1.4 GiB
+n8n                  custom         99c53162504c  13 months  1.5 GiB
+n8n                  1.122.5        9084480429ad  7 months   1.3 GiB
+langfuse/langfuse    3.68           ee82c5113606  14 months  909.3 MiB
+bitnami/zookeeper    3.7.0-...      061e22290d52  22 months  463.1 MiB
+(+ các bản trùng tag với prefix 10.208.137.65:8890/vmlp/)
+⚠️ KHÔNG CÓ dòng nào chứa "ragflow" ⟹ khớp với kết quả ctr ở trên
+```
+
+| Tarball | Trạng thái | Kết luận |
+|---|---|---|
+| ✅ `/root/images/ragflow-v0264_custom.tar` (3.4G) | **Image đã có trên registry** (Kiên xác nhận) | ✅ **XÓA ĐƯỢC** |
+| `n8n.tar`, `n8nio.tar`, `n8n-curl.tar`, `n8n_curl.tar`, `n8n_1_122_5.tar` (~5.9G) | ✅ image có 6 bản trong `default` | ✅ **rác — xóa được** |
+| `langfuse-3.68.tar` (862M) | ✅ `ee82c5113606` | ✅ **rác** |
+| `zookeeper.tar` ×2 (522M) | ✅ `061e22290d52` | ✅ **rác** |
+| `signoz*` (zip+tar, ~1.7G) | ⚠️ chưa verify | ⚠️ **kiểm registry trước** |
+| `open-notebook*` (~1.2G) | ⚠️ chưa verify | ⚠️ **kiểm registry trước** |
+| `qdrant-v1.14.1.tar` (186M) | ⚠️ chưa verify | ⚠️ pod qdrant đang ErrImagePull |
+| `grafana`, `prometheus`, `redis`, `clickhouse`, `otel-collector` (~900M) | ⚠️ chưa verify | ⚠️ **kiểm registry trước** |
+
+⟹ **Xóa được NGAY, đã xác nhận: ~10.7G** (ragflow 3.4G + n8n 5.9G + langfuse 862M + zookeeper 522M).
+⟹ Đủ đưa `.51` từ **88% xuống ~77%** — **dưới ngưỡng `imageGCLowThreshold=80%`**
+⟹ GC ngừng hẳn, `DiskPressure` tự hết. **Đạt mục tiêu chỉ với bước này.**
+
+⚠️ **`qdrant-v1.14.1.tar`** — pod `qdrant-0` đang `Init:ErrImagePull`. Kiểm xem image có trên
+registry không trước khi xóa; nếu có thì xóa, và vấn đề của qdrant là chuyện khác (network
+tới registry / imagePullSecret), không phải thiếu tarball.
+
 ## 3b. LỆNH THỰC THI FIX trên `.51` (user root)
 
 > ⚠️ **CHƯA CHẠY BƯỚC XÓA NÀO cho tới khi verify xong.** Mỗi bước có phần VERIFY trước,
@@ -1235,6 +1330,94 @@ chỉnh GC (bước 6 chỉ là chống tái diễn).
 ```bash
 df -h /
 ```
+
+### ⭐ Bước 0.5 — VERIFY tiếp các tarball CHƯA rõ (làm trước khi xóa bất cứ gì)
+
+```bash
+for kw in signoz open-notebook qdrant grafana prometheus redis clickhouse otel; do printf "%-15s k8s.io=" "$kw"; ctr -n k8s.io images list -q 2>/dev/null | grep -ic "$kw"; done
+```
+
+```bash
+for kw in signoz open-notebook qdrant grafana prometheus redis clickhouse otel; do printf "%-15s default=" "$kw"; nerdctl images -q --format '{{.Repository}}' 2>/dev/null | grep -ic "$kw"; done
+```
+
+<details>
+<summary>Giải nghĩa bước 0.5</summary>
+
+```
+for kw in A B C; do ... done
+└─ Lặp qua từng từ khoá, in một dòng cho mỗi cái ⟹ bảng đối chiếu gọn.
+
+printf "%-15s k8s.io=" "$kw"
+└─ %-15s : chuỗi căn TRÁI, rộng 15 ký tự ⟹ cột thẳng hàng dù từ khoá dài ngắn khác nhau.
+   Không có \n ⟹ kết quả grep in tiếp cùng dòng.
+
+grep -ic "$kw"
+├─ -i : không phân biệt hoa thường
+└─ -c (--count) : ⭐ in SỐ DÒNG KHỚP thay vì nội dung.
+   Cần con số vì ta chỉ hỏi "có hay không", không cần xem chi tiết.
+
+ĐỌC KẾT QUẢ:
+├─ = 0  ⟹ 🔴 image KHÔNG CÓ trong containerd ⟹ tarball là PHAO CỨU SINH ⟹ CẤM XÓA
+└─ > 0  ⟹ ✅ image đã có ⟹ tarball là bản sao thừa ⟹ xóa được
+
+⚠️ Phải kiểm CẢ HAI namespace: pod k8s dùng `k8s.io`, nerdctl dùng `default`.
+   Image có ở `default` KHÔNG giúp được pod k8s và ngược lại — hai kho tách biệt hoàn toàn.
+```
+</details>
+
+### 🚑 Bước 0.9 — VÌ SAO POD VẪN ImagePullBackOff DÙ IMAGE CÓ TRÊN REGISTRY?
+
+Kiên xác nhận image ragflow **đã có trên registry** ⟹ vấn đề **không phải thiếu image**,
+mà là **node không kéo được**. Cần tìm lý do thật.
+
+**Xem lỗi chính xác (user `app`):**
+
+```bash
+kubectl -n ragflow describe pod -l app=ragflow 2>/dev/null | grep -A5 -iE "failed|error|events" | tail -30
+```
+
+```bash
+kubectl -n ragflow get pod -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{range .spec.initContainers[*]}  INIT: {.image}  policy={.imagePullPolicy}{"\n"}{end}{range .spec.containers[*]}  MAIN: {.image}  policy={.imagePullPolicy}{"\n"}{end}{end}'
+```
+
+**Trên node đang chạy pod (`.53`, user root) — thử pull tay để lộ lỗi thật:**
+
+```bash
+ctr -n k8s.io images pull <TEN_IMAGE_LAY_TU_LENH_TREN> --skip-verify=true
+```
+
+<details>
+<summary>Giải nghĩa bước 0.9</summary>
+
+```
+kubectl describe pod ... | grep -A5 -iE "failed|error|events"
+├─ -A5 (--after-context=5) : in thêm 5 dòng SAU mỗi dòng khớp.
+│    ⭐ Cần thiết vì phần Events của describe có thông báo lỗi nằm ở dòng kế tiếp.
+│    (Họ hàng: -B = trước, -C = cả hai chiều.)
+└─ ⭐ Đây là nơi kubelet ghi LÝ DO THẬT: `no such host`, `connection refused`,
+     `unauthorized`, `x509 certificate signed by unknown authority`, `no space left`.
+
+policy={.imagePullPolicy}
+└─ ⭐ Nếu là `Always` ⟹ kubelet LUÔN cố pull kể cả khi image đã có sẵn trên node.
+   Ở cụm airgap mà node không thông registry ⟹ pod chết dù image nằm ngay đó.
+   Đây là một trong những nguyên nhân phổ biến nhất và dễ sửa nhất
+   (đổi sang `IfNotPresent`).
+
+ctr -n k8s.io images pull <IMAGE> --skip-verify=true
+└─ Pull TAY để lộ lỗi mà kubelet đã nuốt mất trong backoff.
+   --skip-verify=true : bỏ qua verify TLS (registry self-signed).
+   ⭐ Đây là lệnh Kiên đã đưa từ đầu phiên — dùng đúng vào lúc này.
+
+CÁC NGUYÊN NHÂN CÓ THỂ (không phải thiếu image):
+├─ Node không thông registry              ⟹ lệnh 1.12 sẽ chỉ ra
+├─ imagePullPolicy: Always + không thông  ⟹ đổi sang IfNotPresent
+├─ Thiếu/sai imagePullSecret              ⟹ kubectl get secret -n ragflow
+├─ containerd chưa cấu hình insecure registry cho host đó
+│    ⟹ /etc/containerd/config.toml phần [plugins."io.containerd.grpc.v1.cri".registry]
+└─ Disk đầy ⟹ pull về không có chỗ ghi    ⟹ chính là vấn đề đang xử lý
+```
+</details>
 
 ### Bước 0 — VERIFY: image trong tarball đã nằm trong containerd chưa?
 
