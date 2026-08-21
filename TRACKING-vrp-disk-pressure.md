@@ -1601,6 +1601,107 @@ Không có data sống. ✅ **Dọn được sau khi verify từng cái.**
 **Tổng tiềm năng trên `.53`:** ~12G (tarball `/home/app` + `/home/vt_admin`), đưa `.53`
 từ 78% xuống ~72%.
 
+## 3a-octies. ⭐⭐ BẰNG CHỨNG QUYẾT ĐỊNH — `k8s.io` trên `.51` ĐÃ BỊ VÉT CẠN
+
+```
+$ crictl images | head -40
+IMAGE                                          TAG       IMAGE ID       SIZE
+10.60.129.132:8890/calico/cni                  v3.20.3   e9a8982d9e894  48.4MB
+10.60.129.132:8890/calico/node                 v3.20.3   6570786a0fd3b  64.9MB
+10.60.129.132:8890/calico/pod2daemon-flexvol   v3.20.3   0631af1a04ae8  9.36MB
+10.60.129.132:8890/kube-proxy                  v1.23.2   d922ca3da64b3  39.3MB
+docker.io/library/import-2026-07-27            <none>    3e85591b8db09  3.28GB
+```
+
+🔴🔴 **`.51` CHỈ CÒN 5 IMAGE, tổng ~3.4GB.** Trong đó 4 cái là **Calico (CNI) + kube-proxy** —
+image hệ thống **bắt buộc**, container đang chạy nên GC không được xóa.
+
+⟹ **KẾT LUẬN DỨT ĐIỂM: kubelet image GC đã VÉT CẠN namespace `k8s.io`.**
+Nó đã xóa sạch mọi image ứng dụng, chỉ chừa lại đúng phần không được phép đụng.
+**Không còn gì cho GC dọn nữa** — mà disk vẫn 83%.
+
+**⟹ Điều này khẳng định dứt điểm 2 điều:**
+1. **Chỉnh ngưỡng GC (`imageMinimumGCAge`, `imageGCHighThreshold`) là VÔ ÍCH ở thời điểm này** —
+   GC không còn gì để dọn. (Vẫn nên làm SAU, để **chống tái diễn**, không phải để giảm disk.)
+2. **Toàn bộ dung lượng còn lại nằm ở nơi GC KHÔNG CÓ QUYỀN CHẠM:**
+   `/var/lib/nerdctl` 20G + tarball ở `/home` + snapshots container 22G.
+   ⟹ **Fix bắt buộc phải đến từ bên ngoài GC.** Đây là lý do vòng lặp không tự thoát được.
+
+**Và đây cũng là lời giải cho ImagePullBackOff toàn cụm:** image ứng dụng bị xóa sạch,
+pod nào restart là phải pull lại — node nào không thông registry thì kẹt vĩnh viễn.
+
+### 🆕 Phát hiện phụ 1 — có REGISTRY THỨ BA
+
+`10.60.129.132:8890` (calico, kube-proxy) — **khác cả hai registry đã biết:**
+
+| Registry | Xuất hiện ở | Đã đo |
+|---|---|---|
+| `10.60.170.184:8083` | lệnh pull ragflow Kiên đưa lúc đầu | ✅ `.51` HTTP 401 |
+| `10.208.137.65:8890` | hầu hết image `nerdctl` (`vmlp/*`) | ❌ chưa |
+| **`10.60.129.132:8890`** | **image hệ thống k8s (calico, kube-proxy)** | ❌ chưa |
+
+⚠️ Registry thứ 3 này phục vụ **image hệ thống** ⟹ nếu nó không thông từ một node nào đó,
+node ấy không thể khởi động lại CNI/kube-proxy ⟹ **NotReady**, nghiêm trọng hơn app thường.
+
+### 🆕 Phát hiện phụ 2 — image mồ côi 3.28GB
+
+```
+docker.io/library/import-2026-07-27   <none>   3e85591b8db09   3.28GB
+```
+
+- Tag `<none>`, tên `import-2026-07-27` ⟹ **dấu vết của một lần `ctr images import` ngày 27/07**
+  mà không đặt tên tử tế.
+- **3.28GB** — chiếm gần như toàn bộ dung lượng image của `.51`.
+- ⚠️ Nếu **không container nào dùng** ⟹ xóa được, thu ngay 3.28G ⟹ **đủ đưa `.51` xuống dưới 80%.**
+- ⚠️ Nhưng GC đã không xóa nó ⟹ **có thể đang được một container tham chiếu.** Phải kiểm trước.
+
+### ⚠️ Đính chính cách đọc `k8s.io=0`
+
+```
+signoz k8s.io=0   open-notebook k8s.io=0   qdrant k8s.io=0   ... (tất cả 0)
+```
+Lần này lệnh **đã đúng** (`crictl images`), nhưng kết quả `0` **KHÔNG có nghĩa "image mất khỏi
+cụm"** — mà chỉ vì `.51` còn đúng 5 image hệ thống. **Signoz chạy trên `.54`, không phải `.51`.**
+⟹ Nhắc lại bài học: **image k8s là PER-NODE**, phải kiểm trên đúng node chạy pod đó.
+
+## 3a-nonies. ✅ `.53` đã dọn — 78% → 77%
+
+```
+$ \rm -v /home/vt_admin/images/ragflow-v0264_custom.tar
+removed '/home/vt_admin/images/ragflow-v0264_custom.tar'
+$ df -h /
+/dev/vda1  197G  144G  46G  77% /        ← 147G→144G ✅
+```
+
+Còn dọn được trên `.53` (~8.6G): `ragflow-pyvi.tar` 3.1G, `surfsense-be-docling.tar` 3.1G,
+`litellm-images-bundle.tar` ×2 (2.4G, trùng nhau).
+
+## 3a-decies. Nhóm signoz / open-notebook trên `.51`
+
+```
+$ du -sh /home/app/signoz /home/app/open-notebook
+2.0G    /home/app/signoz
+1.2G    /home/app/open-notebook
+
+$ ls -lh /home/app/signoz/signoz-images/
+25M   altinity_clickhouse_operator.tar
+24M   altinity_metrics_exporter.tar
+700M  signoz_images.zip
+3.9M  signoz-udf-init.tar
+      signoz_images/            (thư mục)
+
+$ ls -lh /home/app/open-notebook/
+594M  open-notebook-images.zip
+4.7K  open-notebook-deployment.zip
+7.8K  open-notebook-k8s.yaml
+      + các file yaml nhỏ (namespace, secret, surrealdb, ingress, README)
+```
+
+⟹ **3.2G tiềm năng** (signoz 2.0G + open-notebook 1.2G).
+⚠️ Signoz **đang chạy trên `.54`** (pod `signoz-clickhouse-operator`) ⟹ image có thể còn ở đó.
+File `.zip`/`.tar` ở `.51` chỉ là bộ cài đặt để lại ⟹ nhiều khả năng dọn được,
+nhưng **nên hỏi Kiên** vì có kèm file yaml triển khai (có thể là bộ cài duy nhất).
+
 ## 3b. LỆNH THỰC THI FIX trên `.51` (user root)
 
 > ⚠️ **CHƯA CHẠY BƯỚC XÓA NÀO cho tới khi verify xong.** Mỗi bước có phần VERIFY trước,
