@@ -525,36 +525,341 @@ tr " " "\n"
 ```
 </details>
 
+### 1.11 — ⭐ TRUY 45G CÒN THIẾU trên `.51` (user root)
+
+```bash
+du -shx /* 2>/dev/null | sort -rh | head -20
+```
+
+```bash
+du -shx /var/* 2>/dev/null | sort -rh | head -20
+```
+
+```bash
+lsof -nP 2>/dev/null | awk '$5=="REG" && /deleted/ {s+=$7} END {printf "File da xoa nhung process con giu: %.2f GB\n", s/1024/1024/1024}'
+```
+
+```bash
+find / -xdev -type f -size +1G -exec ls -lh {} \; 2>/dev/null | awk '{print $5, $9}' | sort -rh | head -20
+```
+
+```bash
+du -sh /var/lib/containerd/io.containerd.content.v1.content /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs 2>/dev/null
+```
+
+<details>
+<summary>Giải nghĩa lệnh 1.11</summary>
+
+```
+du -shx /* | sort -rh | head -20
+│  ││││  │
+│  ││││  └─ /* : shell tự bung thành danh sách mọi thư mục cấp 1 (/bin /boot /etc /home /opt ...).
+│  ││││       Dùng /* thay vì / vì `du -sh /` chỉ cho MỘT con số tổng, không chỉ ra thủ phạm.
+│  │││└─ -x : ⭐ không vượt sang filesystem khác. Bắt buộc — nếu không sẽ bò vào /proc, /sys,
+│  │││        và mọi mount PV, cho số vô nghĩa và chạy rất lâu.
+│  ││└─ -h : human readable
+│  │└─ -s : chỉ in tổng mỗi mục
+└──┴─ head -20 : 20 dòng đầu (sau sort -rh là 20 thư mục to nhất)
+
+lsof -nP | awk '$5=="REG" && /deleted/ {s+=$7} END {...}'
+│    ││
+│    │└─ -P : không đổi số port sang tên dịch vụ (nhanh hơn, tránh tra /etc/services)
+│    └─ -n : không resolve IP sang hostname (⭐ tránh treo lệnh khi DNS chậm — cụm airgap
+│            rất hay bị treo ở bước resolve này)
+│
+│ ⭐ VÌ SAO CẦN LỆNH NÀY — bẫy kinh điển:
+│   File bị `rm` nhưng process vẫn đang mở nó ⟹ inode chưa được giải phóng ⟹
+│   **`du` KHÔNG đếm** (file không còn trong cây thư mục) nhưng **`df` VẪN tính**.
+│   ⟹ Đây là nguyên nhân số 1 của chênh lệch "df nói đầy, du nói không".
+│   Triệu chứng khớp chính xác với 45G đang thiếu.
+│   Cách sửa: restart process đang giữ fd (KHÔNG phải xóa file — file đã xóa rồi).
+│
+awk '$5=="REG" && /deleted/ {s+=$7} END {printf ...}'
+├─ $5=="REG"   : chỉ lấy dòng file thường (REG = regular file), bỏ socket/pipe/dir
+├─ /deleted/   : dòng có chữ "(deleted)" — file đã bị xóa nhưng fd còn mở
+├─ {s+=$7}     : cộng dồn cột 7 (SIZE, đơn vị byte)
+└─ END{...}    : sau khi duyệt hết mới in, chia 1024³ ra GB
+
+find / -xdev -type f -size +1G -exec ls -lh {} \;
+│      │ │     │       │         │
+│      │ │     │       │         └─ -exec LỆNH {} \; : chạy lệnh cho từng file tìm được.
+│      │ │     │       │            `{}` là chỗ thay tên file, `\;` kết thúc (phải escape
+│      │ │     │       │            dấu ; để shell không nuốt mất).
+│      │ │     │       └─ -size +1G : lớn hơn 1 GiB. Dấu `+` = "lớn hơn" (`-` = nhỏ hơn,
+│      │ │     │          không dấu = đúng bằng).
+│      │ │     └─ -type f : chỉ file thường, bỏ thư mục/symlink
+│      │ └─ -xdev : ⭐ CÙNG Ý NGHĨA với `-x` của du — không vượt filesystem.
+│      │            (find dùng tên `-xdev`, du dùng `-x` — khác tên, cùng tác dụng.)
+│      └─ / : bắt đầu từ gốc
+└─ Mục đích: tìm file đơn lẻ khổng lồ (image tarball import tay, core dump, log app,
+   backup .sql, file swap) mà `du -sh` theo thư mục có thể làm mờ đi.
+
+du -sh /var/lib/containerd/io.containerd.content.v1.content
+                          /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
+└─ Bóc 38G containerd thành 2 phần để biết dọn kiểu nào có tác dụng:
+   ├─ content/    → blob layer đã tải về (image store). `nerdctl rmi` dọn phần này.
+   └─ snapshots/  → filesystem của container đang/đã chạy. Chỉ dọn được khi xóa container.
+   Nếu snapshots to bất thường ⟹ có nhiều container chết chưa xóa.
+```
+</details>
+
+### 1.12 — ⭐ Đo CẢ HAI registry, trên CẢ 8 node
+
+⚠️ Phát hiện mới: cụm dùng **ít nhất 2 registry** — `10.60.170.184:8083` và
+`10.208.137.65:8890` (registry sau xuất hiện trong hầu hết image của `nerdctl images`).
+
+Chạy trên **từng node** (user root), hoặc loop từ `.51`:
+
+```bash
+for n in 48 49 50 51 52 53 54 55; do printf "10.208.137.%-3s " "$n"; ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no 10.208.137.$n 'printf "R1(184:8083)="; timeout 8 curl -sk -o /dev/null -w "%{http_code}" https://10.60.170.184:8083/v2/ 2>/dev/null || printf "FAIL"; printf "  R2(65:8890)="; timeout 8 curl -sk -o /dev/null -w "%{http_code}" https://10.208.137.65:8890/v2/ 2>/dev/null || printf "FAIL"; echo' 2>/dev/null || echo "SSH FAIL"; done | tee /tmp/vrp-registry-2reg.txt
+```
+
+<details>
+<summary>Giải nghĩa lệnh 1.12</summary>
+
+```
+printf "10.208.137.%-3s " "$n"
+└─ %-3s : chuỗi, căn TRÁI (dấu `-`), rộng tối thiểu 3 ký tự ⟹ các cột thẳng hàng
+   dù số node là 48 hay 5. (%3s không có dấu trừ = căn phải.)
+
+ssh -o StrictHostKeyChecking=no
+└─ Không hỏi "xác nhận host key?" ở lần SSH đầu tới node mới ⟹ loop không bị treo
+   chờ gõ yes. Chấp nhận được ở đây vì đang SSH trong mạng nội bộ đã biết rõ.
+
+timeout 8 curl -sk -o /dev/null -w "%{http_code}"
+└─ Chỉ in mã HTTP, không xuống dòng (không có \n trong -w) ⟹ nối vào printf trước đó
+   cho ra một dòng gọn cho mỗi node.
+
+Đọc kết quả:
+├─ 200 hoặc 401 ⟹ ✅ THÔNG (401 = tới nơi, chỉ thiếu auth)
+├─ 000          ⟹ 🚫 KHÔNG THÔNG (không kết nối được)
+└─ FAIL         ⟹ 🚫 curl lỗi hẳn
+
+⚠️ Nếu registry chạy HTTP thuần thì đổi https:// → http://.
+   Registry `65:8890` chưa rõ dùng scheme nào — nếu ra 000 với https, thử lại http.
+
+⭐ QUY TẮC SỐNG CÒN:
+   Node KHÔNG thông ⟹ 🚫 CẤM xóa image trên node đó (airgap, xóa là mất vĩnh viễn).
+```
+</details>
+
+### 1.13 — Xem 67 image rác trong namespace `default` (user root, trên `.51`)
+
+```bash
+nerdctl images --format '{{.Size}}\t{{.Repository}}:{{.Tag}}\t{{.CreatedSince}}' | sort -rh | head -40
+```
+
+```bash
+nerdctl system df
+```
+
+<details>
+<summary>Giải nghĩa lệnh 1.13</summary>
+
+```
+nerdctl images --format '{{.Size}}\t{{.Repository}}:{{.Tag}}\t{{.CreatedSince}}'
+│              │
+│              └─ --format 'GO_TEMPLATE' : tự chọn cột theo cú pháp Go template.
+│                 Dùng thay output mặc định để: (a) đưa Size lên ĐẦU ⟹ `sort -rh` sắp được,
+│                 (b) bỏ cột thừa cho gọn màn hình VDI.
+│                 Các trường dùng được: .Repository .Tag .ID .Size .CreatedSince .Platform
+│
+sort -rh
+└─ -h hiểu hậu tố GiB/MiB ⟹ sắp đúng. Không có -h thì "990 MiB" > "1.5 GiB" (sai).
+
+nerdctl system df
+└─ Tổng hợp dung lượng theo nhóm: Images / Containers / Volumes,
+   kèm cột RECLAIMABLE = ⭐ dọn được bao nhiêu.
+   Đây là con số cần để ước lượng lợi ích TRƯỚC khi dọn — biết trước sẽ thu về bao nhiêu GB.
+
+⚠️ TUYỆT ĐỐI KHÔNG chạy `nerdctl system prune -a` — nó xóa hết image không gắn container
+   đang chạy. n8n chỉ dùng 2 image, nhưng prune -a cũng sẽ xóa luôn image dự phòng và
+   KHÔNG THỂ kéo lại nếu node mất kết nối registry. Phải xóa CÓ CHỌN LỌC bằng `nerdctl rmi`.
+```
+</details>
+
 ---
 
 ## 2. Kết quả thu thập (điền sau khi chạy)
 
-### 2.1 Bảng tài nguyên node
+### 2.1 Bảng tài nguyên node — ✅ ĐÃ CHẠY 2026-08-21
 
-| Node | IP | Role | CPU | RAM | Disk total | Disk used % | Inode used % | DiskPressure | Thông registry |
+Nguồn: `kubectl get nodes -o custom-columns=...` (user `app` trên `.51`).
+
+| Node | IP | Role | CPU | RAM | Disk capacity | Disk used % | Inode used % | DiskPressure | Thông registry |
 |---|---|---|---|---|---|---|---|---|---|
-| vrp-kubeengine01 | .48 | master | | | | | | | |
-| vrp-kubeengine02 | .49 | master | | | | | | | |
-| vrp-kubeengine03 | .50 | master | | | | | | | |
-| vrp-kubeengine04 | .51 | worker ⚠️ n8n | | | | | | | |
-| vrp-kubeengine05 | .52 | worker | | | | | | | |
-| vrp-kubeengine06 | .53 | worker | | | | | | | |
-| vrp-kubeengine07 | .54 | worker | | | | | | | |
-| vrp-kubeengine08 | .55 | worker | | | | | | | |
+| vrp-kubeengine01 | .48 | master | 4 | 8008432Ki (~7.6G) | 51473868Ki (~49G) | ? | ? | False | ? |
+| vrp-kubeengine02 | .49 | master | 4 | 8008424Ki (~7.6G) | 51473868Ki (~49G) | ? | ? | False | ? |
+| vrp-kubeengine03 | .50 | master | 4 | 8008432Ki (~7.6G) | 51473868Ki (~49G) | ? | ? | False | ? |
+| **vrp-kubeengine04** | **.51** | worker ⚠️ n8n | 8 | 16265348Ki (~15.5G) | 103079844Ki (~98G) | **88%** | 24% | False | ✅ **HTTP=401, 0.208s** |
+| **vrp-kubeengine05** | **.52** | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | ? | ? | 🔴 **True** | ? |
+| vrp-kubeengine06 | .53 | worker | 16 | 32778180Ki (~31G) | 206291924Ki (~197G) | ? | ? | False | ? |
+| vrp-kubeengine07 | .54 | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | ? | ? | False | ? |
+| vrp-kubeengine08 | .55 | worker | 16 | 32778180Ki (~31G) | 206291924Ki (~197G) | ? | ? | False | ? |
 
-### 2.2 Kết luận n8n namespace (từ lệnh 1.6) — 🚧 CHẶN MỌI THAO TÁC GHI CHO TỚI KHI ĐIỀN XONG
+- **`maxPods = 50` trên MỌI node** (không phải 110 mặc định) ⟹ trần pod thấp, đáng lưu ý khi
+  hàng chục pod `Evicted` không được dọn vẫn chiếm slot.
+- Cụm **không đồng nhất**: master yếu (4C/8G/49G), worker chia 2 hạng
+  (8C/16G/98G vs 16C/32G/197G) ⟹ scheduling lệch tải là rủi ro thật.
+- 🔴 **Chỉ `.52` đang `DiskPressure=True`.** Nhưng pod hỏng nằm rải khắp `.51`/`.53`/`.54`/`.55`
+  ⟹ **các node kia ĐÃ TỪNG DiskPressure rồi hồi lại**, để lại di chứng ImagePullBackOff
+  (image bị GC xóa mất, không tự khỏi). Đây là bằng chứng cho vòng lặp ở mục 0.
 
-> ⬜ CHƯA CHẠY.
+### 2.1b Disk chi tiết `.51` (user root) — ✅ ĐÃ CHẠY
 
-- n8n nằm ở containerd namespace: `..................`
-- Pod k8s nằm ở namespace: `k8s.io` (mặc định, cần xác nhận)
-- ⟹ Dọn image trong `k8s.io` có ảnh hưởng n8n không? **[ ] CÓ  [ ] KHÔNG**
+```
+$ df -hT -x tmpfs -x devtmpfs
+Filesystem     Type   Size  Used Avail Use% Mounted on
+/dev/vda1      ext4    99G   83G   12G  88% /
 
-**Danh sách image CẤM XÓA trên `.51`** (điền từ `nerdctl images`):
+$ df -i -x tmpfs -x devtmpfs
+Filesystem      Inodes   IUsed   IFree IUse% Mounted on
+/dev/vda1      6553600 1519494 5034106   24% /
 
-| Image (repo:tag) | Digest | Container đang dùng |
-|---|---|---|
-| | | |
+$ du -shx /var/lib/containerd /var/lib/kubelet /var/log 2>/dev/null | sort -rh
+38G     /var/lib/containerd
+325M    /var/log
+352K    /var/lib/kubelet
+```
+
+**Đọc ra được gì:**
+- ✅ **KHÔNG phải vấn đề inode** (24%) ⟹ loại trừ giả thuyết cạn inode.
+- ✅ **KHÔNG phải log** (325M) và **KHÔNG phải kubelet/emptyDir** (352K).
+- 🔴 `/var/lib/containerd` = **38G** — thủ phạm lớn nhất đã xác định.
+- ⚠️ **LỖ HỔNG CHƯA GIẢI THÍCH ĐƯỢC: 83G used − 38G containerd − 0.3G log ≈ 45G ở ĐÂU?**
+  Chưa biết. **Phải tìm ra trước khi kết luận** — xem lệnh 1.11.
+  Nghi ngờ: `/var/lib/docker` cũ còn sót, `/opt`, `/home`, `/root`, image tarball import tay,
+  file log ứng dụng ngoài `/var/log`, hoặc file đã xóa nhưng process còn giữ fd.
+- 88% > `imageGCHighThresholdPercent=85` ⟹ **GC ĐANG chạy liên tục trên `.51`** dù
+  `DiskPressure=False` (GC khởi động ở 85%, còn DiskPressure là ngưỡng khác — 
+  `imagefs.available<15%` tức used>85%... hiện avail 12G/99G = 12% ⟹ **sát mép**).
+
+### 2.1c Registry reachability — ✅ ĐÃ CHẠY (mới `.51`)
+
+```
+$ curl -sk -o /dev/null -w "HTTP=%{http_code} total=%{time_total}s\n" https://10.60.170.184:8083/v2/
+HTTP=401 total=0.208s
+```
+⟹ **`.51` THÔNG registry** (401 = tới nơi, cần auth). Còn 7 node chưa đo.
+
+⚠️ **PHÁT HIỆN: có ÍT NHẤT 2 REGISTRY trong cụm, không phải 1 như đã ghi ban đầu:**
+- `10.60.170.184:8083` — registry Kiên đưa lúc đầu (lệnh pull RAGFlow)
+- `10.208.137.65:8890` — ⭐ registry xuất hiện trong **hầu hết** image của `nerdctl images`
+  (`vmlp/litellm-database`, `vmlp/bitnami/*`, `vmlp/istio/*`, `vmlp/n8n`, `vmlp/prometheus`...)
+  ⟹ Đây mới là registry dùng thường xuyên. **Phải đo reachability CẢ HAI.**
+
+### 2.1d Pod hỏng — ✅ ĐÃ CHẠY
+
+```
+NAMESPACE      POD                                    STATUS                  AGE     NODE
+ragflow        ragflow-755fc96fc6-f6w2p               Init:ImagePullBackOff   170m    vrp-kubeengine06
+qdrant         qdrant-0                               Init:ErrImagePull       3d23h   vrp-kubeengine08
+postgres-test  postgres-0                             ImagePullBackOff        7h27m   vrp-kubeengine07
+open-webui     open-webui-deployment-5b5fb6dffb-g2ck4 ErrImagePull            27h     vrp-kubeengine08
+monitoring     signoz-clickhouse-operator-...-4nxs9   ImagePullBackOff        5d22h   vrp-kubeengine07
+monitoring     signoz-agent-k8s-infra-otel-agent-...  Evicted                 13m     vrp-kubeengine04
+litellm        nginx-7d855f4db4-4vs2b                 ErrImagePull            3d23h   vrp-kubeengine08
+litellm        litellm-96674b5d5-* (7 pod)            Evicted                 24d     vrp-kubeengine04
+litellm        nginx-7d855f4db4-* (~9 pod)            Evicted                 8-14d   .51 / .55
+monitoring     signoz-clickhouse-operator-* (5 pod)   Evicted                 6d19h   vrp-kubeengine07
+```
+
+**Đọc ra được gì:**
+- 🔴 **RAGFlow ĐANG CHẾT** (`Init:ImagePullBackOff`, 170m, trên `.53`) — chính là hệ quả
+  trực tiếp của vụ disk này.
+- Pod `Evicted` **tuổi 24 ngày vẫn chưa được dọn** ⟹ rác tích tụ, ăn slot trong `maxPods=50`.
+- `Init:` prefix ở ragflow/qdrant ⟹ chết ở **initContainer** (nhớ: values.yaml có
+  `codePatch` initContainer) ⟹ image của initContainer bị mất, không chỉ image chính.
+- Trải đều 4 node ⟹ vấn đề **toàn cụm**, không phải một node lẻ.
+
+### 2.1e Thông tin đăng nhập / thao tác (xác nhận 2026-08-21)
+
+- SSH từ `.51` sang các node khác: **ĐƯỢC**. Hoặc SSH thẳng vào từng node cũng được
+  (chỉ 5 worker, ít node).
+- Trên `.51`: login user `vt_admin` → `su` → `su -` để thành root.
+- User `app` dùng cho `kubectl`.
+
+### 2.2 Kết luận n8n namespace — ✅ ĐÃ CHỐT 2026-08-21
+
+```
+$ nerdctl namespace ls
+NAME      CONTAINERS  IMAGES  VOLUMES
+default   2           69      2
+k8s.io    35          12      0
+
+$ ctr namespaces list
+NAME     LABELS
+default
+k8s.io
+```
+
+```
+$ nerdctl ps -a
+CONTAINER ID   IMAGE                                     STATUS  PORTS                        NAMES
+a4d311916c34   docker.io/n8nio/n8n:1.123.38-curl         Up      10.208.137.51:8827->5678/tcp n8n_nerdctl_n8n_1
+af16685f4334   10.208.137.65:8890/vmlp/postgres:16.4     Up      10.208.137.51:8828->5432/tcp n8n_nerdctl_postgres_1
+```
+
+- n8n nằm ở containerd namespace: **`default`**
+- Pod k8s nằm ở namespace: **`k8s.io`** ✅ đã xác nhận
+- ⟹ Dọn image trong `k8s.io` có ảnh hưởng n8n không? **[ ] CÓ  [✅] KHÔNG**
+
+**Danh sách image CẤM XÓA trên `.51`** (n8n stack đang chạy):
+
+| Image (repo:tag) | Image ID | Size | Container đang dùng |
+|---|---|---|---|
+| `docker.io/n8nio/n8n:1.123.38-curl` | `b3c147fbfb46` | 1.4 GiB | `n8n_nerdctl_n8n_1` (Up 3 months) |
+| `10.208.137.65:8890/vmlp/postgres:16.4` | `07ad6d638531` | 436.2 MiB | `n8n_nerdctl_postgres_1` (Up 3 months) |
+
+⚠️ Ngoài 2 image trên, còn **2 volume** trong namespace `default` (`VOLUMES 2`) — gần như chắc
+chắn là data của n8n + postgres. **TUYỆT ĐỐI KHÔNG chạy `nerdctl volume prune`.**
+
+### 2.2b ⭐⭐ PHÁT HIỆN LỚN — LẬT NGƯỢC GIẢ THUYẾT BAN ĐẦU
+
+```
+default   CONTAINERS 2    IMAGES 69   ← 2 container mà 69 image!
+k8s.io    CONTAINERS 35   IMAGES 12   ← 35 container mà chỉ 12 image!
+```
+
+**Hai điều bất thường, ngược chiều nhau:**
+
+**(1) Namespace `default` (nerdctl) = 69 image cho 2 container ⟹ ~67 image RÁC.**
+Đây mới là thủ phạm ăn disk chính, KHÔNG phải image k8s. Bằng chứng từ `nerdctl images`:
+image tuổi **22-24 tháng**, nhiều bản trùng lặp, tổng cộng rất lớn —
+`ghcr.io/berriai/litellm-database` 1.5 GiB ×2 bản, `n8n` 1.3-1.5 GiB ×**7 bản**
+(`1.122.5`, `custom`, `1.123.27`, `1.123.27-curl`, `1.123.38`, `1.123.38-curl`, `v0`, `fix-no-tracing`),
+`codev-version-api:latest` 1.1 GiB, `langfuse` 909 MiB, `mysql` 871 MiB, `bitnami/kafka` 571 MiB...
+
+⭐ **kubelet image GC KHÔNG NHÌN THẤY namespace `default`** — nó chỉ quản `k8s.io`.
+⟹ 67 image rác này **không bao giờ được dọn tự động**, tích tụ tự do suốt 3 năm.
+⟹ Chúng đẩy disk lên 88%, khiến GC phải quét sạch namespace `k8s.io` để bù.
+
+**(2) Namespace `k8s.io` = chỉ 12 image cho 35 container ⟹ ĐÃ BỊ GC QUÉT SẠCH.**
+35 container bình thường cần nhiều hơn 12 image. Con số thấp bất thường này chính là
+**dấu vết image GC đã hoạt động mạnh**. Pod nào restart sau đó ⟹ ImagePullBackOff.
+
+**⟹ CƠ CHẾ THẬT SỰ CỦA SỰ CỐ (khác giả thuyết ban đầu ở mục 0):**
+
+```
+nerdctl (namespace `default`) tích 67 image rác, KHÔNG AI DỌN suốt 3 năm
+   └─> disk lên 88%, vượt imageGCHighThreshold=85%
+        └─> kubelet image GC kích hoạt — NHƯNG chỉ dọn được namespace `k8s.io`
+             └─> GC xóa sạch image k8s (còn 12), KHÔNG đụng được 67 image rác gây ra vấn đề
+                  └─> disk VẪN 88% (vì rác nằm ở `default`) ⟹ GC chạy lại, xóa tiếp
+                       └─> pod restart ⟹ image không còn ⟹ ImagePullBackOff
+```
+
+**Đây là điểm mấu chốt:** GC đang **trừng phạt nhầm đối tượng**. Nó xóa image k8s (cần thiết,
+đang dùng) trong khi thủ phạm thật (image nerdctl rác) nằm ngoài tầm với của nó.
+Nghĩa là **dọn 67 image rác ở `default` sẽ giải quyết tận gốc**, và đó cũng là việc
+**an toàn nhất** vì chỉ cần chừa đúng 2 image của n8n.
+
+### 2.2c ⚠️ Còn 45G chưa giải thích được trên `.51`
+
+`83G used − 38G containerd − 0.325G log − 0.0004G kubelet ≈ 45G` **KHÔNG BIẾT Ở ĐÂU.**
+
+**Chưa được kết luận gì cho tới khi tìm ra.** Nếu 45G này là thứ dọn được, nó còn to hơn
+cả containerd ⟹ có thể là đòn bẩy lớn hơn. Xem lệnh **1.11**.
 
 ### 2.3 Output thật
 
@@ -562,20 +867,47 @@ tr " " "\n"
 
 ---
 
-## 3. Việc tiếp theo (chưa làm)
+## 3. Việc tiếp theo
 
-- [ ] Chạy toàn bộ mục 1, điền bảng 2.1
-- [ ] Chốt n8n namespace (2.2) — **chặn mọi thao tác ghi cho tới khi có kết luận này**
-- [ ] Phân loại node: thông registry (được dọn image) vs không thông (cấm dọn)
-- [ ] Chốt thủ phạm ăn disk thật sự (containerd? log? etcd? emptyDir?)
-- [ ] Đề xuất fix triệt để (chưa viết — chờ số liệu)
+### ✅ Đã xong
+- [x] Chốt n8n namespace = `default`, tách biệt `k8s.io` ⟹ **dọn image k8s.io an toàn**
+- [x] Bảng tài nguyên node (2.1) — còn thiếu disk% của 7 node
+- [x] Loại trừ inode (24%), log (325M), kubelet (352K) khỏi danh sách nghi phạm trên `.51`
+- [x] Xác định `.51` thông registry `10.60.170.184:8083`
+- [x] Phát hiện cơ chế thật: **GC trừng phạt nhầm namespace** (2.2b)
+
+### 🔴 Ngay lập tức — 2 lỗ hổng chặn kết luận
+- [ ] **Lệnh 1.11 — truy 45G thiếu trên `.51`.** Nghi số 1: file đã xóa mà process còn giữ fd
+      (`df` tính, `du` không). Nếu đúng ⟹ chỉ cần restart process là thu hồi, không cần xóa gì.
+- [ ] **Lệnh 1.12 — đo CẢ 2 registry trên CẢ 8 node.** Chưa có bảng này thì **cấm dọn image**
+      trên bất kỳ node nào ngoài `.51`.
+- [ ] **Lệnh 1.3 — disk% + inode của 7 node còn lại** (mới có `.51`). `.52` đang DiskPressure=True
+      nhưng chưa biết đầy bao nhiêu, thủ phạm là gì.
+
+### Sau khi có số liệu
+- [ ] Lệnh 1.13 — liệt kê 67 image rác `default`, ước lượng thu hồi được bao nhiêu GB
+- [ ] Lệnh 1.8 — log kubelet, xác nhận GC/eviction bằng chứng cứ thay vì suy luận
+- [ ] Lệnh 1.10 — đọc ngưỡng eviction/GC hiện tại (mặc định hay đã tuỳ chỉnh?)
+- [ ] Dọn ~20 pod `Evicted` tuổi 8-24 ngày (chiếm slot `maxPods=50`)
+- [ ] Đề xuất fix triệt để — **chưa viết, chờ số liệu**
 - [ ] Cải thiện Helm chart RAGFlow v0.26.4 (**Kiên chưa liệt kê cụ thể — xem mục 4**)
+
+### 💡 Hướng fix đang hình thành (chưa chốt, cần số liệu xác nhận)
+
+| # | Việc | Đòn bẩy | Rủi ro |
+|---|---|---|---|
+| 1 | Dọn ~67 image rác namespace `default` trên `.51`, chừa 2 image n8n | ⭐⭐⭐ Nhắm đúng thủ phạm GC không với tới được | Thấp — chỉ cần chừa đúng 2 image |
+| 2 | Thu hồi 45G nếu là fd rác (restart process giữ file đã xóa) | ⭐⭐⭐ nếu đúng | Cần biết process nào trước |
+| 3 | Nâng `imageMinimumGCAge` 2m → dài hơn, cho cụm airgap | ⭐⭐ Chặn GC xóa image không kéo lại được | Disk phải dọn đường khác |
+| 4 | Dọn pod `Evicted` tồn đọng | ⭐ Giải phóng slot `maxPods=50` | Rất thấp |
+| 5 | Pre-pull image thiết yếu về node sau khi dọn | ⭐⭐ Chặn tái diễn | Cần node thông registry |
 
 ## 4. Câu hỏi còn treo cho Kiên
 
 1. Helm chart v0.26.4 "chưa có" những gì cần bổ sung? (resource limits? PVC sizing?
    nodeSelector/affinity? log rotation? imagePullPolicy? priorityClass?)
    ⟹ Cần Kiên liệt kê để làm đúng phạm vi, không tự đoán.
-2. Có được phép SSH bằng key từ `.51` sang các node khác không, hay phải gõ tay từng node?
+2. ~~SSH từ `.51` sang node khác~~ ✅ **ĐƯỢC** (xác nhận 2026-08-21). Hoặc SSH thẳng vào
+   từng node cũng được — chỉ 5 worker, ít node.
 3. RAGFlow đang chạy trên cụm vRP này hay cụm khác? (memory ghi endpoint `10.208.137.54:8999`
    ⟹ **trùng dải IP cụm vRP**, node `.54` = vrp-kubeengine07 ⟹ RAGFlow NẰM TRÊN CHÍNH CỤM NÀY)
