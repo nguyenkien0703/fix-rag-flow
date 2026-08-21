@@ -1485,6 +1485,122 @@ Muốn describe phải dùng tên pod trực tiếp.
 **Việc cần làm:** xóa pod mồ côi + ReplicaSet cũ (giải phóng slot + snapshot container).
 **Không gấp**, không ảnh hưởng dịch vụ.
 
+## 3a-quinquies. ✅ ĐÃ XÓA THẬT — `.51` từ 88% → 83%
+
+```
+$ \rm -v /root/images/ragflow-v0264_custom.tar
+removed '/root/images/ragflow-v0264_custom.tar'                      ← "removed" = xóa THẬT
+
+$ \rm -v /home/app/workspace/langfuse/langfuse-3.68.tar /home/app/signoz/signoz-images/signoz_zookeeper_3.7.1.tar /home/app/signoz/ctr_signoz_images/zookeeper.tar
+removed '/home/app/workspace/langfuse/langfuse-3.68.tar'
+rm: cannot remove '/home/app/signoz/signoz-images/signoz_zookeeper_3.7.1.tar': No such file or directory
+removed '/home/app/signoz/ctr_signoz_images/zookeeper.tar'
+
+$ df -h /
+/dev/vda1  99G  79G  17G  83% /       ← 83G→79G, avail 12G→17G, 88%→83% ✅
+```
+
+- ✅ `\rm` bỏ qua alias thành công, xóa được ~4.3G.
+- ⚠️ `signoz_zookeeper_3.7.1.tar` **không tồn tại** — đường dẫn lấy từ ảnh trước bị sai.
+  Không ảnh hưởng gì.
+- **Còn cần giảm 3% nữa (≈3G) để xuống dưới `imageGCLowThreshold=80%`.**
+
+## 3a-sexies. 🔴 LỆNH VERIFY BỊ SAI — `k8s.io=0` cho TẤT CẢ là KẾT QUẢ GIẢ
+
+```
+$ for kw in signoz open-notebook qdrant grafana prometheus redis clickhouse otel; do
+    printf "%-15s k8s.io=" "$kw"; ctr -n k8s.io images list -q | grep -ic "$kw"; done
+signoz          k8s.io=0
+open-notebook   k8s.io=0
+qdrant          k8s.io=0
+grafana         k8s.io=0
+prometheus      k8s.io=0
+redis           k8s.io=0
+clickhouse      k8s.io=0
+otel            k8s.io=0        ← TẤT CẢ đều 0
+```
+
+🔴 **KẾT QUẢ NÀY KHÔNG ĐÁNG TIN.** `.51` đang chạy **35 container** trong namespace `k8s.io`
+⟹ **không thể không có image nào.** Nếu thật sự 0 image thì 35 container đó không chạy nổi.
+
+**Nguyên nhân — lỗi lệnh, không phải lỗi hệ thống:**
+`ctr -n k8s.io images list -q` in ra **ref dạng `sha256:...` (digest)**, KHÔNG phải
+`repository:tag`. ⟹ `grep` theo tên repo (`signoz`, `grafana`...) đương nhiên không khớp.
+
+**Lệnh ĐÚNG — dùng `crictl` thay `ctr`:**
+
+```bash
+for kw in signoz open-notebook qdrant grafana prometheus redis clickhouse otel; do printf "%-15s k8s.io=" "$kw"; crictl images 2>/dev/null | grep -ic "$kw"; done
+```
+
+<details>
+<summary>Giải nghĩa — vì sao `crictl` đúng còn `ctr ... -q` sai</summary>
+
+```
+ctr -n k8s.io images list -q
+├─ -q (--quiet) : ⚠️ Ở `ctr`, -q in ref RÚT GỌN. Với image kéo qua CRI, ref thường ở
+│                 dạng `sha256:abc...` hoặc `registry/repo@sha256:...`
+│                 ⟹ grep theo TÊN không khớp ⟹ ra 0 một cách sai lệch.
+└─ Bỏ -q thì `ctr images list` in bảng có cột REF đầy đủ — nhưng định dạng vẫn khác crictl.
+
+crictl images
+└─ ⭐ CLI chuẩn CRI — hiển thị đúng `REPOSITORY  TAG  IMAGE ID  SIZE` như KUBELET nhìn thấy.
+   Đây là công cụ ĐÚNG để trả lời câu hỏi "kubelet có image này không?".
+
+⭐ QUY TẮC RÚT RA:
+├─ Hỏi "kubelet/pod có image X không?"  ⟹ dùng `crictl images`
+├─ Hỏi "containerd namespace nào có gì?" ⟹ dùng `ctr -n <ns> images list` (KHÔNG -q)
+└─ Hỏi "nerdctl có image gì?"            ⟹ dùng `nerdctl images`
+
+⚠️ BÀI HỌC: kết quả "0 hết" / "trống hết" phải bị NGHI NGỜ trước khi tin.
+   Đối chiếu với một sự thật độc lập — ở đây: 35 container đang chạy thì phải có image.
+   Đây là lần thứ HAI trong phiên mắc kiểu lỗi này (lần trước: `ctr list` trống trên `.51`
+   bị hiểu thành "image mất khỏi cụm").
+```
+</details>
+
+### Kết quả namespace `default` (lệnh này ĐÚNG, `nerdctl images` in tên repo thật)
+
+```
+signoz          default=0     ← ⚠️ KHÔNG CÓ
+open-notebook   default=0     ← ⚠️ KHÔNG CÓ
+qdrant          default=2     ✅
+grafana         default=2     ✅
+prometheus      default=3     ✅
+redis           default=5     ✅
+clickhouse      default=0     ← ⚠️ KHÔNG CÓ
+otel            default=0     ← ⚠️ KHÔNG CÓ
+```
+
+⚠️ **`signoz`, `open-notebook`, `clickhouse`, `otel` KHÔNG có trong `default`.**
+Nếu chúng cũng không có trong `k8s.io` (chưa biết, vì lệnh sai) và không có trên registry
+⟹ **tarball là bản duy nhất** ⟹ 🚫 **CHƯA ĐƯỢC XÓA.**
+
+Các tarball đang chờ kết luận:
+- `signoz_images.zip` (700M), `signoz_zookeeper_3.7.1.tar` (261M),
+  `docker.io_clickhouse_clickhouse-server_25.5.6.tar` ×2 (392M),
+  `docker.io_signoz_signoz-otel-collector_v0.144.3.tar` ×2 (368M)
+- `open-notebook-images.zip` (594M), `open-notebook.tar` (567M)
+
+## 3a-septies. ✅ `.53` — `/home/vt_admin` 9.1G đã bóc xong
+
+```
+$ du -shx /home/vt_admin/* | sort -rh | head -10
+6.5G    /home/vt_admin/images          ← ragflow-v0264_custom.tar 3.4G + ragflow-pyvi.tar 3.1G
+2.4G    /home/vt_admin/litellm         ← litellm-images-bundle.tar (bản trùng)
+184M    /home/vt_admin/vmlp
+60M     /home/vt_admin/teleport-8.2.0-1-centos7.x86_64.rpm
+49M     /home/vt_admin/redis-7.2.4-debian-12-r9-amd64.tar
+8.5M    /home/vt_admin/node_exporter-1.2.2.linux-amd64.tar.gz
+3.9M    /home/vt_admin/signoz-udf-init.tar
+```
+
+⟹ **9.1G `/home/vt_admin` gần như TOÀN BỘ là tarball** (6.5G images + 2.4G litellm).
+Không có data sống. ✅ **Dọn được sau khi verify từng cái.**
+
+**Tổng tiềm năng trên `.53`:** ~12G (tarball `/home/app` + `/home/vt_admin`), đưa `.53`
+từ 78% xuống ~72%.
+
 ## 3b. LỆNH THỰC THI FIX trên `.51` (user root)
 
 > ⚠️ **CHƯA CHẠY BƯỚC XÓA NÀO cho tới khi verify xong.** Mỗi bước có phần VERIFY trước,
