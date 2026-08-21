@@ -603,15 +603,18 @@ du -sh /var/lib/containerd/io.containerd.content.v1.content
 ```
 </details>
 
-### 1.12 — ⭐ Đo CẢ HAI registry, trên CẢ 8 node
+### 1.12 — ⭐ Đo CẢ HAI registry, trên **5 WORKER** (.51→.55)
 
-⚠️ Phát hiện mới: cụm dùng **ít nhất 2 registry** — `10.60.170.184:8083` và
+⚠️ Phát hiện: cụm dùng **ít nhất 2 registry** — `10.60.170.184:8083` và
 `10.208.137.65:8890` (registry sau xuất hiện trong hầu hết image của `nerdctl images`).
 
-Chạy trên **từng node** (user root), hoặc loop từ `.51`:
+> **Vì sao chỉ 5 worker, không phải 8 node** (Kiên chỉnh 2026-08-21): workload nằm hết ở
+> 5 worker `.51`–`.55`; 3 master `.48`–`.50` không chạy gì của mình. Master vẫn có kubelet +
+> image GC và chạy pod hệ thống (apiserver/etcd/CNI/kube-proxy) nên **về lý thuyết vẫn có
+> rủi ro** — nhưng cả 3 đang `DiskPressure=False`, disk chỉ ~49G ⟹ **không gấp, để sau.**
 
 ```bash
-for n in 48 49 50 51 52 53 54 55; do printf "10.208.137.%-3s " "$n"; ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no 10.208.137.$n 'printf "R1(184:8083)="; timeout 8 curl -sk -o /dev/null -w "%{http_code}" https://10.60.170.184:8083/v2/ 2>/dev/null || printf "FAIL"; printf "  R2(65:8890)="; timeout 8 curl -sk -o /dev/null -w "%{http_code}" https://10.208.137.65:8890/v2/ 2>/dev/null || printf "FAIL"; echo' 2>/dev/null || echo "SSH FAIL"; done | tee /tmp/vrp-registry-2reg.txt
+for n in 51 52 53 54 55; do printf "10.208.137.%-3s " "$n"; ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no 10.208.137.$n 'printf "R1(184:8083)="; timeout 8 curl -sk -o /dev/null -w "%{http_code}" https://10.60.170.184:8083/v2/ 2>/dev/null || printf "FAIL"; printf "  R2(65:8890)="; timeout 8 curl -sk -o /dev/null -w "%{http_code}" https://10.208.137.65:8890/v2/ 2>/dev/null || printf "FAIL"; echo' 2>/dev/null || echo "SSH FAIL"; done | tee /tmp/vrp-registry-2reg.txt
 ```
 
 <details>
@@ -678,6 +681,113 @@ nerdctl system df
 ```
 </details>
 
+### 1.14 — ⭐⭐ BÓC 23G trong `/var` + 16G trong `/home` (user root, `.51`)
+
+Đây là **đòn bẩy lớn nhất hiện tại** (~42G tiềm năng, so với image nerdctl chưa rõ bao nhiêu).
+
+```bash
+du -shx /var/* 2>/dev/null | sort -rh | head -15
+```
+
+```bash
+du -shx /home/* /root/* 2>/dev/null | sort -rh | head -15
+```
+
+```bash
+find /home /root -xdev -type f -size +200M -exec ls -lh {} \; 2>/dev/null | awk '{print $5"\t"$6" "$7" "$8"\t"$9}' | sort -rh | head -25
+```
+
+```bash
+du -shx /var/lib/* 2>/dev/null | sort -rh | head -15
+```
+
+<details>
+<summary>Giải nghĩa lệnh 1.14</summary>
+
+```
+du -shx /var/*   (thay vì /var)
+└─ `/var/*` bung thành /var/lib, /var/log, /var/cache, /var/tmp...
+   ⟹ chỉ ra thư mục con nào ăn 23G, thay vì một con số tổng 61G vô dụng.
+   Vẫn giữ -x để không bò sang mount point khác.
+
+du -shx /var/lib/*
+└─ Đào sâu thêm một tầng. Kỳ vọng thấy:
+   ├─ containerd  38G  (đã biết)
+   ├─ docker      ?    ⭐ nếu có ⟹ Docker CŨ còn sót trước khi chuyển sang containerd.
+   │                     Cụm 3 năm tuổi rất dễ dính. Đây là rác THUẦN TÚY, dọn được hết.
+   ├─ etcd        ?    (thường chỉ có ở master, nếu có ở worker thì lạ)
+   ├─ rancher / longhorn ?  (nếu cụm từng dùng Rancher/Longhorn)
+   └─ kubelet     352K (đã biết, không đáng kể)
+
+find /home /root -xdev -type f -size +200M -exec ls -lh {} \;
+│                 │            │
+│                 │            └─ -size +200M : lớn hơn 200 MiB. Hạ ngưỡng từ 1G xuống 200M
+│                 │               vì 16G có thể là nhiều file vừa vừa, không phải một file to.
+│                 └─ -xdev : không vượt filesystem (tương đương -x của du)
+│
+awk '{print $5"\t"$6" "$7" "$8"\t"$9}'
+└─ Bóc output `ls -lh` lấy 3 nhóm cột:
+   ├─ $5        → SIZE (dung lượng)
+   ├─ $6 $7 $8  → ngày tháng năm sửa đổi ⭐ QUAN TRỌNG: file 2 năm không đụng ⟹ dọn được
+   └─ $9        → đường dẫn file
+   Có ngày tháng mới quyết định được file nào bỏ đi an toàn.
+
+⭐ KỲ VỌNG TÌM THẤY ở /home và /root (cụm airgap 3 năm tuổi):
+   ├─ *.tar / *.tar.gz  → image tarball import tay (`ctr images import`). Sau khi import
+   │                       xong thì tarball là RÁC — image đã nằm trong containerd rồi.
+   │                       ⭐ Đây là nghi phạm số 1, và dọn được với rủi ro gần bằng 0.
+   ├─ *.sql / *.dump    → backup database để quên
+   ├─ *.log             → log ứng dụng ngoài /var/log
+   └─ thư mục source / helm chart / kube backup
+
+⚠️ KHÔNG XÓA GÌ Ở BƯỚC NÀY. Chỉ liệt kê để Kiên xác nhận từng thứ có ai cần không.
+```
+</details>
+
+### 1.15 — ⭐ Verify: 69 image là 69 BẢN THẬT hay chỉ nhiều TAG trỏ chung? (user root, `.51`)
+
+Quyết định lợi ích thật của việc dọn image. Nếu chỉ là nhiều tag ⟹ dọn không thu về mấy GB.
+
+```bash
+nerdctl images --format '{{.ID}}' | sort | uniq -c | sort -rn | head -20
+```
+
+```bash
+echo "So dong image (ke ca tag trung): $(nerdctl images -q | wc -l)"; echo "So IMAGE ID DUY NHAT: $(nerdctl images --format '{{.ID}}' | sort -u | wc -l)"
+```
+
+```bash
+du -sh /var/lib/containerd/io.containerd.content.v1.content 2>/dev/null; du -sh /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs 2>/dev/null
+```
+
+<details>
+<summary>Giải nghĩa lệnh 1.15</summary>
+
+```
+nerdctl images --format '{{.ID}}' | sort | uniq -c | sort -rn
+└─ Đếm mỗi Image ID xuất hiện bao nhiêu lần.
+   ├─ Nếu ra toàn số 1  ⟹ 69 image THẬT SỰ khác nhau ⟹ dọn thu về nhiều
+   └─ Nếu ra 2, 3       ⟹ ⭐ cùng image nhiều tag ⟹ **cột Size bị đếm trùng**,
+                            lợi ích dọn NHỎ HƠN nhiều so với tổng cột Size.
+   (Dấu hiệu đã thấy: `bitnami/kafka` và `.../vmlp/bitnami/kafka` cùng ID `5a85aeb27ffa`.)
+
+So sánh 2 con số:
+├─ `nerdctl images -q | wc -l`              → số DÒNG (mỗi tag một dòng)
+└─ `nerdctl images --format '{{.ID}}' | sort -u | wc -l`  → số IMAGE ID DUY NHẤT
+   Chênh lệch giữa hai số = số tag thừa. ⭐ Đây là con số nói thật.
+
+sort -u
+└─ -u (--unique) : loại dòng trùng ngay trong lúc sort ⟹ gọn hơn `sort | uniq`.
+
+du -sh .../io.containerd.content.v1.content       → blob layer thật (image store)
+du -sh .../io.containerd.snapshotter.v1.overlayfs → filesystem container đang/đã chạy
+└─ ⭐ Hai con số này là SỰ THẬT về disk, không bị đếm trùng như cột Size của `nerdctl images`.
+   Cộng lại phải xấp xỉ 38G. Tỷ lệ giữa chúng cho biết dọn kiểu nào có tác dụng:
+   ├─ content lớn      ⟹ image rác nhiều ⟹ `nerdctl rmi` có tác dụng
+   └─ snapshots lớn    ⟹ container chết chưa xóa ⟹ phải xóa container trước
+```
+</details>
+
 ---
 
 ## 2. Kết quả thu thập (điền sau khi chạy)
@@ -691,8 +801,8 @@ Nguồn: `kubectl get nodes -o custom-columns=...` (user `app` trên `.51`).
 | vrp-kubeengine01 | .48 | master | 4 | 8008432Ki (~7.6G) | 51473868Ki (~49G) | ? | ? | False | ? |
 | vrp-kubeengine02 | .49 | master | 4 | 8008424Ki (~7.6G) | 51473868Ki (~49G) | ? | ? | False | ? |
 | vrp-kubeengine03 | .50 | master | 4 | 8008432Ki (~7.6G) | 51473868Ki (~49G) | ? | ? | False | ? |
-| **vrp-kubeengine04** | **.51** | worker ⚠️ n8n | 8 | 16265348Ki (~15.5G) | 103079844Ki (~98G) | **88%** | 24% | False | ✅ **HTTP=401, 0.208s** |
-| **vrp-kubeengine05** | **.52** | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | ? | ? | 🔴 **True** | ? |
+| **vrp-kubeengine04** | **.51** | worker ⚠️ n8n | 8 | 16265348Ki (~15.5G) | 103079844Ki (~98G) | **88%** | 24% | 🔴 **True** | ✅ **HTTP=401, 0.208s** |
+| vrp-kubeengine05 | .52 | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | ? | ? | False | ? |
 | vrp-kubeengine06 | .53 | worker | 16 | 32778180Ki (~31G) | 206291924Ki (~197G) | ? | ? | False | ? |
 | vrp-kubeengine07 | .54 | worker | 8 | 16265356Ki (~15.5G) | 103079844Ki (~98G) | ? | ? | False | ? |
 | vrp-kubeengine08 | .55 | worker | 16 | 32778180Ki (~31G) | 206291924Ki (~197G) | ? | ? | False | ? |
@@ -701,9 +811,15 @@ Nguồn: `kubectl get nodes -o custom-columns=...` (user `app` trên `.51`).
   hàng chục pod `Evicted` không được dọn vẫn chiếm slot.
 - Cụm **không đồng nhất**: master yếu (4C/8G/49G), worker chia 2 hạng
   (8C/16G/98G vs 16C/32G/197G) ⟹ scheduling lệch tải là rủi ro thật.
-- 🔴 **Chỉ `.52` đang `DiskPressure=True`.** Nhưng pod hỏng nằm rải khắp `.51`/`.53`/`.54`/`.55`
+- 🔴 **Node đang `DiskPressure=True` là `.51` (kubeengine04)** — chính là node 88% disk + chạy n8n.
+  Các node khác `False`. Nhưng pod hỏng nằm rải khắp `.53`/`.54`/`.55`
   ⟹ **các node kia ĐÃ TỪNG DiskPressure rồi hồi lại**, để lại di chứng ImagePullBackOff
   (image bị GC xóa mất, không tự khỏi). Đây là bằng chứng cho vòng lặp ở mục 0.
+
+> ⚠️ **ĐÍNH CHÍNH (2026-08-21):** bản ghi trước đọc nhầm thành `.52` DiskPressure=True.
+> Đọc lệch dòng khi phân giải chuỗi CSV nén `False,False,True,False,True`. Kiên bắt lỗi.
+> **Bài học:** bảng CSV nén nhiều cột phải đếm vị trí + **đối chiếu chéo với số liệu độc lập**.
+> Ở đây `df` 88% trên `.51` đã mâu thuẫn với kết luận sai ngay từ đầu — lẽ ra phải bắt được.
 
 ### 2.1b Disk chi tiết `.51` (user root) — ✅ ĐÃ CHẠY
 
@@ -854,12 +970,80 @@ nerdctl (namespace `default`) tích 67 image rác, KHÔNG AI DỌN suốt 3 năm
 Nghĩa là **dọn 67 image rác ở `default` sẽ giải quyết tận gốc**, và đó cũng là việc
 **an toàn nhất** vì chỉ cần chừa đúng 2 image của n8n.
 
-### 2.2c ⚠️ Còn 45G chưa giải thích được trên `.51`
+### 2.2c ✅ ĐÃ TRUY RA 45G — và nó KHÔNG phải fd rác
 
-`83G used − 38G containerd − 0.325G log − 0.0004G kubelet ≈ 45G` **KHÔNG BIẾT Ở ĐÂU.**
+```
+$ du -shx /* 2>/dev/null | sort -rh | head -20
+61G     /var          ← containerd 38G nằm trong đây ⟹ CÒN 23G KHÁC trong /var
+16G     /home         ← ⭐ THỦ PHẠM MỚI, hoàn toàn ngoài dự đoán ban đầu
+3.4G    /root
+3.0G    /usr
+818M    /run
+335M    /opt
+327M    /boot
+41M     /etc
+19M     /tmp
+16K     /lost+found
+4.0K    /u01 /srv /mnt /media /data /backup_data
 
-**Chưa được kết luận gì cho tới khi tìm ra.** Nếu 45G này là thứ dọn được, nó còn to hơn
-cả containerd ⟹ có thể là đòn bẩy lớn hơn. Xem lệnh **1.11**.
+$ lsof -nP | awk '$5=="REG" && /deleted/ {s+=$7} END {...}'
+File da xoa nhung process con giu: 0.02 GB     ← ❌ GIẢ THUYẾT fd RÁC BỊ LOẠI BỎ
+
+$ nerdctl system df
+FATA[0000] unknown subcommand "df" for "system"   ← nerdctl bản này KHÔNG có `system df`
+```
+
+**Cân đối lại:** 61 + 16 + 3.4 + 3.0 + 0.8 + 0.3 + 0.3 ≈ **85G** ≈ khớp 83G used ✅
+
+**45G "bí ẩn" phân bổ như sau:**
+
+| Nơi | Dung lượng | Trạng thái |
+|---|---|---|
+| `/var` ngoài containerd (61G − 38G) | **23G** | 🔴 **CHƯA BIẾT LÀ GÌ** — cần bóc tiếp |
+| `/home` | **16G** | 🔴 **CHƯA BIẾT LÀ GÌ** — bất thường với node k8s |
+| `/root` | 3.4G | Cần xem |
+| `/usr` | 3.0G | Bình thường (hệ điều hành) |
+
+- ❌ **Loại bỏ giả thuyết "file đã xóa mà process giữ fd"** — chỉ 0.02 GB, không đáng kể.
+- ⚠️ `/var` = 61G nhưng lần đo trước `du` các thư mục con chỉ ra containerd 38G + log 325M
+  + kubelet 352K ≈ 38.3G ⟹ **còn 23G trong `/var` chưa rõ nằm ở thư mục con nào.**
+  Nghi: `/var/lib/docker` (Docker cũ còn sót từ trước khi chuyển containerd), `/var/lib/etcd`,
+  `/var/cache`, `/var/lib/rancher`, `/var/lib/longhorn`.
+- ⚠️ `/home` = 16G trên một node k8s là **bất thường** — nghi file người dùng để lại:
+  image tarball (`.tar` import tay ở cụm airgap), backup `.sql`, log cũ, source code.
+  ⭐ Nếu là tarball/backup thì đây là **16G dọn được ngay, rủi ro gần bằng 0** — sau khi
+  xác nhận không ai cần.
+
+⟹ **Đòn bẩy có thể lớn hơn dự tính:** 23G + 16G + 3.4G ≈ **42G tiềm năng**, so với việc
+dọn image nerdctl. Nhưng phải biết chúng là GÌ trước — xem lệnh **1.14**.
+
+### 2.2d ⚠️ Image nerdctl: mỗi image có 2 TAG, chưa chắc là 2 BẢN SAO
+
+`nerdctl images` cho thấy mọi image xuất hiện **2 lần** — tag ngắn và tag đầy đủ, **cùng size**:
+
+```
+909.3 MiB  langfuse/langfuse:3.68                            14 months ago
+909.3 MiB  10.208.137.65:8890/vmlp/langfuse:3.68             14 months ago
+871.9 MiB  mysql:9.3.0                                       13 months ago
+871.9 MiB  10.208.137.65:8890/vmlp/mysql:9.3.0               13 months ago
+871.9 MiB  10.208.137.65:8890/vmlp/library/mysql:9.3.0       13 months ago   ← thậm chí 3 tag
+571.7 MiB  bitnami/kafka:2.8.1-debian-10-r99                 22 months ago
+571.7 MiB  10.208.137.65:8890/vmlp/bitnami/kafka:...         22 months ago
+```
+
+🔴 **CẢNH BÁO — ĐỪNG CỘNG DỒN CỘT SIZE.** Rất có thể đây là **cùng một image mang nhiều tag**
+(trỏ chung một Image ID, chung layer blob) chứ không phải nhiều bản sao.
+Nếu đúng vậy: **xóa bớt một tag KHÔNG thu về GB nào** — layer chỉ thực sự được giải phóng
+khi tag CUỐI CÙNG trỏ tới nó bị xóa.
+
+⟹ **PHẢI xác nhận bằng Image ID trước khi ước lượng lợi ích** — xem lệnh **1.15**.
+Ở lần đo trước (`nerdctl images` mặc định) đã thấy dấu hiệu này:
+`bitnami/kafka` và `10.208.137.65:8890/vmlp/bitnami/kafka` **cùng IMAGE ID `5a85aeb27ffa`**
+⟹ **gần như chắc chắn là cùng image, khác tag.** Cần verify diện rộng.
+
+**Hệ quả:** con số "69 image" ở `nerdctl namespace ls` có thể chỉ tương ứng ~35 image thật.
+Lợi ích dọn dẹp namespace `default` **nhỏ hơn ước tính ban đầu** — nhưng vẫn đáng làm vì
+image tuổi 22-24 tháng, không container nào dùng.
 
 ### 2.3 Output thật
 
@@ -876,13 +1060,20 @@ cả containerd ⟹ có thể là đòn bẩy lớn hơn. Xem lệnh **1.11**.
 - [x] Xác định `.51` thông registry `10.60.170.184:8083`
 - [x] Phát hiện cơ chế thật: **GC trừng phạt nhầm namespace** (2.2b)
 
-### 🔴 Ngay lập tức — 2 lỗ hổng chặn kết luận
-- [ ] **Lệnh 1.11 — truy 45G thiếu trên `.51`.** Nghi số 1: file đã xóa mà process còn giữ fd
-      (`df` tính, `du` không). Nếu đúng ⟹ chỉ cần restart process là thu hồi, không cần xóa gì.
-- [ ] **Lệnh 1.12 — đo CẢ 2 registry trên CẢ 8 node.** Chưa có bảng này thì **cấm dọn image**
-      trên bất kỳ node nào ngoài `.51`.
-- [ ] **Lệnh 1.3 — disk% + inode của 7 node còn lại** (mới có `.51`). `.52` đang DiskPressure=True
-      nhưng chưa biết đầy bao nhiêu, thủ phạm là gì.
+- [x] **Lệnh 1.11 — đã truy ra 45G.** ❌ Không phải fd rác (chỉ 0.02G). Phân bổ:
+      `/var` ngoài containerd **23G** + `/home` **16G** + `/root` 3.4G + `/usr` 3G.
+- [x] Đính chính: node DiskPressure=True là **`.51`**, không phải `.52` (đọc nhầm cột)
+
+### 🔴 Ngay lập tức
+- [ ] ⭐⭐ **Lệnh 1.14 — bóc 23G `/var` + 16G `/home`.** Đòn bẩy lớn nhất (~42G tiềm năng).
+      Nghi số 1: image tarball `.tar` import tay còn sót (rác thuần túy, dọn rủi ro ~0),
+      và `/var/lib/docker` cũ từ trước khi chuyển containerd.
+- [ ] ⭐ **Lệnh 1.15 — verify 69 image là bản thật hay chỉ nhiều tag.** Đã thấy dấu hiệu
+      tag trùng (cùng Image ID) ⟹ **lợi ích dọn image có thể nhỏ hơn tưởng nhiều.**
+      Phải biết trước khi đề xuất, tránh hứa hão.
+- [ ] **Lệnh 1.12 — đo 2 registry trên 5 worker.** Chưa có bảng này thì **cấm dọn image**
+      trên node ngoài `.51`.
+- [ ] **Lệnh 1.3 — disk% + inode của 4 worker còn lại** (`.52`→`.55`).
 
 ### Sau khi có số liệu
 - [ ] Lệnh 1.13 — liệt kê 67 image rác `default`, ước lượng thu hồi được bao nhiêu GB
@@ -896,8 +1087,9 @@ cả containerd ⟹ có thể là đòn bẩy lớn hơn. Xem lệnh **1.11**.
 
 | # | Việc | Đòn bẩy | Rủi ro |
 |---|---|---|---|
-| 1 | Dọn ~67 image rác namespace `default` trên `.51`, chừa 2 image n8n | ⭐⭐⭐ Nhắm đúng thủ phạm GC không với tới được | Thấp — chỉ cần chừa đúng 2 image |
-| 2 | Thu hồi 45G nếu là fd rác (restart process giữ file đã xóa) | ⭐⭐⭐ nếu đúng | Cần biết process nào trước |
+| 1 | **Dọn `/home` 16G + phần rác trong `/var` 23G** (tarball, backup, docker cũ) | ⭐⭐⭐ Lớn nhất, ~42G | Rất thấp NẾU là tarball/backup — cần Kiên xác nhận không ai cần |
+| 2 | Dọn image rác namespace `default`, chừa 2 image n8n | ⭐⭐ Nhắm đúng thủ phạm GC không với tới | Thấp — nhưng **lợi ích chưa rõ**, chờ lệnh 1.15 |
+| ~~2b~~ | ~~Thu hồi 45G fd rác~~ | ❌ **ĐÃ LOẠI** — chỉ 0.02G | — |
 | 3 | Nâng `imageMinimumGCAge` 2m → dài hơn, cho cụm airgap | ⭐⭐ Chặn GC xóa image không kéo lại được | Disk phải dọn đường khác |
 | 4 | Dọn pod `Evicted` tồn đọng | ⭐ Giải phóng slot `maxPods=50` | Rất thấp |
 | 5 | Pre-pull image thiết yếu về node sau khi dọn | ⭐⭐ Chặn tái diễn | Cần node thông registry |
