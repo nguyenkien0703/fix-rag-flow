@@ -129,6 +129,10 @@ ragflow:
     # xu ly trung). Web/API stateless theo request.
     replicas: 3
 
+    # So ReplicaSet cu giu lai de rollback (mac dinh k8s = 10).
+    # Giam xuong 3 de k8s tu don RS cu. Xem ghi chu trong templates/ragflow.yaml.
+    revisionHistoryLimit: 3
+
     # --- Rolling update strategy (them 2026-08-21) -------------------------
     # TRUOC DO de trong => k8s dung mac dinh maxUnavailable=25%, maxSurge=25%.
     # Voi replicas=3: 25% lam tron len = 1 => cho phep 1 pod chet trong luc

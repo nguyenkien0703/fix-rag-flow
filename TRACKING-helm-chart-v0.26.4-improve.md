@@ -155,17 +155,92 @@ $ helm template test helm_ragflow_v0.26.4 | grep -A8 readinessProbe
 
 ## 3. ⚠️ CẦN LÀM TRƯỚC KHI DEPLOY
 
-- [ ] ⭐ **Verify endpoint trên pod THẬT** — source nói `/api/v1/system/healthz` không cần auth,
-      nhưng phải xác nhận trên image **custom** đang chạy (image lệch upstream, đã có tiền lệ
-      phát hiện `pyvi` chỉ nhờ đọc trong container):
+- [x] ✅ **ĐÃ VERIFY ENDPOINT TRÊN POD THẬT (2026-08-21) — trả về 200.**
       ```
-      kubectl -n ragflow exec <pod> -c ragflow -- curl -s -o /dev/null -w "%{http_code}\n" http://localhost:9380/api/v1/system/healthz
+      $ kubectl -n ragflow exec ragflow-6d5c6899f-b6vhv -c ragflow -- \
+          curl -s -o /dev/null -w "%{http_code}\n" http://localhost:9380/api/v1/system/healthz
+      200
       ```
-      Phải ra **200**. Nếu ra 401/404 ⟹ **dừng lại**, probe sai sẽ làm pod không bao giờ Ready
-      ⟹ **toàn bộ dịch vụ sập**. Đây là rủi ro lớn nhất của đợt patch này.
+      ⟹ Endpoint hoạt động trên **image custom** đang chạy, **không cần auth**, đúng như source.
+      ⟹ **Rủi ro lớn nhất của đợt patch đã được gỡ.** Probe an toàn để deploy.
+      (Bước này bắt buộc vì image custom lệch upstream — tiền lệ: phát hiện `pyvi` chỉ nhờ
+      đọc trong container chứ không phải đọc GitHub.)
 - [ ] Kiểm cụm còn đủ tài nguyên cho `maxSurge: 1` (pod thứ 4 tạm thời) — `.51` vừa mới thoát
       DiskPressure, `.54` vẫn 84%.
 - [ ] `helm diff upgrade` trước khi apply thật.
+
+## 3b. 🔴 PHÁT HIỆN MỚI — ReplicaSet cũ ĐANG SỐNG, liên tục tạo lại pod
+
+```
+$ kubectl get pods -n ragflow -o wide
+ragflow-6d5c6899f-b6vhv    1/1  Running             4h29m  vrp-kubeengine05
+ragflow-6d5c6899f-c8q8q    1/1  Running             4h29m  vrp-kubeengine05
+ragflow-6d5c6899f-jblj9    1/1  Running             4h30m  vrp-kubeengine05
+ragflow-755fc96fc6-gq46f   0/1  Init:ErrImagePull   34s    vrp-kubeengine06   ← MỚI 34s!
+```
+
+⚠️ **ĐÍNH CHÍNH nhận định lượt trước.** Trước đó ghi pod mồ côi là "tàn dư nằm im, không gấp".
+**SAI.** Đối chiếu 2 lần đo:
+
+| Lần đo | Tên pod | Tuổi |
+|---|---|---|
+| Trước | `ragflow-755fc96fc6-**f6w2p**` | 3h33m |
+| Nay | `ragflow-755fc96fc6-**gq46f**` | **34s** |
+
+Cùng ReplicaSet `755fc96fc6` nhưng **pod đổi tên và tuổi reset về 34 giây**
+⟹ **ReplicaSet cũ VẪN CÓ `replicas: 1` và đang trong vòng lặp:**
+```
+tao pod -> Init:ErrImagePull -> backoff -> xoa -> tao lai -> ...
+```
+
+**Vì sao nó không tự biến mất:** `revisionHistoryLimit` mặc định của Deployment là **10**
+⟹ k8s giữ lại tới 10 ReplicaSet cũ để rollback. RS cũ có `replicas: 0` thì vô hại —
+nhưng RS này còn `replicas: 1`, tức **lần rollout trước chưa hoàn tất sạch**.
+Nó sẽ đeo bám mãi cho tới khi bị scale về 0 hoặc xóa.
+
+**Tác hại:** mỗi vòng lặp tốn một lượt pull thất bại + để lại snapshot/rác trên `.53`
+(node vừa dọn xong). Không ảnh hưởng dịch vụ (3 pod mới vẫn Running) nhưng **liên tục sinh rác**.
+
+**Cách xử lý (user `app`):**
+
+```bash
+kubectl -n ragflow get rs -o wide
+```
+
+```bash
+kubectl -n ragflow describe pod ragflow-755fc96fc6-gq46f | grep -A5 -iE "image|events|failed"
+```
+
+```bash
+kubectl -n ragflow scale rs ragflow-755fc96fc6 --replicas=0
+```
+
+<details>
+<summary>Giải nghĩa</summary>
+
+```
+kubectl get rs -o wide
+└─ Liet ke ReplicaSet + cot IMAGES. ⭐ Xem RS cu dang doi image nao - rat co the
+   no tro toi tag KHONG CON TON TAI tren registry (vd tag cu da bi xoa/ghi de).
+   Cot DESIRED/CURRENT/READY cho biet RS nao con "muon" tao pod.
+
+describe pod ... | grep -A5 -iE "image|events|failed"
+└─ Xem LY DO ErrImagePull chinh xac: tag khong ton tai / khong thong registry /
+   thieu imagePullSecret. Bien "khong keo duoc" thanh mot nguyen nhan cu the.
+
+scale rs <ten> --replicas=0
+└─ ⭐ Cach AN TOAN NHAT: dua RS cu ve 0 pod thay vi `delete rs`.
+   - Van GIU LICH SU rollout => con `kubectl rollout undo` duoc neu can quay lai.
+   - Dung ngay vong lap tao pod.
+   `delete rs` cung duoc nhung mat kha nang rollback ve ban do.
+
+⚠️ KHONG dung `kubectl delete pod` - Deployment/RS se tao lai pod ngay lap tuc.
+   Phai xu ly o tang RS, khong phai tang pod. Day la loi pho bien.
+
+Chong tai dien: dat `revisionHistoryLimit` trong Deployment spec
+(vd 3) de k8s tu don RS cu, thay vi giu 10 ban.
+```
+</details>
 
 ## 4. 📋 ISSUE CÒN LẠI (chưa làm, ghi để không quên)
 

@@ -8,6 +8,12 @@ metadata:
     app.kubernetes.io/component: ragflow
 spec:
   replicas: {{ .Values.ragflow.deployment.replicas | default 1 }}
+  # Mac dinh k8s giu 10 ReplicaSet cu de rollback. RS cu co replicas=0 thi vo hai,
+  # nhung neu rollout truoc do khong hoan tat sach (RS cu con replicas>0) thi no
+  # LIEN TUC tao lai pod loi => ErrImagePull -> backoff -> tao lai, sinh rac mai.
+  # Da xay ra that: RS ragflow-755fc96fc6 van tao pod moi sau 4h30m (2026-08-21).
+  # Giam so ban giu lai de k8s tu don, van du de rollback vai buoc.
+  revisionHistoryLimit: {{ .Values.ragflow.deployment.revisionHistoryLimit | default 3 }}
   selector:
     matchLabels:
       {{- include "ragflow.selectorLabels" . | nindent 6 }}
