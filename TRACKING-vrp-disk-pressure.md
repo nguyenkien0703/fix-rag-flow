@@ -1702,6 +1702,65 @@ $ ls -lh /home/app/open-notebook/
 File `.zip`/`.tar` ở `.51` chỉ là bộ cài đặt để lại ⟹ nhiều khả năng dọn được,
 nhưng **nên hỏi Kiên** vì có kèm file yaml triển khai (có thể là bộ cài duy nhất).
 
+## 3a-undecies. ✅ IMAGE MỒ CÔI ĐÃ XÁC NHẬN — nhưng CHƯA XÓA
+
+```
+$ crictl ps -a --no-trunc | grep -i 3e85591b8db09
+(trống)
+$ ctr -n k8s.io containers list | grep -i 3e85591b8db09
+(trống)
+$ crictl images --digests | grep -i import-2026
+docker.io/library/import-2026-07-27  <none>  f9351835933f1  3e85591b8db09  3.28GB
+```
+
+✅ **Cả hai lệnh kiểm container đều TRỐNG** ⟹ image 3.28GB **thật sự mồ côi**,
+không container nào (đang chạy hoặc đã dừng) tham chiếu ⟹ **XÓA ĐƯỢC AN TOÀN.**
+
+⚠️ **NHƯNG CHƯA CHẠY `crictl rmi`** — đã nhảy sang bước B luôn.
+🔴 **3.28G vẫn đang nằm trên đĩa.** Đây chính là thứ đưa `.51` xuống dưới 80%.
+
+⭐ **Vì sao GC không xóa nó dù mồ côi:** image này được `ctr images import` **trực tiếp**
+(tên `import-2026-07-27` là tên tự sinh khi import không đặt tag), **không qua CRI**
+⟹ kubelet/CRI không quản lý ⟹ **cùng một vùng mù** như namespace `default` của nerdctl.
+Một lần nữa: **thủ phạm nằm ở nơi GC không nhìn thấy.**
+
+## 3a-duodecies. ✅ TIẾN ĐỘ SAU ĐỢT DỌN THỨ HAI
+
+```
+$ \rm -rfv /home/app/signoz/signoz-images/signoz_images.zip /home/app/open-notebook/open-notebook-images.zip
+removed '/home/app/signoz/signoz-images/signoz_images.zip'
+removed '/home/app/open-notebook/open-notebook-images.zip'
+$ df -h /
+/dev/vda1  99G  77G  18G  82% /          ← .51: 83% → 82%
+```
+
+```
+# Trên .53
+$ \rm -v /home/vt_admin/images/ragflow-pyvi.tar /home/app/surf-sense/images/surfsense-be-docling.tar /home/vt_admin/litellm/litellm-images-bundle.tar
+removed '/home/vt_admin/images/ragflow-pyvi.tar'
+removed '/home/app/surf-sense/images/surfsense-be-docling.tar'
+removed '/home/vt_admin/litellm/litellm-images-bundle.tar'
+$ df -h /
+/dev/vda1  197G  137G  53G  73% /        ← .53: 77% → 73% ✅
+```
+
+### Bảng tiến độ tổng
+
+| Node | Ban đầu | Hiện tại | Mục tiêu | Còn thiếu |
+|---|---|---|---|---|
+| **`.51`** | 88% 🔴 | **82%** | <80% | **~2%** (≈2G) |
+| `.52` | 25% ✅ | 25% | — | — |
+| **`.53`** | 78% | **73%** ✅ | <80% | ✅ **ĐẠT** |
+| `.54` | 84% 🔴 | 84% | <80% | **~4%** (≈4G) — **chưa động tới** |
+| `.55` | 66% ✅ | 66% | — | — |
+
+⭐ **`.51` chỉ còn thiếu ~2%** — image mồ côi 3.28G **thừa sức** giải quyết (3.28G ≈ 3.3%).
+⟹ `crictl rmi 3e85591b8db09` sẽ đưa `.51` xuống **~79%**, dưới ngưỡng
+`imageGCLowThreshold=80%` ⟹ **GC ngừng, DiskPressure tự hết.**
+
+🔴 **`.54` (84%) vẫn chưa được đụng tới** — sát ngưỡng GC 85%, sắp lặp lại kịch bản `.51`.
+Có 26G containerd + 11G nerdctl. **Cần xử lý ngay sau `.51`.**
+
 ## 3b. LỆNH THỰC THI FIX trên `.51` (user root)
 
 > ⚠️ **CHƯA CHẠY BƯỚC XÓA NÀO cho tới khi verify xong.** Mỗi bước có phần VERIFY trước,
