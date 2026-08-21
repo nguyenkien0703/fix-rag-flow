@@ -13,6 +13,14 @@ Chi tiết đầy đủ: memory `vrp-cluster-topology.md` + `TRACKING-vrp-disk-p
 | **vrp-kubeengine04** | **10.208.137.51** | worker — ⚠️ **jump box (kubectl) + n8n chạy bằng `nerdctl`** |
 | vrp-kubeengine05..08 | .52 / .53 / .54 / .55 | worker (RAGFlow ở .54) |
 
+### 👤 User nào chạy lệnh gì
+
+| Việc | User |
+|---|---|
+| `kubectl ...` | **`app`** |
+| `nerdctl ps` / `nerdctl images` (n8n) | **`root`** — `su -` trước, **KHÔNG dùng `sudo nerdctl`** |
+| `ctr` / `crictl` | **`root`** |
+
 ### 3 luật cứng
 
 1. **`.51` chạy n8n bằng `nerdctl` — n8n DOWN LÀ RẤT NGUY HIỂM.**
@@ -33,6 +41,10 @@ Chi tiết đầy đủ: memory `vrp-cluster-topology.md` + `TRACKING-vrp-disk-p
   Lệnh dài dùng sơ đồ `│ └─` thay vì bảng.
 - **Collapse phải nằm TRONG FILE tracking**, không chỉ in ra chat. Soạn lệnh cho Kiên chạy
   ⟹ ghi vào file trước, rồi mới nhắc lại trong chat.
+- ⭐ **Trong CHAT thì KHÔNG giải thích lệnh** (Kiên chốt 2026-08-21) — chat chỉ đưa **lệnh trần**,
+  phần giải nghĩa nằm trọn trong file tracking. Tránh lặp nội dung ở 2 chỗ.
+- ⭐ **Kết thúc MỖI lượt phải nói rõ: "Kiên cần chạy lệnh gì"** — liệt kê thẳng, đúng thứ tự,
+  kèm user cần dùng. Không để Kiên phải tự mò trong file xem tới bước nào.
 
 ## Bài học vận hành đã trả giá (đừng lặp lại)
 

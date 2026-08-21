@@ -17,6 +17,20 @@
 | Master | `.48` (kubeengine01), `.49` (02), `.50` (03) |
 | Worker | `.51` (04), `.52` (05), `.53` (06), `.54` (07), `.55` (08) |
 
+### 👤 USER NÀO CHẠY LỆNH GÌ (xác nhận từ Kiên 2026-08-21)
+
+| Việc | User | Ghi chú |
+|---|---|---|
+| `kubectl ...` | **`app`** | User thao tác k8s hằng ngày, trên `.51` |
+| `nerdctl ps` / `nerdctl images` (n8n) | **`root`** | ⚠️ Phải `su -` sang root trước. **KHÔNG dùng `sudo nerdctl`** |
+| `ctr` / `crictl` | **`root`** | Cùng nhóm với nerdctl, cần quyền truy cập containerd socket |
+
+```bash
+su -
+```
+Sau khi vào root mới gõ `nerdctl ps` / `nerdctl images` / `ctr ...` / `crictl ...`.
+Các lệnh `kubectl` thì thoát về user `app` (`exit`) rồi gõ.
+
 ### ⚠️ Ràng buộc an toàn — ĐỌC TRƯỚC KHI GÕ BẤT KỲ LỆNH GHI NÀO
 
 - **`.51` (vrp-kubeengine04) là node NHẠY CẢM NHẤT:**
@@ -260,14 +274,67 @@ So sánh crictl vs ctr:
 
 ### 1.6 — ⭐ SỐNG CÒN: xác định n8n trên `.51` nằm ở containerd namespace nào
 
+**Chạy TRÊN node `.51`, bằng user `root`** (`su -` trước, KHÔNG dùng `sudo nerdctl`):
+
 ```bash
-ssh 10.208.137.51 'echo "=== CAC NAMESPACE CONTAINERD ==="; sudo ctr namespaces list; echo "=== CONTAINER NS default (nerdctl/n8n?) ==="; sudo ctr -n default containers list; echo "=== NERDCTL PS ==="; sudo nerdctl ps -a 2>/dev/null || echo "nerdctl khong co trong PATH"; echo "=== IMAGE NS default ==="; sudo ctr -n default images list -q; echo "=== NERDCTL NAMESPACE ==="; sudo nerdctl namespace ls 2>/dev/null'
+su -
+```
+
+```bash
+nerdctl ps -a
+```
+
+```bash
+nerdctl images
+```
+
+```bash
+nerdctl namespace ls
+```
+
+```bash
+ctr namespaces list
+```
+
+```bash
+ctr -n default containers list
+```
+
+```bash
+ctr -n k8s.io containers list | wc -l
+```
+
+Gộp một lượt ghi ra file (vẫn ở user root):
+
+```bash
+{ echo "=== NERDCTL PS -A ==="; nerdctl ps -a; echo "=== NERDCTL IMAGES ==="; nerdctl images; echo "=== NERDCTL NAMESPACE LS ==="; nerdctl namespace ls; echo "=== CTR NAMESPACES ==="; ctr namespaces list; echo "=== CTR -n default CONTAINERS ==="; ctr -n default containers list; } 2>&1 | tee /tmp/vrp-n8n-namespace.txt
 ```
 
 <details>
 <summary>Giải nghĩa lệnh 1.6 — vì sao lệnh này chạy TRƯỚC mọi lệnh dọn dẹp</summary>
 
 ```
+⚠️ PHẢI Ở USER root (`su -`). KHÔNG dùng `sudo nerdctl` — Kiên xác nhận cách dùng
+   trên cụm này là su sang root rồi gõ `nerdctl` trần.
+
+nerdctl ps -a
+├─ ps    : liệt kê container nerdctl đang chạy ⟹ ⭐ tìm container n8n ở đây
+└─ -a (--all) : gồm cả container đã dừng.
+   Cần -a để thấy container n8n cũ đã stop (chúng vẫn giữ image ⟹ image không bị coi
+   là "unused" ⟹ ảnh hưởng tính toán khi prune).
+   ⭐ Cột cần ghi lại: IMAGE (tên đầy đủ + tag) và NAMES của n8n — để sau này lập
+      danh sách image CẤM XÓA.
+
+nerdctl images
+└─ Liệt kê image trong namespace mặc định mà nerdctl đang dùng.
+   ⭐ Ghi lại image của n8n vào mục 2.2 — đây là danh sách bảo vệ.
+
+nerdctl namespace ls
+└─ ⭐⭐ LỆNH QUYẾT ĐỊNH. Cho biết nerdctl đang làm việc ở namespace nào và có bao nhiêu
+   container/image mỗi namespace. Nếu n8n nằm ở `default` ⟹ tách biệt hoàn toàn với
+   pod k8s (`k8s.io`) ⟹ dọn image k8s.io AN TOÀN.
+   Nếu n8n nằm ở `k8s.io` ⟹ NGUY HIỂM, image GC của kubelet có thể xóa image n8n.
+
 ctr namespaces list
 └─ Liệt kê tất cả namespace của containerd trên node. Kỳ vọng thấy ít nhất:
    `k8s.io` (kubelet) và `default` (nerdctl). Nếu n8n được deploy với
@@ -278,15 +345,11 @@ ctr -n default containers list
 └─ Liệt kê container trong namespace default. Nếu thấy n8n ở đây ⟹ THỞ PHÀO:
    dọn image trong k8s.io hoàn toàn không đụng tới nó.
 
-nerdctl ps -a
-├─ ps    : liệt kê container đang chạy
-└─ -a (--all) : gồm cả container đã dừng.
-   Cần -a để thấy container n8n cũ đã stop (chúng vẫn giữ image ⟹ image không bị coi
-   là "unused" ⟹ ảnh hưởng tính toán khi prune).
-
-|| echo "..." : nếu lệnh trước THẤT BẠI (exit code ≠ 0) thì in thông báo thay vì im lặng.
-                Tránh trường hợp lệnh không tồn tại mà output trống, gây hiểu nhầm là
-                "không có container nào".
+{ lệnh1; lệnh2; ...; } 2>&1 | tee FILE
+├─ { ...; } : gom nhiều lệnh thành một khối, để `| tee` nhận output của CẢ KHỐI
+│             chứ không chỉ lệnh cuối. ⚠️ Bắt buộc có dấu `;` trước `}`.
+├─ 2>&1     : gộp stderr vào stdout ⟹ lỗi cũng lọt vào file thay vì bay mất
+└─ tee FILE : vừa in màn hình vừa ghi file ⟹ VDI chặn clipboard thì vẫn xem lại được
 
 ⚠️ KẾT LUẬN CẦN RÚT RA TỪ LỆNH NÀY (ghi vào mục 2.2 trước khi làm gì tiếp):
    n8n nằm ở namespace ......... ⟹ dọn image k8s.io [CÓ / KHÔNG] ảnh hưởng n8n.
@@ -479,9 +542,19 @@ tr " " "\n"
 | vrp-kubeengine07 | .54 | worker | | | | | | | |
 | vrp-kubeengine08 | .55 | worker | | | | | | | |
 
-### 2.2 Kết luận n8n namespace (từ lệnh 1.6)
+### 2.2 Kết luận n8n namespace (từ lệnh 1.6) — 🚧 CHẶN MỌI THAO TÁC GHI CHO TỚI KHI ĐIỀN XONG
 
-> ⬜ CHƯA CHẠY — điền vào đây trước khi làm bất kỳ thao tác dọn dẹp nào.
+> ⬜ CHƯA CHẠY.
+
+- n8n nằm ở containerd namespace: `..................`
+- Pod k8s nằm ở namespace: `k8s.io` (mặc định, cần xác nhận)
+- ⟹ Dọn image trong `k8s.io` có ảnh hưởng n8n không? **[ ] CÓ  [ ] KHÔNG**
+
+**Danh sách image CẤM XÓA trên `.51`** (điền từ `nerdctl images`):
+
+| Image (repo:tag) | Digest | Container đang dùng |
+|---|---|---|
+| | | |
 
 ### 2.3 Output thật
 
