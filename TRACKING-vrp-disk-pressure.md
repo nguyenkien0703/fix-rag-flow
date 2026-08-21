@@ -1314,13 +1314,176 @@ bitnami/zookeeper    3.7.0-...      061e22290d52  22 months  463.1 MiB
 | `qdrant-v1.14.1.tar` (186M) | ⚠️ chưa verify | ⚠️ pod qdrant đang ErrImagePull |
 | `grafana`, `prometheus`, `redis`, `clickhouse`, `otel-collector` (~900M) | ⚠️ chưa verify | ⚠️ **kiểm registry trước** |
 
-⟹ **Xóa được NGAY, đã xác nhận: ~10.7G** (ragflow 3.4G + n8n 5.9G + langfuse 862M + zookeeper 522M).
-⟹ Đủ đưa `.51` từ **88% xuống ~77%** — **dưới ngưỡng `imageGCLowThreshold=80%`**
-⟹ GC ngừng hẳn, `DiskPressure` tự hết. **Đạt mục tiêu chỉ với bước này.**
+### 🟡 QUYẾT ĐỊNH CỦA KIÊN (2026-08-21): file n8n GIỮ LẠI, chờ xác nhận
+
+> Kiên chốt: trên `.51` **chỉ xóa `/root/images/ragflow-v0264_custom.tar`**.
+> **Toàn bộ file liên quan n8n GIỮ NGUYÊN** — cần xác nhận từ **người triển khai n8n**
+> trước khi đụng vào.
+
+**Danh sách file n8n đang chờ xác nhận — ghi rõ dung lượng để hỏi:**
+
+| File | Size | Ngày | Loại |
+|---|---|---|---|
+| `/home/app/workspace/images/n8n.tar` | **1.2G** | May 8 | image tarball |
+| `/home/app/workspace/images/n8nio.tar` | **1.2G** | Mar 30 | image tarball |
+| `/home/app/workspace/n8n_nerdctl/n8n-curl.tar` | **1.2G** | May 13 | image tarball |
+| `/home/app/workspace/images/n8n_1_122_5.tar` | **1.1G** | Dec 25 2025 | image tarball |
+| `/home/app/workspace/images/n8n_curl.tar` | **263M** | Apr 7 | image tarball |
+| `/home/app/workspace/n8n_nerdctl/n8n_backup_2026-03-30.sql` | **1.4G** | Mar 30 | **backup DB** |
+| **TỔNG** | **~6.4G** | | |
+
+**Câu hỏi cần hỏi người triển khai n8n:**
+1. 5 file `.tar` image n8n (5.0G) — image đã nằm trong containerd namespace `default` rồi
+   (6 bản: `1.123.38-curl`, `1.123.38`, `1.123.27-curl`, `1.123.27`, `custom`, `1.122.5`).
+   Tarball còn cần để rollback về bản cũ không, hay xóa được?
+2. `n8n_backup_2026-03-30.sql` (1.4G) — có bản backup nào khác ở nơi khác không?
+   Nếu đây là bản duy nhất thì **phải chuyển đi trước khi xóa**.
+
+🔴 **Không đụng dù có xác nhận:** `/home/app/persistent-data/` (pgdata sống),
+`/var/lib/nerdctl` (20G volume data n8n).
+
+### Tổng kết dung lượng `.51`
+
+| Nhóm | Size | Trạng thái |
+|---|---|---|
+| ✅ `ragflow-v0264_custom.tar` | **3.4G** | Được phép xóa — **nhưng lệnh `rm` bị alias chặn, CHƯA xóa thật** (xem 3a-bis) |
+| 🟡 File n8n (5 tar + 1 sql) | **~6.4G** | ⏸️ **Chờ xác nhận người triển khai n8n** |
+| ✅ `langfuse-3.68.tar` | 862M | Xóa được (image `ee82c5113606` đã có) |
+| ✅ `zookeeper.tar` ×2 | 522M | Xóa được (image `061e22290d52` đã có) |
+| ⚠️ signoz, open-notebook, qdrant, grafana, prometheus, redis, clickhouse | ~3.8G | Chưa verify |
+
+⟹ **Xóa được ngay mà không cần hỏi ai: ~4.8G** (ragflow + langfuse + zookeeper)
+⟹ `.51` từ 88% → **~83%**. **Chưa đủ xuống dưới 80%** ⟹ cần thêm nhóm ⚠️ hoặc nhóm 🟡.
 
 ⚠️ **`qdrant-v1.14.1.tar`** — pod `qdrant-0` đang `Init:ErrImagePull`. Kiểm xem image có trên
 registry không trước khi xóa; nếu có thì xóa, và vấn đề của qdrant là chuyện khác (network
 tới registry / imagePullSecret), không phải thiếu tarball.
+
+## 3a-bis. ⚠️ BẪY: `rm` KHÔNG XÓA vì alias `rm -i` — và cách nhận ra
+
+```
+$ rm -v /root/images/ragflow-v0264_custom.tar
+rm: remove regular file '/root/images/ragflow-v0264_custom.tar'?      ← DẤU ? = CÂU HỎI
+$ df -h /
+/dev/vda1  99G  83G  12G  88% /                                        ← không đổi (ĐÚNG)
+```
+
+**File CHƯA bị xóa.** `rm` đang hỏi xác nhận và dừng chờ gõ `y`. Không phải "xóa lỗi".
+
+**Nguyên nhân:** CentOS 7 mặc định đặt `alias rm='rm -i'` cho root (trong `/root/.bashrc`
+hoặc `/etc/profile.d/`) ⟹ mọi `rm` đều thành chế độ hỏi từng file.
+
+**Cách xử lý:**
+
+```bash
+\rm -v /duong/dan/file.tar
+```
+
+hoặc gõ `y` + Enter khi được hỏi, hoặc:
+
+```bash
+rm -f -v /duong/dan/file.tar
+```
+
+<details>
+<summary>Giải nghĩa — và cách PHÂN BIỆT "đã xóa" với "đang hỏi"</summary>
+
+```
+⭐ ĐỌC OUTPUT CỦA `rm -v` CHO ĐÚNG:
+├─ Xóa THẬT   → in:  removed '/root/images/ragflow-v0264_custom.tar'
+└─ Đang HỎI   → in:  rm: remove regular file '...'?     ← KẾT THÚC BẰNG DẤU `?`
+
+⚠️ Nếu chỉ nhìn `df` rồi kết luận "xóa lỗi" ⟹ đi tìm nhầm hướng (nghi fd rác, nghi
+   filesystem hỏng). Dòng kết thúc bằng `?` là CÂU HỎI, không phải KẾT QUẢ.
+
+\rm  (dấu gạch chéo ngược trước tên lệnh)
+└─ ⭐ Bỏ qua ALIAS, gọi thẳng lệnh gốc `/usr/bin/rm`.
+   Mẹo chung cho mọi lệnh bị alias: \ls, \cp, \grep...
+   Kiểm tra lệnh có bị alias không:  type rm     (hoặc: alias rm)
+
+rm -f
+├─ -f (--force) : không hỏi, bỏ qua file không tồn tại
+└─ ⚠️ Mạnh tay hơn `\rm` — dùng khi CHẮC CHẮN. Với thao tác trên production,
+   `\rm -v` an toàn hơn vì vẫn giữ mọi cảnh báo khác, chỉ bỏ phần hỏi.
+
+VÌ SAO `df` KHÔNG ĐỔI CÒN CÓ MỘT LÝ DO KHÁC (không phải ca này, nhưng đáng nhớ):
+└─ Nếu file đã xóa THẬT mà `df` vẫn không giảm ⟹ có process đang giữ file descriptor
+   ⟹ inode chưa giải phóng. Kiểm bằng: lsof -nP | grep deleted
+   (Ở `.51` đã đo: chỉ 0.02G ⟹ không phải vấn đề này.)
+```
+</details>
+
+## 3a-ter. 🔴 `.53` (kubeengine06) — 83G là PostgreSQL SỐNG, KHÔNG phải rác
+
+```
+$ du -shx /home/* | sort -rh | head
+83G     /home/app          ← phần lớn là postgres data
+9.1G    /home/vt_admin
+924K×N  /home/backup_202512XX   (~15 thư mục nhỏ, không đáng kể)
+
+$ find /home -xdev -type f -size +500M -exec ls -lh {} \; | sort -rh
+3.4G  Jul 31 13:48  /home/vt_admin/images/ragflow-v0264_custom.tar
+3.1G  Jul 31 16:44  /home/app/surf-sense/images/surfsense-be-docling.tar
+3.1G  Jul 27 17:33  /home/vt_admin/images/ragflow-pyvi.tar
+1.2G  May 22 09:48  /home/app/litellm/litellm/litellm-images-bundle.tar
+1.2G  May 21 19:43  /home/vt_admin/litellm/litellm-images-bundle.tar
+1.0G  Aug 21 12:20  /home/app/postgres/data/base/16384/16860     🔴 ĐANG GHI HÔM NAY
+1.0G  Aug 21 12:20  /home/app/postgres/data/base/16384/16531     🔴
+1.0G  Aug 21 12:03  /home/app/postgres/data/base/16384/17362     🔴
+1.0G  Aug 21 11:24  /home/app/postgres/data/base/16384/16509     🔴
+1.0G  Aug 21 10:16  /home/app/postgres/data/base/16384/16509.20 → .24
+1.0G  Aug 20 19:18  /home/app/postgres/data/base/16384/16509.7  → .19
+```
+
+🔴🔴 **`/home/app/postgres/data/` LÀ POSTGRESQL SỐNG — TUYỆT ĐỐI KHÔNG ĐỤNG.**
+- Timestamp `Aug 21 12:20` = **đang được ghi ngay lúc chạy lệnh.**
+- ⭐ Các file `16509.N` là **segment nối tiếp của CÙNG MỘT BẢNG** — PostgreSQL tự cắt file
+  mỗi **1GB** (`RELSEG_SIZE`), đánh số `.1`, `.2`, ... Thấy `.7` → `.24`
+  ⟹ **riêng bảng đó đã ~25GB.**
+- Đây là **postgres chạy TRỰC TIẾP TRÊN HOST** (`/home/app/postgres/data`), **không phải
+  trong k8s** — giống mô hình n8n trên `.51`. ⟹ kubelet/GC không biết gì về nó.
+
+**⟹ 83G `/home/app` trên `.53` PHẦN LỚN LÀ DATA THẬT, không phải rác dọn được.**
+Đây là điểm khác biệt quan trọng so với `.51` (nơi `/home` chủ yếu là tarball).
+
+### Xóa được trên `.53`: ~12G tarball
+
+| File | Size | Ghi chú |
+|---|---|---|
+| `/home/vt_admin/images/ragflow-v0264_custom.tar` | 3.4G | ✅ image đã trên registry (Kiên xác nhận) |
+| `/home/app/surf-sense/images/surfsense-be-docling.tar` | 3.1G | ⚠️ verify trước |
+| `/home/vt_admin/images/ragflow-pyvi.tar` | 3.1G | ⚠️ verify — image `pyvi` là bản custom RAGFlow |
+| `/home/app/litellm/litellm/litellm-images-bundle.tar` | 1.2G | ⚠️ verify |
+| `/home/vt_admin/litellm/litellm-images-bundle.tar` | 1.2G | ⚠️ **trùng file trên, 2 bản ở 2 chỗ** |
+
+⚠️ `9.1G /home/vt_admin` — chứa tarball + gì nữa chưa rõ, cần bóc thêm.
+
+## 3a-quater. ✅ POD RAGFLOW: dịch vụ VẪN CHẠY BÌNH THƯỜNG
+
+```
+$ kubectl get pods -n ragflow -o wide
+ragflow-6d5c6899f-b6vhv    1/1  Running                 3h33m  vrp-kubeengine05
+ragflow-6d5c6899f-c8q8q    1/1  Running                 3h33m  vrp-kubeengine05
+ragflow-6d5c6899f-jblj9    1/1  Running                 3h34m  vrp-kubeengine05
+ragflow-755fc96fc6-f6w2p   0/1  Init:ImagePullBackOff   3h33m  vrp-kubeengine06   ← MỒ CÔI
+ragflow-minio-0            1/1  Running                 6d18h  vrp-kubeengine07
+ragflow-mysql-0            1/1  Running                 7d12h  vrp-kubeengine06
+ragflow-redis-0            1/1  Running                 6d18h  vrp-kubeengine07
+```
+
+⭐ **KHÔNG PHẢI SỰ CỐ DỊCH VỤ.** 3 pod ragflow đang `Running` bình thường trên `.52`.
+
+**Pod kẹt là POD MỒ CÔI của ReplicaSet CŨ:**
+- Pod chạy tốt: `ragflow-**6d5c6899f**-*` (ReplicaSet mới)
+- Pod kẹt:      `ragflow-**755fc96fc6**-f6w2p` (ReplicaSet **cũ**)
+⟹ Hash ReplicaSet khác nhau ⟹ đây là tàn dư từ lần deploy trước, deployment đã chuyển sang
+bản mới thành công. Pod này **không phục vụ traffic nào**.
+
+⚠️ `kubectl describe pod -l app=ragflow` không ra gì ⟹ **label không phải `app=ragflow`**.
+Muốn describe phải dùng tên pod trực tiếp.
+
+**Việc cần làm:** xóa pod mồ côi + ReplicaSet cũ (giải phóng slot + snapshot container).
+**Không gấp**, không ảnh hưởng dịch vụ.
 
 ## 3b. LỆNH THỰC THI FIX trên `.51` (user root)
 
