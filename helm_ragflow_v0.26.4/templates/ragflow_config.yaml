@@ -90,7 +90,18 @@ data:
                         '$status $body_bytes_sent "$http_referer" '
                         '"$http_user_agent" "$http_x_forwarded_for"';
 
-        access_log  /var/log/nginx/access.log  main;
+        # TAT access_log (2026-08-21) - truoc do ghi MOI request vao
+        # /var/log/nginx/access.log, KHONG rotate, KHONG gioi han kich thuoc.
+        # File nay nam trong filesystem container (ephemeral) => tinh vao disk
+        # cua NODE => gop phan gay disk-pressure (xem TRACKING-vrp-disk-pressure.md).
+        #
+        # Danh doi: mat log request. Chap nhan duoc vi access_log cua RAGFlow
+        # KHONG co field duration (bai hoc phien 2026-08-18: cot 270774 tung bi
+        # doc nham thanh "270.8 giay", thuc ra la response size) => gia tri debug
+        # thap, trong khi chi phi disk la that.
+        # Muon bat lai de dieu tra: doi thanh /dev/stdout de kubelet tu rotate,
+        # KHONG ghi ra file trong container.
+        access_log  off;
 
         sendfile        on;
         #tcp_nopush     on;
