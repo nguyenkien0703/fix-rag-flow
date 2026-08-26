@@ -28,7 +28,10 @@ Kiên **ssh trực tiếp được vào từng node của cả 2 cụm**.
 | Cái gì ở lại vRP | RAGFlow, MySQL, Redis, ES — **không đụng** |
 | Namespace đích | `ragflow` trên vMLP (tạo mới, không xung đột — ns là object cục bộ từng cụm) |
 | Ổ đĩa | ❌ **KHÔNG được cấp block device mới** — Kiên chốt: *"có gì dùng nấy"* ⟹ chạy trên `/dev/vda1` sẵn có |
-| Phương án copy | **B — copy offline** (chi tiết mục 5) |
+| Phương án copy | **B — copy offline**, nguồn chỉ ĐỌC (mục 5) |
+| **Kiến trúc đích** | ✅ **SINGLE-NODE** — Kiên chốt 26/08. Bỏ MinIO tạm + `mc mirror`. **Chi tiết & luồng chốt: mục 5d** |
+| Issue #4 (cluster hoá) | ⏸️ **Tách ra làm sau**, không gộp vào lần migrate này |
+| Cứu RAGFlow sống lại | ❌ **Không làm** — Kiên chốt *"kệ nó, đã chết từ lâu"* |
 
 ### Hệ quả kiến trúc bắt buộc chấp nhận
 
@@ -327,9 +330,14 @@ và `pv-ragflow-redis` — cùng cơ chế `nodeAffinity: ragflow-target`.)*
 
 ---
 
-## 5. ⭐ Phương án copy — đã chốt B
+## 5. Phương án copy — bàn A vs B *(⚠️ ĐÃ LỖI THỜI — xem 5d)*
 
-### Điểm chặn kỹ thuật lớn nhất
+> ⚠️ **ĐỌC 5d TRƯỚC.** Mục này ghi lại quá trình cân nhắc A vs B khi còn **giả định
+> kiến trúc đích là Tenant erasure-coded**. Kiên đã chốt **single-node** (5d)
+> ⟹ **không còn MinIO tạm, không còn `mc mirror`**. Giữ lại để tra cứu lý do,
+> **đừng làm theo các bước trong mục này**.
+
+### Điểm chặn kỹ thuật lớn nhất *(chỉ đúng khi đích là Tenant)*
 
 **Single-node MinIO và Tenant erasure-coded có layout đĩa KHÁC NHAU HOÀN TOÀN.**
 Không thể `rsync` thư mục `/data/ragflow/minio` sang PV của Tenant rồi mong nó đọc được —
@@ -631,6 +639,356 @@ nhưng giờ chết vì **không kéo được image** từ registry vRP.
 
 ---
 
+## 5c. 🔴 KHẢO SÁT ĐỢT 3 — KẾT QUẢ LẬT NGƯỢC CHẨN ĐOÁN (26/08)
+
+### 5c.1 🔴 Phát hiện 7 — taint ĐÃ HẠ, sự cố KHÔNG CÒN là inode
+
+```
+$ kubectl get node vrp-kubeengine07 -o jsonpath='{.spec.taints}'
+(in ra RỖNG — không còn taint nào)
+```
+
+```
+NAME                       READY  STATUS            RESTARTS     AGE    IP             NODE
+ragflow-67fcdbbdb7-cpdbs   0/1    Running           0            27h    172.16.78.64   vrp-kubeengine05
+ragflow-67fcdbbdb7-ns8pd   0/1    Running           0            27h    172.16.83.83   vrp-kubeengine06
+ragflow-67fcdbbdb7-pl8hd   0/1    Running           48 (4m27s)   27h    172.16.83.72   vrp-kubeengine06
+ragflow-minio-0            0/1    ImagePullBackOff  0            3h59m  172.16.93.112  vrp-kubeengine07
+ragflow-mysql-0            1/1    Running           0            12d    172.16.83.7    vrp-kubeengine06
+ragflow-redis-0            0/1    ImagePullBackOff  0            3h59m  172.16.93.108  vrp-kubeengine07
+```
+
+`describe pod` xác nhận: `PodScheduled: True`, pod **đã được gán vrp-kubeengine07**, đã có IP.
+
+⟹ **Scheduling KHÔNG còn là vấn đề.** Chuỗi nhân quả cũ
+(inode → taint → Pending → RAGFlow chết) **đã đứt ở mắt xích thứ 3**.
+
+### 5c.2 🔴 Phát hiện 8 — lỗi THẬT là kéo image từ Docker Hub Internet
+
+Events nguyên văn từ `describe pod ragflow-minio-0`:
+
+```
+Normal   BackOff  6m58s (x910 over 3h51m)  kubelet
+  Back-off pulling image "minio/minio:RELEASE.2025-06-13T11-33-47Z"
+
+Warning  Failed   118s (x58 over 3h32m)    kubelet
+  Failed to pull image "minio/minio:RELEASE.2025-06-13T11-33-47Z":
+  rpc error: code = Unknown desc = failed to pull and unpack image
+  "docker.io/minio/minio:RELEASE.2025-06-13T11-33-47Z":
+  failed to resolve reference "docker.io/minio/minio:RELEASE.2025-06-13T11-33-47Z":
+  failed to do request:
+  Head "https://registry-1.docker.io/v2/minio/minio/manifests/RELEASE.2025-06-13T11-33-47Z":
+  dial tcp: lookup registry-1.docker.io on 10.30.3.39:53:
+  read udp 10.208.137.54:39761->10.30.3.39:53: i/o timeout
+```
+
+Đã thử **910 lần** trong 3h51m.
+
+**Root cause — độ chắc chắn: RẤT CAO** (log nguyên văn, không suy diễn):
+
+```
+StatefulSet ghi image: "minio/minio:RELEASE.2025-06-13T11-33-47Z"
+                        └─ KHÔNG CÓ PREFIX REGISTRY
+        ↓
+containerd mặc định điền "docker.io/" vào đầu
+        ↓
+cụm AIRGAP → DNS 10.30.3.39 không hồi đáp → i/o timeout
+        ↓
+ImagePullBackOff vĩnh viễn
+```
+
+⭐ **Phân biệt `i/o timeout` với `no such host`**:
+- `i/o timeout` = gói DNS gửi đi **không có hồi đáp** ⟹ firewall **DROP im lặng**
+- `no such host` = DNS **trả lời** "không tồn tại" ⟹ sai tên miền
+
+Ở đây là **timeout** ⟹ bị chặn, không phải gõ sai. Đọc nhầm 2 cái này là đi sai hướng.
+
+### 5c.3 ⭐ Vì sao taint hạ mà inode KHÔNG hề giảm
+
+`df` mới nhất trên vrp-07:
+
+```
+$ df -i /
+/dev/vda1  Inodes 6553600  IUsed 6221631  IFree 331969  IUse% 95%
+
+$ df -h /
+/dev/vda1  Size 99G  Used 61G  Avail 34G  Use% 65%
+```
+
+| Thời điểm | IUsed | IFree | IUse% |
+|---|---|---|---|
+| 26/08 sáng (tracking cũ) | 6.221.566 | 332.034 | 95% |
+| 26/08 chiều (đợt 3) | 6.221.631 | 331.969 | 95% |
+
+⟹ **Inode gần như KHÔNG đổi** (chênh 65 inode). Vậy tại sao taint hạ?
+
+**Giải thích**: ngưỡng mặc định của kubelet là `nodefs.inodesFree < 5%`.
+Node đang ở **331.969 / 6.553.600 = 5,06% free** — **dao động NGAY SÁT MÉP ngưỡng**.
+
+⚠️ ⟹ Taint đang **bật/tắt quanh lằn ranh**. Đây **KHÔNG PHẢI đã khỏi** —
+chỉ cần MinIO ghi thêm vài nghìn object là taint bật lại. Trạng thái này **nguy hiểm hơn**
+bị taint cố định, vì nó tạo cảm giác an toàn giả.
+
+❓ *Cần xác minh*: ngưỡng `evictionHard` thực tế trên cụm này có đúng mặc định 5% không
+(`ps -ef | grep kubelet` hoặc đọc `/var/lib/kubelet/config.yaml`).
+
+### 5c.4 ⭐⭐ HỆ QUẢ: có còn cần migrate không?
+
+**Sự cố ĐANG diễn ra fix được trong ~10 phút, KHÔNG cần migrate gì:**
+
+```
+1. ctr -n k8s.io images import /tmp/ragflow-images.tar   (trên vrp-07)
+2. Sửa image reference trong values/sts → registry nội bộ 10.60.170.184:8083
+3. Pod chạy → RAGFlow sống lại
+```
+
+**Nhưng nguyên nhân gốc còn nguyên**: inode 95%, free 331.969, node dao động sát ngưỡng,
+và RAGFlow vẫn đang ghi object mới.
+
+⟹ **Migrate vẫn CẦN**, nhưng đổi tính chất:
+- Trước: việc **cứu hoả**, làm gấp trong lúc dịch vụ đang chết
+- Giờ: việc **xử lý nợ kỹ thuật**, làm có kế hoạch, có downtime chủ động
+
+### ✅ QUYẾT ĐỊNH — Kiên chốt 26/08
+
+> **"vẫn migrate chứ"** + **"ko cần ragflow sống lại, kệ nó, vì nó đã chết từ lâu rồi,
+> tập trung hoàn thành chỗ migrate minIO này trước"**
+
+| Việc | Quyết định |
+|---|---|
+| Cứu RAGFlow sống lại ngay | ❌ **BỎ** — đã chết lâu, không phải việc gấp |
+| Migrate MinIO sang vMLP | ✅ **LÀM, ưu tiên số 1** |
+
+### ⭐ Điều này ĐƠN GIẢN HOÁ bài toán rất nhiều
+
+| Ràng buộc trước đây | Giờ |
+|---|---|
+| Phải tính downtime, xin cửa sổ bảo trì | ✅ **Bỏ** — dịch vụ đã down sẵn |
+| Lo MinIO ghi thêm object khi đang copy | ✅ **Bỏ** — MinIO không chạy, dữ liệu **ĐỨNG YÊN** |
+| Lo inode vrp-07 tụt tiếp trong lúc làm | ✅ **Bỏ** — không có gì ghi vào |
+| R5 (RAGFlow vẫn đang ghi) | ✅ **ĐÓNG** |
+| R6 (`mc mirror` bucket lớn không checkpoint) | 🟢 hạ mức — không có sức ép thời gian |
+
+⭐ **Dữ liệu nguồn ở trạng thái ĐỨNG YÊN là điều kiện lý tưởng để copy** —
+không cần lo tính nhất quán, không cần quiesce, copy xong là chắc chắn đủ.
+
+---
+
+## 5d. ✅ CHỐT KIẾN TRÚC ĐÍCH: **SINGLE-NODE** (Kiên chốt 26/08)
+
+### Bối cảnh câu hỏi
+
+Kiên hỏi lại: *"ủa mà bạn đang bảo dựng tạm là dựng cái gì thế? tưởng chỉ cần migrate
+data của minIO từ node 07 sang, rồi tạo các PV PVC, rồi migrate cả workload dành cho
+minIO nữa, rồi check kết nối giữa các thành phần với minIO xem ok chưa"*
+
+⭐ **Câu hỏi đúng chỗ.** Tôi đã **lẳng lặng nhét thêm một quyết định Kiên chưa hề chốt**:
+mặc định MinIO đích sẽ là **Tenant erasure-coded** (vì vMLP có sẵn Operator).
+**Chính giả định đó — chứ không phải bản thân việc migrate — mới đẻ ra "MinIO tạm".**
+
+### Vì sao Tenant thì cần MinIO tạm, single-node thì không
+
+| Hướng | Layout đĩa | Copy được bằng | MinIO tạm? |
+|---|---|---|---|
+| single-node → **single-node** | **Y HỆT** | `rsync` thư mục thô, trỏ PV vào là đọc thẳng | ❌ **KHÔNG cần** |
+| single-node → **Tenant EC** | **KHÁC HẲN** (object chẻ thành shard rải nhiều drive + `xl.meta` riêng) | bắt buộc qua **tầng S3** (`mc mirror`) | ✅ Cần — để parse layout cũ |
+
+⟹ **"MinIO tạm" KHÔNG phải yêu cầu bắt buộc của việc migrate.**
+Nó là **cái giá của việc đổi kiến trúc sang Tenant**. Bỏ Tenant ⟹ cái giá đó biến mất.
+
+### Trade-off đã trình bày để Kiên chọn
+
+| | **1. Single-node** ✅ chọn | 2. Tenant EC |
+|---|---|---|
+| Các bước | rsync → PV/PVC → deploy STS → check | rsync → MinIO tạm → mc mirror → Tenant → check |
+| Độ phức tạp | **Thấp** — bê nguyên config vRP sang | Cao — viết Tenant mới, học Operator v5.0.6 |
+| Rủi ro hỏng | **Thấp** — layout không đổi | Trung bình — nhiều bước mới, chưa từng làm |
+| Inode | vẫn dồn 5,66M vào 1 node | chia 4 node (~1,4M/node) — **chỉ nếu** cấu hình đúng |
+| Giải quyết gốc? | ❌ mua thêm thời gian | ✅ nếu trải được qua nhiều node |
+| Issue #4 của sếp | ❌ chưa | ✅ xong luôn |
+
+⭐ **Điểm quyết định**: node đích **vmlp-09 có 12,65M inode free**, còn vrp-07
+chỉ có **6,55M inode TỔNG**. ⟹ Ngay cả single-node cũng cho **gấp đôi quỹ inode**
+so với hiện tại — **không phải "y như cũ"**.
+
+⭐ Và **R15 làm lựa chọn 2 kém hấp dẫn hơn tưởng**: Tenant mẫu trên vMLP pin cả pool
+vào 1 node, muốn chia thật phải làm **khác mẫu** trên Operator đời **2023**
+⟹ rủi ro cao hơn, mà **lợi ích không còn tự động có**.
+
+### ✅ Quyết định
+
+**Single-node.** Issue #4 (cluster hoá) tách thành **việc riêng làm sau** — khi đó
+dữ liệu đã nằm sẵn trên vMLP, việc dựng MinIO tạm + `mc mirror` sang Tenant
+diễn ra **trong nội bộ một cụm**, dễ và an toàn hơn nhiều so với làm ngay bây giờ.
+
+### 📐 Luồng migrate CHỐT
+
+```
+[1] rsync 37G     vrp-07:/data/ragflow/minio  ──>  vmlp-09:/home/app/app_data/ragflow/minio
+                     (đứng yên, chỉ ĐỌC)
+[2] tạo PV (hostPath + nodeAffinity vmlp-09) + PVC        trên vMLP, ns ragflow
+[3] import image từ tar + deploy StatefulSet MinIO        image 2025-06
+[4] tạo Service NodePort                                  vì cross-cluster
+[5] sửa MINIO_HOST + MINIO_PORT trong ragflow-env-config   trên vRP
+[6] check kết nối + đối chiếu số object / dung lượng
+[7] dọn: xoá /data/ragflow/minio trên vrp-07 → thu hồi 5,66M inode
+```
+
+⚠️ **Bước [3] BẮT BUỘC dùng image `RELEASE.2025-06-13T11-33-47Z`** từ
+`/tmp/ragflow-images.tar` — **KHÔNG** dùng image 2023-06 sẵn có trên vMLP,
+vì bản cũ không đọc được backend do bản mới ghi (5b.3).
+
+⚠️ Phải khai **đủ FQDN registry** hoặc import sẵn vào containerd + `IfNotPresent` —
+đừng lặp lại đúng lỗi thiếu prefix đã làm chết pod nguồn (5c.2).
+
+⚠️ **Không còn bản copy trung gian** ⟹ **R8 đóng**. Bản rsync sang chính là bản dùng thật.
+
+⭐ **Bài học**: nếu không chạy `describe pod` mà lao vào migrate ngay,
+ta đã **migrate 37G để chữa một bệnh đã tự khỏi**, trong khi bệnh thật
+(image reference thiếu registry prefix) vẫn còn nguyên và sẽ tái phát ở cụm mới.
+
+### 5c.5 File tar image
+
+```
+$ ls -lh /tmp/ragflow-images.tar
+-rw-r--r-- 1 root root 838M Aug 14 09:08 /tmp/ragflow-images.tar
+```
+
+**838 MB**, tạo 14/08. scp sang vMLP trong mạng nội bộ (~0,3–1ms RTT) ⟹ rất nhanh.
+
+### 5c.6 ⭐ Tenant mẫu `viettel-telecom` — BẢN MẪU để viết Tenant ragflow
+
+```yaml
+apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: viettel-telecom
+  namespace: viettel-telecom
+  labels: { app: minio, app.kubernetes.io/managed-by: Helm }
+  annotations:
+    meta.helm.sh/release-name: minio          # ⟹ quản lý bằng Helm
+    meta.helm.sh/release-namespace: viettel-telecom
+  creationTimestamp: "2024-01-11T11:11:23Z"
+spec:
+  buckets:                                     # ⭐ Tenant TỰ TẠO bucket
+  - { name: mlflow, objectLock: false }
+  - { name: vmlp,   objectLock: false }
+  configuration: { name: myminio-env-configuration }   # ⟸ Secret chứa credential
+  features: { bucketDNS: false, enableSFTP: false }
+  image: 10.208.137.65:8890/vmlp/minio/minio:RELEASE.2023-06-23T20-26-00Z
+  imagePullPolicy: IfNotPresent
+  imagePullSecret: { name: harbor-secret }     # ⚠️ CẦN secret này trong ns
+  mountPath: /export                           # ⚠️ KHÔNG phải /data
+  subPath: /data
+  podManagementPolicy: Parallel
+  pools:
+  - name: viettel-telecom-pool-0
+    servers: 4
+    volumesPerServer: 4
+    nodeSelector:
+      kubernetes.io/hostname: vmlp-kubeengine08     # ⚠️⚠️ XEM 5c.7
+    containerSecurityContext: { runAsUser: 0, runAsGroup: 0, runAsNonRoot: false }
+    securityContext:
+      { fsGroup: 0, fsGroupChangePolicy: OnRootMismatch,
+        runAsUser: 0, runAsGroup: 0, runAsNonRoot: false }
+    volumeClaimTemplate:
+      metadata: { name: data }
+      spec:
+        accessModes: [ ReadWriteOnce ]
+        resources: { requests: { storage: 20Gi } }
+        storageClassName: host-storage
+  prometheusOperator: false
+  requestAutoCert: false
+status:
+  currentState: Initialized
+  healthStatus: green
+  availableReplicas: 4
+  drivesOnline: 16
+  writeQuorum: 12
+  usage: { rawCapacity: 343597383680, rawUsage: 2133630582784 }
+  pools: [ { ssName: viettel-telecom-viettel-telecom-pool-0, state: PoolInitialized } ]
+  provisionedBuckets: true
+```
+
+Operator: `10.208.137.65:8890/vmlp/minio/operator:v5.0.6`
+
+**Ghi chú đọc từ mẫu:**
+- `mountPath: /export` + `subPath: /data` — **khác** vRP (`/data`). Phải theo mẫu vMLP.
+- `imagePullSecret: harbor-secret` — Tenant ragflow cũng cần secret này (hoặc import image sẵn).
+- `configuration: myminio-env-configuration` — credential nằm trong Secret riêng,
+  **không** nhét thẳng vào Tenant. Đây là chỗ đặt user/password cho Tenant ragflow.
+- `buckets:` — khai báo sẵn ⟹ có thể **khai luôn bucket của RAGFlow** để Operator tự tạo.
+
+### 5c.7 🔴🔴 SỬA TIẾP KẾT LUẬN — Tenant mẫu pin CẢ POOL vào MỘT NODE
+
+```yaml
+pools:
+- servers: 4
+  volumesPerServer: 4
+  nodeSelector: { kubernetes.io/hostname: vmlp-kubeengine08 }   # ← MỘT node duy nhất
+```
+
+`status: drivesOnline: 16, writeQuorum: 12` nghe rất khoẻ, **nhưng**:
+
+**16 "drive" đó = 4 server × 4 volume, TẤT CẢ nằm trên `vmlp-kubeengine08`,
+tất cả trên cùng `/dev/vda1`.**
+
+| Chống được | Không chống được |
+|---|---|
+| Hỏng file lẻ / bit rot | ⛔ **Mất node vmlp-08 ⟹ MẤT SẠCH** |
+| | ⛔ Hỏng ổ `/dev/vda1` ⟹ mất sạch |
+| | ⛔ **Cạn inode của vmlp-08** ⟹ chết y hệt vrp-07 |
+
+### ⚠️ Điều này làm SẬP lập luận của tôi ở đợt 1 và 2
+
+Tôi đã ghi 2 lần: *"dùng Tenant ⟹ chia inode ra 4 node, mỗi node ~1,4M inode"*.
+**SAI.** Nếu bắt chước y hệt mẫu (`nodeSelector` 1 hostname), **cả 5,66M inode dồn
+vào MỘT node** — đúng vết xe đổ vrp-07, chỉ đổi tên node.
+
+⟹ **Tenant ragflow BẮT BUỘC phải làm KHÁC mẫu**: bỏ `nodeSelector` cố định 1 hostname,
+thay bằng cơ chế trải pod qua nhiều node (`podAntiAffinity` theo hostname,
+hoặc `nodeSelector` rộng + `topologySpreadConstraints`).
+Và PV phải tạo với `nodeAffinity` trỏ **4 node khác nhau**.
+
+⚠️ Cần kiểm: Operator **v5.0.6 (2023)** có hỗ trợ `topologySpreadConstraints` trong pool không.
+
+### 5c.8 Dung lượng `/home` trên node ứng viên
+
+```
+[vt_admin@vmlp-kubeengine07 ~]$ du -sh /home/app/app_data 2>/dev/null
+(RỖNG — thư mục chưa tồn tại)
+[vt_admin@vmlp-kubeengine07 ~]$ df -h /home
+/dev/vda1  197G  97G used  92G avail  52%  /
+
+[vt_admin@vmlp-kubeengine09 ~]$ du -sh /home/app/app_data 2>/dev/null
+(RỖNG — thư mục chưa tồn tại)
+[vt_admin@vmlp-kubeengine09 ~]$ df -h /home
+/dev/vda1  197G  50G used  139G avail  27%  /
+```
+
+✅ Xác nhận **`/home` KHÔNG phải mount riêng** — nằm trên `/dev/vda1`, đúng như `lsblk` đợt 1.
+✅ Cả vmlp-07 và vmlp-09 **chưa có `/home/app/app_data`** ⟹ chưa gánh dữ liệu MinIO nào.
+
+| Node | Avail | IFree (đợt 1) | Đủ cho 37G + 5,7M inode? |
+|---|---|---|---|
+| vmlp-07 (.41) | 92G | 11.701.245 | ✅ |
+| vmlp-09 (.43) | **139G** | **12.651.792** | ✅ **thoáng nhất** |
+
+### 5c.9 Ghi chú — `rawUsage` của Tenant mẫu là số VÔ LÝ
+
+```
+rawCapacity: 343597383680    =  320 GiB
+rawUsage:   2133630582784    = 1,94 TiB   ← LỚN HƠN capacity gấp 6 lần
+```
+
+Usage > capacity là **bất thường**. ❓ Giả thuyết (**chưa xác minh**): Operator v5.0.6
+báo `rawUsage` là dung lượng **toàn ổ `/dev/vda1`** của cả 4 pod cộng lại,
+không phải phần MinIO dùng.
+
+⟹ **Đừng tin cột `rawUsage`** khi đánh giá dung lượng. Dùng `du` trên node thay thế.
+
+---
+
 ## 6. Trạng thái khảo sát — còn thiếu gì
 
 ### ✅ Đã có
@@ -902,36 +1260,88 @@ df -h /home
 | # | Rủi ro | Mức | Ghi chú |
 |---|---|---|---|
 | R1 | ~~Firewall chặn giữa 2 cụm~~ | ✅ **ĐÓNG** | Đo 26/08: ping OK 2 chiều + curl bắt tay HTTP thành công. Xem 5b.1 |
-| R2 | vMLP dùng **cùng mật độ inode** với vRP | 🟠 | Bê nguyên single-node sang ⟹ 5,66M inode = 43% quỹ 1 node ⟹ lặp lại sự cố. **Bắt buộc dùng Tenant chia qua 4 SERVER** (~1,4M inode/node). ⚠️ Đã sửa lý do ở 5b.2: chia được **4 lần, không phải 16** |
+| R2 | vMLP cùng **mật độ** inode với vRP, single-node vẫn dồn 5,66M vào 1 node | 🟠 **CHẤP NHẬN CÓ Ý THỨC** | Kiên chốt single-node (5d) ⟹ **không chia inode**. Nhưng vmlp-09 có **12,65M inode free** vs vrp-07 chỉ **6,55M TỔNG** ⟹ **gấp đôi quỹ**, mua đủ thời gian. Xử lý gốc = Issue #4, làm riêng sau |
 | R3 | Không có ổ rời ⟹ MinIO dùng chung `/dev/vda1` với OS | 🟠 | Cạn inode sẽ kéo sập cả node, không chỉ MinIO. **Cần alert `df -i`** |
 | R4 | Cross-cluster: MinIO thành external dependency | 🟠 | RAGFlow probe deep-check ⟹ mạng chập là pod 0/1 ngay |
-| R5 | vrp-07 vẫn còn 0,33M inode và **RAGFlow vẫn đang ghi** | 🔴 CAO | Cân nhắc **tạm dừng upload tài liệu mới** trong lúc migrate |
-| R6 | Bucket 37G nằm trong **1 bucket duy nhất** | 🟡 | `mc mirror` 1 bucket lớn — không có checkpoint tự nhiên, cần theo dõi tiến độ |
+| ~~R5~~ | ~~RAGFlow vẫn đang ghi thêm object~~ | ✅ **ĐÓNG** | Kiên chốt **kệ RAGFlow, không cứu** ⟹ MinIO không chạy ⟹ **dữ liệu ĐỨNG YÊN**, không ghi thêm. Điều kiện lý tưởng để copy |
+| R6 | Bucket 37G nằm trong **1 bucket duy nhất** | 🟢 **HẠ MỨC** | Không còn sức ép thời gian (dịch vụ đã down sẵn) ⟹ `mc mirror` chạy bao lâu cũng được |
 | R7 | vMLP cũng dính `ImagePullBackOff` ⟹ airgap | 🟡 **HẠ MỨC** | Đã có đường vòng: import tar bằng `ctr -n k8s.io` trên từng node, không phụ thuộc registry. Gộp theo dõi cùng **R10** |
-| R8 | Bản copy trung gian 37G trên node trung chuyển | 🟡 | Phải **xoá sau khi verify**, nếu không thành dữ liệu mồ côi ăn inode |
+| ~~R8~~ | ~~Bản copy trung gian 37G~~ | ✅ **ĐÓNG** | Single-node ⟹ **không có bản trung gian**. Bản rsync sang **chính là bản dùng thật**. Xem 5d |
 | ~~R9~~ | ~~Image MinIO vMLP cũ hơn vRP 2 năm~~ | ✅ **ĐÓNG** | ✅ `/tmp/ragflow-images.tar` trên vrp-07 chứa **đúng 100% image + tag** cần dùng ⟹ import bằng `ctr -n k8s.io`, **không cần đụng registry**. Vẫn phải nhớ: **không được dùng image 2023-06 sẵn có trên vMLP**. Xem 5b.3 + 5b.3b |
 | **R10** | Registry vMLP đang lỗi kéo image | 🟠 | `minio-operator-...-zsqpz` **ImagePullBackOff 11 ngày** ⟹ Operator mất HA. Phải sửa **trước khi** apply Tenant. Xem 5b.5 |
 | ~~R11~~ | ~~Credential lộ qua screenshot~~ | ⚪ **ĐÓNG** | **Kiên đánh giá không thành vấn đề** (VDI nội bộ). Vẫn giữ nguyên tắc không ghi secret vào repo. Xem 5b.7 |
 | **R12** | 4 "disk" mỗi server là **4 thư mục cùng 1 ổ** | 🟠 | EC chỉ chịu lỗi **node**, **không** chịu lỗi ổ đĩa. Đừng nhầm "16 disk nên rất an toàn". Xem 5b.2 |
-| **R13** | `ragflow-minio-0` đã đổi từ `Pending` → `ImagePullBackOff` | 🟠 | Trục sự cố **dịch từ inode sang registry**. Cần `describe pod` để biết node + lỗi pull. Xem 5b.8 |
+| ~~R13~~ | ~~`ragflow-minio-0` đổi `Pending` → `ImagePullBackOff`~~ | ✅ **LÀM RÕ** | Nguyên nhân: image thiếu prefix registry ⟹ containerd đi `docker.io` ⟹ DNS timeout (airgap). Xem 5c.2 |
+| **R14** | 🔴 **Taint vrp-07 dao động SÁT MÉP ngưỡng** | 🔴 **CAO** | IFree 331.969 = **5,06%**, ngưỡng kubelet **5%**. Taint bật/tắt quanh lằn ranh ⟹ **cảm giác an toàn giả**. Chỉ cần ghi thêm vài nghìn object là bật lại. Xem 5c.3 |
+| ~~R15~~ | ~~Tenant mẫu pin cả pool vào 1 node~~ | ⏸️ **HOÃN** | Không còn áp dụng cho lần migrate này (chốt single-node). **Giữ lại nguyên vẹn** — sẽ là rủi ro số 1 khi làm Issue #4 sau này. Xem 5c.7 |
+| ~~R16~~ | ~~Operator v5.0.6 có hỗ trợ tính năng cần không~~ | ⏸️ **HOÃN** | Cùng lý do R15 — chỉ liên quan khi chuyển sang Tenant |
+| **R17** | Image reference thiếu prefix registry | 🟠 | Lỗi này **sẽ tái phát ở cụm mới** nếu bê nguyên values sang. Phải sửa thành FQDN registry ở cả 2 nơi |
+| **R18** | `mountPath` vMLP là `/export`, vRP là `/data` | 🟡 | Khác biệt layout — không được bê nguyên config vRP sang Tenant vMLP |
 
 ---
 
 ## 9. Việc tiếp theo
 
 - [x] ~~Kiên chạy đợt khảo sát 2~~ ✅ **XONG 26/08** — kết quả ở mục 5b
-- [ ] **Kiên chạy đợt khảo sát 3** (mục 7b) — ưu tiên **7b.1 kiểm taint node 07**
-- [ ] ⭐ **Xem lại lựa chọn A vs B** nếu taint vrp-07 đã hạ (xem 7b.1)
-- [ ] Chốt node trung chuyển cho `rsync` (ứng viên: **vmlp-09** `.43`)
-- [ ] Chốt 4 node đặt Tenant `ragflow` (tránh vmlp-06/10 vì CPU cao, tránh vmlp-04 vì cordon)
-- [ ] Thiết kế Tenant: số pool, số disk, dung lượng mỗi PV, đường dẫn hostPath
-- [x] ~~Xác nhận image MinIO có sẵn~~ ✅ có `/tmp/ragflow-images.tar` trên vrp-07
-- [ ] scp tar sang node vMLP + `ctr -n k8s.io images import` trên **từng node** đích
-- [ ] Kiểm Operator v5.0.6 có hỗ trợ image MinIO 2025-06 không
-- [ ] Lên kịch bản downtime + rollback
-- [ ] Kế hoạch verify sau migrate (đối chiếu số object, checksum, test kết nối RAGFlow→MinIO)
-- [ ] Sau khi verify xong: xoá `/data/ragflow/minio` trên vrp-07, **thu hồi 5,66M inode**
-- [ ] Xoá bản copy trung gian trên node trung chuyển
+- [x] ~~Kiên chạy đợt khảo sát 3~~ ✅ **XONG 26/08** — kết quả ở mục 5c
+- [x] ~~Xem lại lựa chọn A vs B~~ ✅ **Giữ B** — nhưng đổi chỗ dựng MinIO tạm sang vMLP (xem 5c.4)
+- [x] ~~Xác nhận image MinIO có sẵn~~ ✅ `/tmp/ragflow-images.tar` 838M trên vrp-07
+- [x] ~~Lên kịch bản downtime~~ ✅ **KHÔNG CẦN** — dịch vụ đã down sẵn, Kiên chốt kệ RAGFlow
+
+> Luồng theo kiến trúc **single-node** đã chốt ở **5d**.
+
+### Bước 1 — chốt node đích + chuẩn bị (chưa động vào dữ liệu)
+
+- [ ] Chốt node đích: ứng viên **vmlp-09** (`.43`) — 139G trống, inode **4%** (thoáng nhất)
+- [ ] Chốt đường dẫn hostPath trên node đích
+      → đề xuất `/home/app/app_data/ragflow/minio` (theo quy ước vMLP ở 5b.2)
+- [ ] Tạo namespace `ragflow` trên vMLP
+- [ ] scp `/tmp/ragflow-images.tar` (838M) từ vrp-07 → node đích
+- [ ] `ctr -n k8s.io images import` trên node đích — ⚠️ **nhớ `-n k8s.io`**, không thì kubelet không thấy
+- [ ] Xác minh image đã vào đúng namespace: `ctr -n k8s.io images ls | grep minio`
+
+### Bước 2 — copy dữ liệu (37G, nguồn ĐỨNG YÊN)
+
+- [ ] `rsync` từ vrp-07 (**chỉ ĐỌC**, không xoá gì bên nguồn) → node đích
+- [ ] ⚠️ Dùng cờ giữ nguyên quyền/owner/timestamp — MinIO nhạy với metadata
+- [ ] Đối chiếu **số inode** và **dung lượng** 2 bên sau khi copy xong
+
+### Bước 3 — dựng workload MinIO trên vMLP
+
+- [ ] Tạo PV: hostPath + `nodeAffinity` trỏ node đích + `Retain`
+- [ ] Tạo PVC bind vào PV đó
+- [ ] Tạo Secret credential cho MinIO (đặt giá trị riêng, không bê nguyên từ vRP — 5b.7)
+- [ ] Deploy StatefulSet MinIO — ⚠️ image **2025-06**, `imagePullPolicy: IfNotPresent`
+- [ ] ⚠️ Image reference phải ghi **đủ FQDN** hoặc dùng image đã import (R17)
+- [ ] Tạo Service **NodePort** (bắt buộc, vì cross-cluster — ClusterIP không dùng được)
+
+### Bước 4 — đấu nối lại với RAGFlow ở vRP
+
+- [ ] Sửa `MINIO_HOST` + `MINIO_PORT` trong `ragflow-env-config` → `IP-node-vMLP:NodePort`
+- [ ] Sửa credential trong secret nếu đặt giá trị mới ở bước 3
+- [ ] ⚠️ Sửa luôn **image reference thiếu prefix registry** của các pod vRP (R17)
+      — nếu không, RAGFlow/Redis vẫn `ImagePullBackOff` dù MinIO đã ok
+
+### Bước 5 — verify (⭐ phần Kiên yêu cầu: không mất dữ liệu + kết nối thông)
+
+- [ ] Đối chiếu **số object** nguồn ↔ đích
+- [ ] Đối chiếu **tổng dung lượng** (kỳ vọng 37G) + **số inode**
+- [ ] Spot-check **checksum** vài file ngẫu nhiên trong bucket lớn
+      `73932b965e5e11f192725fd51894c519`
+- [ ] Test S3 API từ vRP sang MinIO mới (health + list bucket + get 1 object)
+- [ ] Kiểm RAGFlow đọc/ghi được file thật (upload thử 1 tài liệu)
+
+### Bước 6 — dọn (chỉ làm SAU khi verify xong)
+
+- [ ] Xoá `/data/ragflow/minio` trên vrp-07 → **thu hồi 5,66M inode**
+- [ ] Xác nhận `df -i` vrp-07 tụt từ 95% xuống mức an toàn
+- [ ] Đặt alert `df -i` trên Prometheus (nợ kỹ thuật từ tracking gốc)
+
+### Việc tách ra làm SAU (không thuộc phiên này)
+
+- [ ] **Issue #4 — chuyển sang Tenant erasure-coded** (cluster hoá theo chỉ đạo sếp).
+      Khi đó dữ liệu đã ở vMLP ⟹ dựng MinIO tạm + `mc mirror` **trong nội bộ 1 cụm**,
+      dễ và an toàn hơn làm ngay bây giờ. Rủi ro cần giải khi đó: **R15**, **R16**
 
 ---
 
@@ -953,3 +1363,12 @@ df -h /home
 | 26/08 | Kiên báo có sẵn tar image | ✅ **R9 ĐÓNG** — `/tmp/ragflow-images.tar` trên vrp-07, đúng 100% image + tag |
 | 26/08 | Kiên đánh giá vụ lộ credential | Không thành vấn đề ⟹ **R11 đóng**, bỏ rotate khỏi kế hoạch |
 | 26/08 | Phát hiện trạng thái pod đổi | `ragflow-minio-0`: `Pending` → **`ImagePullBackOff`** ⟹ **R13**, có thể taint đã hạ |
+| 26/08 | Khảo sát đợt 3 — taint | 🔴 **Taint ĐÃ HẠ**, pod đã gán vrp-07. Chuỗi nhân quả cũ đứt |
+| 26/08 | Khảo sát đợt 3 — describe pod | 🔴 **Lỗi thật**: image thiếu prefix registry → `docker.io` → DNS timeout (910 lần thử) |
+| 26/08 | Đo lại inode vrp-07 | 6.221.631 / IFree **331.969** / **95%** — không đổi. **R14**: dao động sát mép ngưỡng 5% |
+| 26/08 | Đọc Tenant mẫu | 🔴 **R15**: mẫu pin **cả pool vào 1 node** ⟹ Tenant ragflow phải làm KHÁC mẫu |
+| 26/08 | ⭐ Sửa kết luận sai lần 2 | Lập luận "Tenant chia inode ra 4 node" **SAI** nếu bắt chước mẫu |
+| 26/08 | Kiên chốt | ✅ **VẪN MIGRATE** |
+| 26/08 | Kiên chốt | ✅ **KỆ RAGFlow, không cứu** ⟹ dữ liệu đứng yên, **R5 đóng**, bỏ bài toán downtime |
+| 26/08 | Kiên hỏi lại *"dựng tạm là dựng cái gì?"* | ⭐ Lộ ra tôi **tự nhét giả định Tenant** mà Kiên chưa chốt |
+| 26/08 | Kiên chốt kiến trúc | ✅ **SINGLE-NODE** ⟹ **bỏ MinIO tạm + `mc mirror`**, **R8/R15/R16 đóng/hoãn** |
