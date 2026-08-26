@@ -32,6 +32,8 @@ Kiên **ssh trực tiếp được vào từng node của cả 2 cụm**.
 | **Kiến trúc đích** | ✅ **SINGLE-NODE** — Kiên chốt 26/08. Bỏ MinIO tạm + `mc mirror`. **Chi tiết & luồng chốt: mục 5d** |
 | Issue #4 (cluster hoá) | ⏸️ **Tách ra làm sau**, không gộp vào lần migrate này |
 | Cứu RAGFlow sống lại | ❌ **Không làm** — Kiên chốt *"kệ nó, đã chết từ lâu"* |
+| **Node đích** | ✅ **vmlp-kubeengine09** = `10.208.137.43` (Kiên chốt 26/08) |
+| **Path đích** | ✅ **`/home/app/app_data/ragflow/minio`** (Kiên chốt 26/08) |
 
 ### Hệ quả kiến trúc bắt buộc chấp nhận
 
@@ -1255,6 +1257,308 @@ df -h /home
 
 ---
 
+---
+
+## 7c. 🚀 LỆNH THỰC THI — BƯỚC 1 & 2 (node đích đã chốt)
+
+> ✅ **Kiên chốt 26/08**: node đích **vmlp-09** (`10.208.137.43`),
+> path **`/home/app/app_data/ragflow/minio`**
+
+### 7c.0 ⚠️ Kiểm tra TRƯỚC KHI CHẠY — 3 điều phải xác minh
+
+Chạy trên **vmlp-09** (`10.208.137.43`):
+
+```
+id app
+ls -ld /home/app/app_data
+sudo -n true 2>&1 | head -1
+rsync --version | head -1
+```
+
+<details>
+<summary>Giải nghĩa — vì sao 4 lệnh này bắt buộc chạy trước (bấm để mở)</summary>
+
+```
+id app
+│   ⟹ lấy UID/GID của user 'app'.
+│      ⭐ QUAN TRỌNG: PV mẫu của vMLP chạy securityContext runAsUser: 0 (root),
+│      nhưng path là /home/app/app_data (thư mục của user app).
+│      Cần biết UID/GID để rsync giữ đúng chủ sở hữu, nếu không MinIO
+│      có thể không ghi được vào thư mục sau khi copy xong
+│
+ls -ld /home/app/app_data
+│ ├─ -l  long: hiện quyền, owner, group
+│ └─ -d  directory: hiện THÔNG TIN CỦA CHÍNH THƯ MỤC,
+│        không liệt kê nội dung bên trong.
+│        ⚠️ Thiếu -d thì ls sẽ đổ ra toàn bộ file con — sai thứ cần xem
+│   ⟹ trả lời: thư mục đã tồn tại chưa, quyền/owner ra sao.
+│      Đợt 3 'du -sh' trả rỗng ⟹ nhiều khả năng CHƯA có, cần tạo
+│
+sudo -n true 2>&1 | head -1
+│ ├─ -n  non-interactive: KHÔNG hỏi mật khẩu, fail ngay nếu cần nhập
+│ ├─ true  lệnh rỗng luôn thành công — chỉ dùng để TEST quyền sudo
+│ └─ 2>&1 | head -1  gộp stderr rồi lấy 1 dòng, tránh rác
+│   ⟹ trả lời: user hiện tại có sudo không cần mật khẩu không.
+│      Quyết định cách chạy rsync (có sudo hay không)
+│      In ra RỖNG = có sudo NOPASSWD. Báo lỗi = cần mật khẩu / không có quyền
+│
+rsync --version | head -1
+    ⟹ xác nhận rsync ĐÃ CÀI trên node đích.
+       ⚠️ Môi trường airgap — nếu chưa có thì KHÔNG cài được qua yum,
+       phải đổi sang phương án tar over ssh (xem 7c.2b)
+```
+</details>
+
+Và trên **vrp-07** (`10.208.137.54`, user `root`):
+
+```
+rsync --version | head -1
+ls -ld /data/ragflow/minio
+```
+
+---
+
+### 7c.1 Tạo thư mục đích trên vmlp-09
+
+```
+sudo mkdir -p /home/app/app_data/ragflow/minio
+sudo chown app:app /home/app/app_data/ragflow
+ls -ld /home/app/app_data/ragflow/minio
+```
+
+<details>
+<summary>Giải nghĩa (bấm để mở)</summary>
+
+```
+sudo mkdir -p /home/app/app_data/ragflow/minio
+│ └─ -p  parents: tạo LUÔN các thư mục cha còn thiếu, và
+│        KHÔNG báo lỗi nếu thư mục đã tồn tại.
+│        ⟹ chạy lại nhiều lần vẫn an toàn (idempotent)
+│
+sudo chown app:app /home/app/app_data/ragflow
+│   ⟹ trả quyền sở hữu về user app cho khớp bố cục /home/app.
+│   ⚠️ CHỈ chown thư mục cha 'ragflow', KHÔNG chown -R xuống 'minio'.
+│      Lý do: bước rsync sau sẽ tự mang owner đúng từ nguồn sang.
+│      chown -R trước rồi rsync sau = làm 2 lần, và chown -R
+│      trên 5,66 TRIỆU file sẽ chạy rất lâu
+│
+ls -ld ...   → xác nhận đã tạo đúng, quyền đúng
+```
+
+⚠️ **Vì sao không chown -R**: thư mục sẽ chứa **5.664.048 inode**.
+Mọi lệnh đệ quy (`chown -R`, `chmod -R`, `ls -R`, `du` không `-s`) trên số lượng này
+đều chạy **rất lâu** và tạo tải I/O lớn. Nguyên tắc: tránh mọi thao tác đệ quy
+không cần thiết trên thư mục MinIO.
+</details>
+
+---
+
+### 7c.2 ⭐ rsync 37G — chặng chính
+
+Chạy trên **vrp-07** (`10.208.137.54`, user `root`):
+
+```
+rsync -aHAX --numeric-ids --info=progress2 --partial /data/ragflow/minio/ app@10.208.137.43:/home/app/app_data/ragflow/minio/
+```
+
+<details>
+<summary>⭐ Giải nghĩa TỪNG CỜ — đọc kỹ, sai một cờ là hỏng dữ liệu (bấm để mở)</summary>
+
+```
+rsync -aHAX --numeric-ids --info=progress2 --partial <nguồn>/ <đích>/
+│
+├─ -a   archive: cờ GỘP, tương đương -rlptgoD
+│       │  r = recursive     đệ quy xuống thư mục con
+│       │  l = links         giữ symlink thành symlink
+│       │  p = perms         giữ quyền (rwx)
+│       │  t = times         giữ mtime — ⭐ QUAN TRỌNG với MinIO
+│       │  g = group         giữ group
+│       │  o = owner         giữ owner (cần quyền root bên nhận)
+│       │  D = devices+specials
+│       ⟹ Đây là cờ CỐT LÕI. Thiếu -a thì mất hết metadata,
+│          MinIO có thể không nhận diện được object
+│
+├─ -H   hard-links: giữ HARDLINK.
+│       ⭐ MinIO KHÔNG dùng hardlink nhiều, nhưng bật để chắc chắn —
+│       nếu có mà không giữ thì file bị nhân bản, phình dung lượng VÀ inode
+│
+├─ -A   ACLs: giữ Access Control List (quyền mở rộng ngoài rwx)
+│
+├─ -X   xattrs: giữ extended attributes.
+│       ⭐ CÓ THỂ QUAN TRỌNG — một số bản MinIO lưu metadata ở xattr.
+│       Không giữ thì rủi ro mất thông tin object. Bật cho an toàn
+│
+├─ --numeric-ids
+│       KHÔNG dịch tên user/group sang tên chữ, giữ nguyên UID/GID dạng SỐ.
+│       ⭐ BẮT BUỘC khi copy giữa 2 máy: user 'app' trên vrp-07 có thể
+│       có UID khác 'app' trên vmlp-09. Không có cờ này, rsync dịch
+│       theo TÊN và owner bị đổi sai âm thầm
+│
+├─ --info=progress2
+│       Hiện tiến độ TỔNG THỂ (%, tốc độ, thời gian còn lại) trên MỘT dòng,
+│       thay vì in tên từng file.
+│       ⚠️ Với 5,66 TRIỆU file, chế độ mặc định sẽ in 5,66 triệu dòng —
+│       không đọc được gì và làm chậm cả quá trình
+│
+├─ --partial
+│       Giữ lại file đang copy dở nếu bị đứt.
+│       ⭐ Chạy lại lệnh sẽ tiếp tục từ chỗ dở thay vì làm lại từ đầu.
+│       Rất quan trọng với 37G / phiên ssh có thể timeout
+│
+└─ Dấu / ở CUỐI đường dẫn NGUỒN — ⭐⭐ ĐIỂM DỄ SAI NHẤT
+    /data/ragflow/minio/   (CÓ /)  ⟹ copy NỘI DUNG BÊN TRONG minio/
+    /data/ragflow/minio    (KHÔNG) ⟹ copy CẢ THƯ MỤC minio vào trong đích
+                                      ⟹ thành .../ragflow/minio/minio/  ← SAI
+    ⚠️ Cả 2 đầu nguồn và đích đều PHẢI có dấu / ở cuối như lệnh trên
+```
+
+⚠️ **Ước lượng thời gian**: 37G qua mạng nội bộ (~0,3–1ms RTT) thường nhanh,
+**nhưng 5,66 triệu file nhỏ thì nút thắt là IOPS/metadata, không phải băng thông**.
+Dự kiến **lâu hơn nhiều** so với phép chia `37G ÷ tốc độ mạng`. Chuẩn bị tinh thần
+chạy hàng giờ. ❓ *Chưa đo thực tế.*
+
+⚠️ **Nên chạy trong `screen`/`nohup`** để không mất tiến độ khi đứt ssh
+(có `--partial` thì chạy lại được, nhưng vẫn phải quét lại toàn bộ cây thư mục).
+</details>
+
+#### 7c.2b Phương án dự phòng nếu vmlp-09 KHÔNG có rsync
+
+```
+tar -cf - -C /data/ragflow/minio . | ssh app@10.208.137.43 'tar -xf - -C /home/app/app_data/ragflow/minio'
+```
+
+<details>
+<summary>Giải nghĩa (bấm để mở)</summary>
+
+```
+tar -cf - -C /data/ragflow/minio .  |  ssh <đích> 'tar -xf - -C <thư mục>'
+│
+├─ Vế TRÁI — đóng gói và đẩy ra stdout
+│  ├─ -c   create: tạo archive
+│  ├─ -f - file = '-' nghĩa là ghi ra STDOUT thay vì ra file
+│  │       ⟹ không tốn thêm 37G đĩa để chứa file tar trung gian
+│  ├─ -C /data/ragflow/minio   change directory: NHẢY VÀO thư mục đó TRƯỚC khi đóng gói
+│  └─ .    đóng gói "thư mục hiện tại" (sau khi đã -C)
+│          ⟹ đường dẫn trong archive là TƯƠNG ĐỐI, giải nén ra không bị lồng thừa
+│             (cùng tác dụng với dấu / cuối của rsync)
+│
+└─ Vế PHẢI — nhận từ stdin và giải nén
+   ├─ -x   extract
+   ├─ -f - đọc từ STDIN
+   └─ -C <thư mục>  giải nén VÀO thư mục đó
+
+⚠️ NHƯỢC ĐIỂM so với rsync:
+   - KHÔNG resume được: đứt giữa chừng phải làm LẠI TỪ ĐẦU
+   - KHÔNG có tiến độ
+   - KHÔNG so sánh được 2 bên khi chạy lại
+   ⟹ CHỈ dùng khi node đích không có rsync và không cài được (airgap)
+```
+</details>
+
+---
+
+### 7c.3 ⭐ Đối chiếu sau khi copy — TRƯỚC khi làm bước 3
+
+Trên **vrp-07** (`root`):
+```
+du -sh /data/ragflow/minio
+find /data/ragflow/minio -xdev -printf "." | wc -c
+```
+
+Trên **vmlp-09**:
+```
+du -sh /home/app/app_data/ragflow/minio
+find /home/app/app_data/ragflow/minio -xdev -printf "." | wc -c
+```
+
+<details>
+<summary>Giải nghĩa + cách đọc kết quả (bấm để mở)</summary>
+
+```
+find <path> -xdev -printf "." | wc -c
+│
+├─ -xdev    ⭐ KHÔNG vượt qua ranh giới filesystem.
+│           Bài học đã trả giá phiên trước: thiếu -xdev thì find bò sang
+│           mount point PV/NFS, số ra sai và chạy hàng chục phút
+│
+├─ -printf "."   với MỖI file tìm thấy, in ra ĐÚNG 1 dấu chấm
+│                (không in tên, không xuống dòng)
+│
+└─ wc -c    đếm số BYTE nhận được = số dấu chấm = SỐ FILE
+   │        ├─ -c  chars/bytes
+   │        ⚠️ Vì sao không dùng 'wc -l' (đếm dòng)? Vì -printf "."
+   │           không xuống dòng ⟹ toàn bộ là 1 dòng ⟹ wc -l trả về 0 hoặc 1
+   │        ⚠️ Vì sao không dùng 'find ... | wc -l'? Tên file có thể chứa
+   │           ký tự xuống dòng ⟹ đếm sai. Cách này an toàn hơn
+```
+
+**Cách đọc kết quả — kỳ vọng:**
+
+| Chỉ số | Nguồn (vrp-07) | Đích (vmlp-09) | Kết luận |
+|---|---|---|---|
+| `du -sh` | 37G | **37G** | ✅ khớp |
+| số file | **5.664.048** | phải bằng | ✅ khớp |
+
+⚠️ **Lệch vài file thì KHÔNG được bỏ qua** — MinIO mất 1 `xl.meta` là hỏng object đó.
+Lệch ⟹ chạy lại rsync (có `--partial`, `-a` nên nó chỉ copy phần thiếu).
+
+⚠️ `du` có thể lệch **vài MB** do khác biệt block size / filesystem — chấp nhận được.
+Nhưng **số file phải khớp TUYỆT ĐỐI**.
+
+⚠️ `find` trên 5,66 triệu file chạy **khá lâu** (phiên trước mất vài phút). Kiên nhẫn.
+</details>
+
+---
+
+### 7c.4 Import image trên vmlp-09
+
+Copy tar sang trước — chạy trên **vrp-07** (`root`):
+```
+scp /tmp/ragflow-images.tar app@10.208.137.43:/tmp/
+```
+
+Rồi trên **vmlp-09**, user **`root`**:
+```
+ctr -n k8s.io images import /tmp/ragflow-images.tar
+ctr -n k8s.io images ls | grep -i minio
+```
+
+<details>
+<summary>⚠️ Giải nghĩa — LUẬT CỨNG về -n k8s.io (bấm để mở)</summary>
+
+```
+scp /tmp/ragflow-images.tar app@10.208.137.43:/tmp/
+│   scp = secure copy, copy file qua ssh. 838M, mạng nội bộ ⟹ nhanh
+│
+ctr -n k8s.io images import /tmp/ragflow-images.tar
+│ │
+│ └─ ⭐⭐ -n k8s.io  BẮT BUỘC. containerd chia image theo NAMESPACE:
+│       ├─ k8s.io    ← namespace mà KUBELET đọc
+│       └─ default   ← namespace mặc định của ctr/nerdctl
+│
+│    ⛔ Thiếu -n k8s.io ⟹ image vào namespace 'default'
+│       ⟹ kubelet KHÔNG THẤY ⟹ pod vẫn ImagePullBackOff
+│       ⟹ mà 'ctr images ls' lại hiện ra bình thường
+│       ⟹ tưởng đã import xong nhưng thực ra vô ích.
+│    Đây là cùng loại bẫy với luật nerdctl/namespace bên vRP (CLAUDE.md)
+│
+ctr -n k8s.io images ls | grep -i minio
+    ⟹ XÁC MINH image đã vào ĐÚNG namespace k8s.io.
+       Phải thấy dòng chứa RELEASE.2025-06-13T11-33-47Z.
+       ⚠️ Đừng bỏ qua bước verify này — 'import' có thể exit 0
+          mà vẫn vào sai namespace
+```
+
+⚠️ **Ghi lại CHÍNH XÁC tên image** mà lệnh `ls` in ra — đó là chuỗi phải điền vào
+StatefulSet ở bước 3. Nếu tên trong tar là `minio/minio:RELEASE...` (không prefix)
+thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest, kèm
+`imagePullPolicy: IfNotPresent` để kubelet **không đi hỏi registry**.
+
+⚠️ Đây chính là chỗ đã làm chết pod nguồn (5c.2) — **đừng lặp lại**.
+</details>
+
+---
+
 ## 8. Rủi ro đang theo dõi
 
 | # | Rủi ro | Mức | Ghi chú |
@@ -1292,9 +1596,9 @@ df -h /home
 
 ### Bước 1 — chốt node đích + chuẩn bị (chưa động vào dữ liệu)
 
-- [ ] Chốt node đích: ứng viên **vmlp-09** (`.43`) — 139G trống, inode **4%** (thoáng nhất)
-- [ ] Chốt đường dẫn hostPath trên node đích
-      → đề xuất `/home/app/app_data/ragflow/minio` (theo quy ước vMLP ở 5b.2)
+- [x] ~~Chốt node đích~~ ✅ **vmlp-09** (`.43`) — 139G trống, inode **4%** (thoáng nhất)
+- [x] ~~Chốt đường dẫn hostPath~~ ✅ **`/home/app/app_data/ragflow/minio`**
+- [ ] ⚠️ **Chạy 7c.0 kiểm tra trước** (UID user app, quyền thư mục, sudo, có rsync không)
 - [ ] Tạo namespace `ragflow` trên vMLP
 - [ ] scp `/tmp/ragflow-images.tar` (838M) từ vrp-07 → node đích
 - [ ] `ctr -n k8s.io images import` trên node đích — ⚠️ **nhớ `-n k8s.io`**, không thì kubelet không thấy
