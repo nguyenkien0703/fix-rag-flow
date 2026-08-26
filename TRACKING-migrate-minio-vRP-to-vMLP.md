@@ -1316,33 +1316,103 @@ rsync --version | head -1
 ls -ld /data/ragflow/minio
 ```
 
----
+#### ✅ KẾT QUẢ ĐO (26/08)
 
-### 7c.1 Tạo thư mục đích trên vmlp-09
+**vmlp-09** — ⚠️ Kiên đăng nhập bằng **`root`**, không phải `app`:
 
 ```
-sudo mkdir -p /home/app/app_data/ragflow/minio
-sudo chown app:app /home/app/app_data/ragflow
-ls -ld /home/app/app_data/ragflow/minio
+[root@vmlp-kubeengine09 ~]# id app
+uid=1001(app) gid=1001(app) groups=1001(app),153(containerd)
+
+[root@vmlp-kubeengine09 ~]# ls -ld /home/app/app_data
+drwxr-xr-x. 6 app app 4096 Apr 22 2025 /home/app/app_data
+
+[root@vmlp-kubeengine09 ~]# sudo -n true 2>&1 | head -1
+(rỗng)
+
+[root@vmlp-kubeengine09 ~]# rsync --version | head -1
+rsync  version 3.1.2  protocol version 31
+```
+
+**vrp-07**:
+
+```
+[root@vrp-kubeengine07 ~]# rsync --version | head -1
+rsync  version 3.1.2  protocol version 31
+
+[root@vrp-kubeengine07 ~]# ls -ld /data/ragflow/minio
+drwxr-xr-x 40 root root 4096 Jul 20 17:35 /data/ragflow/minio
+```
+
+| Hạng mục | Kết quả | Ảnh hưởng |
+|---|---|---|
+| rsync 2 node | ✅ **cùng 3.1.2, protocol 31** | Không lệch protocol, đủ hỗ trợ `-aHAX --numeric-ids --info=progress2 --partial` |
+| `/home/app/app_data` | ✅ tồn tại từ Apr 2025, `app:app` (uid **1001**) | Chỉ cần tạo thêm 2 cấp `ragflow/minio` |
+| Quyền thao tác | ✅ Kiên có **root** trên cả 2 node | Không cần sudo |
+| **Owner dữ liệu nguồn** | ⚠️ **`root:root` (uid 0)** | ⭐ **ĐỔI LỆNH rsync — xem dưới** |
+
+### 🔴 PHÁT HIỆN 9 — nguồn thuộc `root`, đích thuộc `app` ⟹ phải rsync bằng `root`
+
+```
+nguồn  /data/ragflow/minio             root:root  (uid 0)
+đích   /home/app/app_data              app:app    (uid 1001)
+```
+
+⚠️ **Lệnh 7c.2 bản nháp ban đầu dùng `app@10.208.137.43` — SAI trong tình huống này.**
+
+Lý do: `-a` (chứa `-o`/`-g`) cố **giữ owner `root:root`** ở đích. Nhưng đăng nhập
+bằng `app` (uid 1001, không sudo) thì **không có quyền `chown` sang uid 0**
+⟹ rsync báo hàng loạt `failed to set ownership`, hoặc **âm thầm đổi owner sang `app`**.
+
+✅ **Sửa: dùng `root@10.208.137.43`.**
+
+⭐ **Và giữ nguyên owner `root:root` là ĐÚNG, đừng đổi sang `app`:**
+- StatefulSet MinIO ở vRP chạy `securityContext: {}` ⟹ mặc định **uid 0**
+- Tenant mẫu ở vMLP cũng `runAsUser: 0, runAsGroup: 0, fsGroup: 0` (5c.6)
+⟹ Cả 2 cụm đều chạy MinIO bằng root ⟹ dữ liệu thuộc root là khớp.
+
+❓ *Ghi chú*: `groups=1001(app),153(containerd)` — user `app` nằm trong group
+`containerd`, đó là lý do `app` gõ được `kubectl`/`ctr` trên các node vMLP.
+
+---
+
+### 7c.1 Tạo thư mục đích trên vmlp-09 — user **`root`**
+
+> ✅ Đã cập nhật theo kết quả đo: Kiên là **root** ⟹ **bỏ `sudo`**.
+
+```
+mkdir -p /home/app/app_data/ragflow/minio
+chown app:app /home/app/app_data/ragflow
+ls -ld /home/app/app_data/ragflow /home/app/app_data/ragflow/minio
 ```
 
 <details>
 <summary>Giải nghĩa (bấm để mở)</summary>
 
 ```
-sudo mkdir -p /home/app/app_data/ragflow/minio
+mkdir -p /home/app/app_data/ragflow/minio
 │ └─ -p  parents: tạo LUÔN các thư mục cha còn thiếu, và
 │        KHÔNG báo lỗi nếu thư mục đã tồn tại.
 │        ⟹ chạy lại nhiều lần vẫn an toàn (idempotent)
+│   (đã BỎ sudo — Kiên đăng nhập sẵn bằng root)
 │
-sudo chown app:app /home/app/app_data/ragflow
-│   ⟹ trả quyền sở hữu về user app cho khớp bố cục /home/app.
-│   ⚠️ CHỈ chown thư mục cha 'ragflow', KHÔNG chown -R xuống 'minio'.
-│      Lý do: bước rsync sau sẽ tự mang owner đúng từ nguồn sang.
-│      chown -R trước rồi rsync sau = làm 2 lần, và chown -R
-│      trên 5,66 TRIỆU file sẽ chạy rất lâu
+chown app:app /home/app/app_data/ragflow
+│   ⟹ thư mục CHA 'ragflow' để app:app cho khớp bố cục /home/app.
+│   ⚠️ CHỈ chown thư mục cha, KHÔNG chown xuống 'minio'.
+│      Thư mục 'minio' bên trong sẽ do rsync mang owner root:root
+│      từ nguồn sang — ĐÚNG như mong muốn (MinIO chạy uid 0).
+│   ⚠️ TUYỆT ĐỐI KHÔNG dùng chown -R: thư mục sẽ chứa 5,66 TRIỆU inode,
+│      lệnh đệ quy sẽ chạy rất lâu và tạo tải I/O lớn — mà lại vô ích
+│      vì rsync đã set owner đúng rồi
 │
-ls -ld ...   → xác nhận đã tạo đúng, quyền đúng
+ls -ld <2 đường dẫn>   → xác nhận cả thư mục cha và con đã tạo đúng
+    └─ -d  chỉ xem thông tin THƯ MỤC, không liệt kê nội dung
+```
+
+⚠️ **Kết quả kỳ vọng sau khi chạy**:
+```
+drwxr-xr-x. app  app  ... /home/app/app_data/ragflow
+drwxr-xr-x. root root ... /home/app/app_data/ragflow/minio   ← sau rsync sẽ là root:root
 ```
 
 ⚠️ **Vì sao không chown -R**: thư mục sẽ chứa **5.664.048 inode**.
@@ -1355,11 +1425,53 @@ không cần thiết trên thư mục MinIO.
 
 ### 7c.2 ⭐ rsync 37G — chặng chính
 
+> 🔴 **ĐÃ SỬA `app@` → `root@`** theo phát hiện 9. Dùng bản dưới đây, **không dùng bản cũ**.
+
 Chạy trên **vrp-07** (`10.208.137.54`, user `root`):
 
+**Chạy thử trước (dry-run) — không copy gì, chỉ xem sẽ làm gì:**
 ```
-rsync -aHAX --numeric-ids --info=progress2 --partial /data/ragflow/minio/ app@10.208.137.43:/home/app/app_data/ragflow/minio/
+rsync -aHAX --numeric-ids --dry-run --stats /data/ragflow/minio/ root@10.208.137.43:/home/app/app_data/ragflow/minio/
 ```
+
+**Chạy thật:**
+```
+screen -S minio-rsync
+rsync -aHAX --numeric-ids --info=progress2 --partial /data/ragflow/minio/ root@10.208.137.43:/home/app/app_data/ragflow/minio/
+```
+
+<details>
+<summary>Giải nghĩa phần MỚI THÊM: dry-run và screen (bấm để mở)</summary>
+
+```
+--dry-run   (viết tắt -n)
+│   Chạy THỬ: rsync tính toán mọi thứ và báo cáo sẽ làm gì,
+│   nhưng KHÔNG ghi một byte nào ra đích.
+│   ⭐ Dùng để bắt lỗi đường dẫn / quyền / dấu / TRƯỚC khi tốn hàng giờ
+│   ⚠️ Bỏ --info=progress2 và --partial ở bản dry-run vì không copy thật
+│
+--stats
+│   In bảng tổng kết cuối: tổng số file, tổng dung lượng,
+│   số file sẽ được truyền.
+│   ⭐ Con số "Number of files" ở đây nên khớp ~5.664.048 —
+│      đối chiếu ngay từ dry-run, không cần chờ copy xong
+│
+screen -S minio-rsync
+│ └─ -S <tên>  đặt TÊN cho session, để tìm lại được
+│   ⭐ Vì sao cần: rsync 5,66 triệu file chạy HÀNG GIỜ. Nếu ssh đứt
+│      (VDI timeout, mất mạng) thì tiến trình bị giết giữa chừng.
+│      screen giữ tiến trình chạy tiếp dù ssh đứt.
+│
+│   Thao tác screen cần nhớ:
+│   ├─ Ctrl-a rồi d      → detach (thoát ra, tiến trình VẪN CHẠY)
+│   ├─ screen -r minio-rsync  → quay lại xem tiến độ
+│   └─ screen -ls        → liệt kê các session đang có
+│
+│   ❓ Nếu vrp-07 không có 'screen', thay bằng 'tmux' hoặc:
+│      nohup rsync ... > /tmp/rsync-minio.log 2>&1 &
+│      rồi theo dõi bằng: tail -f /tmp/rsync-minio.log
+```
+</details>
 
 <details>
 <summary>⭐ Giải nghĩa TỪNG CỜ — đọc kỹ, sai một cờ là hỏng dữ liệu (bấm để mở)</summary>
@@ -1390,9 +1502,11 @@ rsync -aHAX --numeric-ids --info=progress2 --partial <nguồn>/ <đích>/
 │
 ├─ --numeric-ids
 │       KHÔNG dịch tên user/group sang tên chữ, giữ nguyên UID/GID dạng SỐ.
-│       ⭐ BẮT BUỘC khi copy giữa 2 máy: user 'app' trên vrp-07 có thể
-│       có UID khác 'app' trên vmlp-09. Không có cờ này, rsync dịch
-│       theo TÊN và owner bị đổi sai âm thầm
+│       ⭐ BẮT BUỘC khi copy giữa 2 máy: cùng một TÊN user có thể mang
+│       UID khác nhau trên 2 máy. Không có cờ này, rsync dịch theo TÊN
+│       và owner bị đổi sai âm thầm.
+│       ⟹ Ở đây: giữ nguyên uid 0 (root) từ nguồn sang đích — khớp với
+│          MinIO chạy uid 0 ở cả 2 cụm (xem phát hiện 9)
 │
 ├─ --info=progress2
 │       Hiện tiến độ TỔNG THỂ (%, tốc độ, thời gian còn lại) trên MỘT dòng,
@@ -1421,10 +1535,13 @@ chạy hàng giờ. ❓ *Chưa đo thực tế.*
 (có `--partial` thì chạy lại được, nhưng vẫn phải quét lại toàn bộ cây thư mục).
 </details>
 
-#### 7c.2b Phương án dự phòng nếu vmlp-09 KHÔNG có rsync
+#### 7c.2b Phương án dự phòng — ⚪ **KHÔNG CẦN DÙNG**
+
+> ✅ Đã đo 26/08: **cả 2 node đều có rsync 3.1.2** ⟹ dùng 7c.2, bỏ qua mục này.
+> Giữ lại phòng khi rsync gặp sự cố.
 
 ```
-tar -cf - -C /data/ragflow/minio . | ssh app@10.208.137.43 'tar -xf - -C /home/app/app_data/ragflow/minio'
+tar -cf - -C /data/ragflow/minio . | ssh root@10.208.137.43 'tar -xf - -C /home/app/app_data/ragflow/minio'
 ```
 
 <details>
@@ -1514,7 +1631,7 @@ Nhưng **số file phải khớp TUYỆT ĐỐI**.
 
 Copy tar sang trước — chạy trên **vrp-07** (`root`):
 ```
-scp /tmp/ragflow-images.tar app@10.208.137.43:/tmp/
+scp /tmp/ragflow-images.tar root@10.208.137.43:/tmp/
 ```
 
 Rồi trên **vmlp-09**, user **`root`**:
@@ -1527,7 +1644,7 @@ ctr -n k8s.io images ls | grep -i minio
 <summary>⚠️ Giải nghĩa — LUẬT CỨNG về -n k8s.io (bấm để mở)</summary>
 
 ```
-scp /tmp/ragflow-images.tar app@10.208.137.43:/tmp/
+scp /tmp/ragflow-images.tar root@10.208.137.43:/tmp/
 │   scp = secure copy, copy file qua ssh. 838M, mạng nội bộ ⟹ nhanh
 │
 ctr -n k8s.io images import /tmp/ragflow-images.tar
@@ -1598,7 +1715,9 @@ thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest
 
 - [x] ~~Chốt node đích~~ ✅ **vmlp-09** (`.43`) — 139G trống, inode **4%** (thoáng nhất)
 - [x] ~~Chốt đường dẫn hostPath~~ ✅ **`/home/app/app_data/ragflow/minio`**
-- [ ] ⚠️ **Chạy 7c.0 kiểm tra trước** (UID user app, quyền thư mục, sudo, có rsync không)
+- [x] ~~Chạy 7c.0 kiểm tra trước~~ ✅ **XONG 26/08** — cả 2 node có rsync 3.1.2,
+      Kiên có root, `/home/app/app_data` tồn tại. ⚠️ Ra **phát hiện 9**: nguồn `root:root`
+      ⟹ **đổi `app@` → `root@`** trong lệnh rsync
 - [ ] Tạo namespace `ragflow` trên vMLP
 - [ ] scp `/tmp/ragflow-images.tar` (838M) từ vrp-07 → node đích
 - [ ] `ctr -n k8s.io images import` trên node đích — ⚠️ **nhớ `-n k8s.io`**, không thì kubelet không thấy
@@ -1676,3 +1795,6 @@ thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest
 | 26/08 | Kiên chốt | ✅ **KỆ RAGFlow, không cứu** ⟹ dữ liệu đứng yên, **R5 đóng**, bỏ bài toán downtime |
 | 26/08 | Kiên hỏi lại *"dựng tạm là dựng cái gì?"* | ⭐ Lộ ra tôi **tự nhét giả định Tenant** mà Kiên chưa chốt |
 | 26/08 | Kiên chốt kiến trúc | ✅ **SINGLE-NODE** ⟹ **bỏ MinIO tạm + `mc mirror`**, **R8/R15/R16 đóng/hoãn** |
+| 26/08 | Kiên chốt node + path | ✅ **vmlp-09** (`.43`), `/home/app/app_data/ragflow/minio` |
+| 26/08 | Chạy kiểm tra 7c.0 | ✅ rsync 3.1.2 cả 2 node, có root, thư mục cha tồn tại |
+| 26/08 | ⚠️ **Phát hiện 9** | Nguồn `root:root` vs đích `app:app` ⟹ **sửa lệnh rsync: `app@` → `root@`** |
