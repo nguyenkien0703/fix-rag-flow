@@ -1,0 +1,215 @@
+# =============================================================================
+# MinIO single-node tren cum vMLP (node vmlp-kubeengine09 / 10.208.137.43)
+# Migrate tu vRP node 07. Xem TRACKING-migrate-minio-vRP-to-vMLP.md
+#
+# ⚠️ SECRET: file nay KHONG chua credential that.
+#    Tao secret bang lenh rieng (xem 7d.2 trong file tracking), khong commit gia tri.
+#
+# Thu tu apply:  ns -> pv -> pvc -> sts -> svc
+# =============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ragflow
+---
+# -----------------------------------------------------------------------------
+# PV: hostPath tro thang vao du lieu da rsync sang
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-ragflow-minio-vmlp
+spec:
+  # 60Gi: du lieu that ~37G. PV nguon ghi 5Gi la SO AO (hostPath khong ep quota)
+  # nhung de sat thuc te de con nguoi doc con so nay khong bi danh lua.
+  capacity:
+    storage: 60Gi
+  accessModes:
+    - ReadWriteOnce
+  # Retain: xoa PVC KHONG xoa du lieu. BAT BUOC - day la ban duy nhat sau migrate.
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  volumeMode: Filesystem
+  hostPath:
+    path: /home/app/app_data/ragflow/minio
+    type: Directory        # Directory (khong phai DirectoryOrCreate):
+                           # neu path khong ton tai -> BAO LOI thay vi tao thu muc
+                           # RONG roi MinIO khoi tao lai tu dau => mat du lieu
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            # Dung hostname thay vi label 'ragflow-target' cua PV nguon:
+            # vmlp-09 KHONG co label do (phat hien 14), va cac PV san co
+            # tren vMLP cung dung chinh key nay.
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - vmlp-kubeengine09
+---
+# -----------------------------------------------------------------------------
+# PVC: bind CHINH XAC vao PV tren
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-ragflow-minio-vmlp
+  namespace: ragflow
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-storage
+  # volumeName: ep bind dung PV tren, khong de scheduler tu chon PV khac
+  volumeName: pv-ragflow-minio-vmlp
+  resources:
+    requests:
+      storage: 60Gi
+---
+# -----------------------------------------------------------------------------
+# StatefulSet MinIO
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ragflow-minio
+  namespace: ragflow
+  labels:
+    app.kubernetes.io/name: ragflow
+    app.kubernetes.io/instance: ragflow
+    app.kubernetes.io/component: minio
+spec:
+  serviceName: ragflow-minio-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ragflow
+      app.kubernetes.io/instance: ragflow
+      app.kubernetes.io/component: minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ragflow
+        app.kubernetes.io/instance: ragflow
+        app.kubernetes.io/component: minio
+    spec:
+      # Ghim vao dung node co du lieu. PV nodeAffinity da ep roi,
+      # nhung khai them cho ro rang va de doc.
+      nodeSelector:
+        kubernetes.io/hostname: vmlp-kubeengine09
+      securityContext:
+        runAsUser: 0        # MinIO chay uid 0 o ca 2 cum. Du lieu da chown root:root.
+        runAsGroup: 0
+        fsGroup: 0
+      containers:
+        - name: minio
+          # ⚠️ TEN IMAGE PHAI KHOP Y HET chuoi ma lenh nay in ra tren vmlp-09:
+          #      ctr -n k8s.io images ls | grep -i minio
+          #    Anh nguon thieu prefix registry -> containerd di hoi docker.io
+          #    -> DNS timeout (airgap) -> day chinh la loi da giet pod ben vRP (R17).
+          image: docker.io/minio/minio:RELEASE.2025-06-13T11-33-47Z
+          # IfNotPresent: da import san bang ctr => TUYET DOI khong di hoi registry.
+          # KHONG dung Always - airgap se ImagePullBackOff vinh vien.
+          imagePullPolicy: IfNotPresent
+          args:
+            - server
+            - --console-address=:9001
+            - /data
+          envFrom:
+            - secretRef:
+                name: ragflow-env-config
+          ports:
+            # Ten port PHAI la s3 / console: Service ben vRP dung targetPort
+            # dang TEN chu khong phai so. Giu y het de khong lech.
+            - name: s3
+              containerPort: 9000
+              protocol: TCP
+            - name: console
+              containerPort: 9001
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data      # /data - KHONG phai /export nhu Tenant mau vMLP (R18)
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          # startupProbe: MinIO quet 2,83 trieu object luc khoi dong -> co the LAU.
+          # Khong co probe nay, liveness se giet pod giua chung roi lap vo han.
+          startupProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 40      # cho toi da 10 phut
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 4Gi             # KHONG dat limit CPU: MinIO bi throttle se cham te
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pvc-ragflow-minio-vmlp
+---
+# -----------------------------------------------------------------------------
+# Service 1: headless - bat buoc cho StatefulSet
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: ragflow-minio-headless
+  namespace: ragflow
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ragflow
+    app.kubernetes.io/instance: ragflow
+    app.kubernetes.io/component: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+    - name: console
+      port: 9001
+      targetPort: console
+---
+# -----------------------------------------------------------------------------
+# Service 2: NodePort - duong RAGFlow ben vRP goi sang
+#
+# ⭐ VI SAO PHAI NodePort: DNS cua k8s KHONG phan giai xuyen cum.
+#    RAGFlow o vRP khong the goi 'ragflow-minio.ragflow.svc.cluster.local' cua vMLP.
+#    Phai di bang IP node + port co dinh.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: ragflow-minio
+  namespace: ragflow
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: ragflow
+    app.kubernetes.io/instance: ragflow
+    app.kubernetes.io/component: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+      nodePort: 30900       # RAGFlow ben vRP se tro vao 10.208.137.43:30900
+    - name: console
+      port: 9001
+      targetPort: console
+      nodePort: 30901

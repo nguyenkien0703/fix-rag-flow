@@ -2135,6 +2135,230 @@ thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest
 
 ---
 
+## 7d. 🚀 BƯỚC 3 — DỰNG WORKLOAD MinIO TRÊN vMLP
+
+> ✅ **rsync HOÀN TẤT 26/08 ~15:30** — `xfr#2831983`, `to-chk=0/5664048`, **40 phút 10 giây**,
+> tốc độ thật **8.64 MB/s**. `chown -R root:root` đã xong.
+> Manifest: **`manifests-vmlp/minio-vmlp.yaml`**
+
+### 7d.0 Hai phát hiện mới từ khảo sát cụm đích (26/08)
+
+#### 🔴 Phát hiện 13 — namespace `ragflow` **CHƯA TỒN TẠI** trên vMLP
+```
+$ kubectl get ns | grep -i ragflow
+(rỗng)
+```
+⟹ Phải tạo. Đã đưa vào manifest. Trả lời câu hỏi ban đầu của Kiên
+*"migrate lên vMLP thì có giữ được ns `ragflow` không?"* → **CÓ**, tên ns không xung đột gì.
+
+#### 🔴 Phát hiện 14 — vmlp-09 **KHÔNG có label `ragflow-target`**
+```
+$ kubectl get node vmlp-kubeengine09 --show-labels
+LABELS: beta.kubernetes.io/arch=amd64, beta.kubernetes.io/os=linux,
+        kubernetes.io/arch=amd64, kubernetes.io/hostname=vmlp-kubeengine09,
+        kubernetes.io/os=linux
+```
+PV nguồn dùng `nodeAffinity` key **`ragflow-target: "true"`** (§4).
+
+**2 lựa chọn:**
+
+| Cách | Việc phải làm | Đánh giá |
+|---|---|---|
+| Gắn label `ragflow-target=true` vào vmlp-09 | `kubectl label node ...` | Thêm 1 bước, thêm 1 thứ phải nhớ |
+| ✅ **Đổi nodeAffinity sang `kubernetes.io/hostname`** | Không đụng gì vào node | **CHỌN** — label này **luôn có sẵn**, và các PV sẵn có trên vMLP (`minio-pv-1`) **đang dùng đúng key này** ⟹ nhất quán với cụm |
+
+#### ✅ Làm rõ về StorageClass
+```
+$ kubectl get sc
+local-path (default)   rancher.io/local-path                    Delete  WaitForFirstConsumer
+local-storage          kubernetes.io/no-provisioner             Delete  WaitForFirstConsumer
+nfs-delete             .../nfs-subdir-external-provisioner      Delete  Immediate
+nfs-retain             .../nfs-subdir-external-provisioner      Retain  Immediate
+```
+⭐ **`host-storage` (SC mà Tenant mẫu khai) KHÔNG có trong danh sách** — xác nhận lại
+kết luận cũ: đó là **nhãn tự bịa** cho PV thủ công, không có provisioner nào.
+
+⟹ Dùng **`local-storage`** (`kubernetes.io/no-provisioner`) vì **nó CÓ THẬT**.
+`no-provisioner` = không tự tạo PV, phải khai tay — đúng mô hình hostPath của ta.
+⚠️ **Không dùng `local-path` (default)** dù là mặc định: nó **TỰ CHỌN đường dẫn**,
+không trỏ được vào `/home/app/app_data/ragflow/minio` đã có sẵn dữ liệu.
+
+### 7d.1 Cấu hình gốc đọc được từ vRP (để dựng lại cho khớp)
+
+```
+Service ragflow-minio (vRP):
+├─ type: ClusterIP        172.16.213.63
+├─ ports:
+│  ├─ name: s3       port 9000  targetPort: s3        ⭐ targetPort dạng TÊN
+│  └─ name: console  port 9001  targetPort: console       không phải SỐ
+└─ selector:
+   ├─ app.kubernetes.io/component: minio
+   ├─ app.kubernetes.io/instance:  ragflow
+   └─ app.kubernetes.io/name:      ragflow
+
+Secret ragflow-env-config: do HELM quản lý (meta.helm.sh/release-name: ragflow)
+├─ MINIO_HOST / MINIO_PORT (=9000) / MINIO_PASSWORD
+├─ MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
+└─ + ES/MySQL/Redis... (dùng chung 1 secret cho cả RAGFlow stack)
+```
+
+> ⭐ **`targetPort` dạng TÊN** ⟹ StatefulSet **bắt buộc** khai `ports.name: s3` và
+> `ports.name: console`. Sai tên là Service không tìm thấy đích, Endpoints rỗng.
+
+### 7d.2 Tạo Secret — ⚠️ **KHÔNG commit giá trị vào repo**
+
+> 🔴 Repo này **đã có nợ bảo mật** (token + mật khẩu ES lọt git history — xem CLAUDE.md).
+> Kiên đã nói lộ credential không thành vấn đề, **nhưng vẫn không ghi giá trị vào file**.
+
+Cách sạch nhất — **copy thẳng secret từ vRP sang vMLP, không qua trung gian**.
+Trên **vrp-04** (`app`), xuất ra file tạm:
+```
+kubectl -n ragflow get secret ragflow-env-config -o yaml > /tmp/minio-secret.yaml
+```
+
+Rồi **lọc bỏ metadata bám vào cụm cũ** trước khi apply sang cụm mới:
+```
+grep -v -E 'resourceVersion|uid:|creationTimestamp|meta.helm.sh|app.kubernetes.io/managed-by' /tmp/minio-secret.yaml > /tmp/minio-secret-clean.yaml
+```
+
+<details>
+<summary>⭐ Vì sao phải lọc — bấm để mở</summary>
+
+```
+grep -v -E '<pattern1>|<pattern2>|...'  <file>  >  <file moi>
+│ │  │
+│ │  └─ -E   extended regex: cho phep dung dau | (hoac)
+│ └─ -v      INVERT: in ra nhung dong KHONG khop
+│
+Cac truong PHAI bo va ly do:
+├─ resourceVersion   ⟹ số phiên bản của CỤM CŨ. Mang sang cụm mới gây
+│                       lỗi "metadata.resourceVersion: Invalid value"
+├─ uid               ⟹ định danh duy nhất do CỤM CŨ cấp. Cụm mới tự cấp uid riêng
+├─ creationTimestamp ⟹ dấu thời gian cũ, vô nghĩa ở cụm mới
+├─ meta.helm.sh/...  ⭐ QUAN TRỌNG: đánh dấu "object này do Helm release
+│                       'ragflow' quản lý". Bên vMLP KHÔNG có release đó
+│                       ⟹ để lại thì Helm bên kia có thể hiểu nhầm quyền sở hữu
+└─ managed-by: Helm  ⟹ cùng lý do trên
+
+⚠️ KHÔNG lọc 'namespace: ragflow' — ns này ta CÓ tạo bên vMLP nên giữ đúng.
+```
+</details>
+
+Copy sang node gõ kubectl của vMLP rồi apply:
+```
+scp /tmp/minio-secret-clean.yaml app@10.208.137.42:/tmp/
+```
+Trên **vmlp-08** (`app`):
+```
+kubectl apply -f /tmp/minio-secret-clean.yaml
+kubectl -n ragflow get secret ragflow-env-config
+```
+
+⚠️ **Xoá file tạm sau khi xong** (chứa credential dạng base64 — decode được ngay):
+```
+rm -f /tmp/minio-secret.yaml /tmp/minio-secret-clean.yaml
+```
+
+### 7d.3 Apply manifest chính
+
+File: **`manifests-vmlp/minio-vmlp.yaml`** — chứa Namespace + PV + PVC +
+StatefulSet + 2 Service (headless + NodePort).
+
+⚠️ **TRƯỚC KHI APPLY, phải sửa 1 dòng**: tên image trong manifest phải khớp
+**y hệt** chuỗi mà `ctr -n k8s.io images ls | grep -i minio` in ra trên vmlp-09.
+
+```
+kubectl apply -f minio-vmlp.yaml
+kubectl -n ragflow get pv,pvc,sts,svc,pod -o wide
+```
+
+<details>
+<summary>⭐ Giải nghĩa các quyết định trong manifest (bấm để mở)</summary>
+
+```
+PV
+├─ capacity: 60Gi
+│    ⚠️ hostPath KHÔNG ép quota — con số này chỉ là NHÃN để k8s ghép PV-PVC.
+│    PV nguồn ghi 5Gi trong khi chứa 37G (§4) ⟹ số ảo, dễ đánh lừa người đọc.
+│    Đặt 60Gi để con số PHẢN ÁNH thực tế (37G data + chỗ lớn thêm).
+│
+├─ persistentVolumeReclaimPolicy: Retain   ⭐⭐ BẮT BUỘC
+│    Xoá PVC sẽ KHÔNG xoá dữ liệu.
+│    ⛔ Nếu để 'Delete': lỡ tay xoá PVC ⟹ MẤT SẠCH 37G vừa copy 40 phút.
+│    Đây là bản DUY NHẤT sau khi dọn nguồn ở bước 6.
+│
+├─ hostPath.type: Directory        ⭐ KHÔNG dùng DirectoryOrCreate
+│    Directory        = path PHẢI tồn tại, không thì BÁO LỖI
+│    DirectoryOrCreate= không có thì TẠO THƯ MỤC RỖNG
+│    ⛔ Nguy hiểm: nếu gõ sai path mà dùng DirectoryOrCreate, k8s tạo thư mục
+│       rỗng, MinIO thấy trống ⟹ KHỞI TẠO LẠI TỪ ĐẦU ⟹ coi như mất dữ liệu
+│       (dữ liệu cũ vẫn nằm ở path đúng, nhưng MinIO không biết)
+│    ⟹ Directory biến lỗi ĐÁNH MÁY thành lỗi DỪNG NGAY, thay vì hỏng âm thầm
+│
+└─ nodeAffinity: kubernetes.io/hostname In [vmlp-kubeengine09]
+     ⭐ hostPath = dữ liệu nằm TRÊN Ổ CỦA MỘT NODE CỤ THỂ.
+     Không ghim thì scheduler có thể đẩy pod sang node khác ⟹ thư mục rỗng
+     ⟹ MinIO khởi tạo lại. Đây là bẫy KINH ĐIỂN của hostPath.
+
+PVC
+└─ volumeName: pv-ragflow-minio-vmlp
+     ⭐ ÉP bind đúng PV này. Không khai thì scheduler có thể ghép vào PV khác
+        cùng storageClass ⟹ pod chạy nhưng trỏ nhầm chỗ, không thấy dữ liệu
+
+StatefulSet
+├─ imagePullPolicy: IfNotPresent   ⭐⭐ BẮT BUỘC
+│    Đã import bằng ctr ⟹ TUYỆT ĐỐI không đi hỏi registry.
+│    ⛔ 'Always' ⟹ airgap ⟹ ImagePullBackOff VĨNH VIỄN.
+│    Chính lỗi này đã giết pod bên vRP (5c.2, R17)
+│
+├─ ports.name: s3 / console        ⭐ PHẢI đúng tên
+│    Service dùng targetPort dạng TÊN (7d.1). Sai tên ⟹ Endpoints RỖNG,
+│    Service tồn tại nhưng không ai trả lời
+│
+├─ securityContext: runAsUser/Group/fsGroup = 0
+│    Khớp với dữ liệu đã chown root:root ở 7c.3b, và khớp cả 2 cụm
+│
+├─ startupProbe: failureThreshold 40 × period 15s = CHỜ TỐI ĐA 10 PHÚT
+│    ⭐⭐ ĐÂY LÀ ĐIỂM DỄ SAI NHẤT KHI KHỞI ĐỘNG LẦN ĐẦU:
+│    MinIO quét 2,83 TRIỆU object lúc boot ⟹ có thể rất lâu (metadata-bound,
+│    xem 7c.2e). Không có startupProbe thì livenessProbe GIẾT pod giữa chừng
+│    ⟹ CrashLoopBackOff lặp vô hạn, và nhìn log sẽ tưởng là lỗi dữ liệu
+│    ⟹ startupProbe hoãn liveness/readiness cho tới khi khởi động xong
+│
+├─ mountPath: /data     KHÔNG phải /export như Tenant mẫu vMLP (R18)
+│    args cũng là 'server /data' — khớp y hệt vRP
+│
+└─ resources: request 250m CPU / 512Mi, limit 4Gi RAM, KHÔNG limit CPU
+     ⭐ Không đặt CPU limit: MinIO bị CFS throttle sẽ chậm tệ hại.
+     Memory limit có, để MinIO không ăn hết RAM node nếu rò rỉ.
+
+Service NodePort  ⭐⭐ VÌ SAO BẮT BUỘC
+     DNS của k8s KHÔNG phân giải xuyên cụm. RAGFlow ở vRP KHÔNG THỂ gọi
+     'ragflow-minio.ragflow.svc.cluster.local' của vMLP — tên đó chỉ có nghĩa
+     BÊN TRONG cụm vMLP.
+     ⟹ phải đi bằng IP node + port cố định: 10.208.137.43:30900
+     (30900/30901 nằm trong dải NodePort mặc định 30000–32767)
+```
+</details>
+
+### 7d.4 Kiểm tra sau khi apply
+
+```
+kubectl -n ragflow get pod -o wide
+kubectl -n ragflow describe pod ragflow-minio-0 | tail -30
+kubectl -n ragflow logs ragflow-minio-0 --tail=50
+kubectl -n ragflow get endpoints ragflow-minio
+```
+
+> ⚠️ **Kỳ vọng**: pod có thể ở `Running` nhưng **chưa `Ready` trong vài phút** —
+> đó là MinIO đang quét 2,83 triệu object. **Đừng vội kết luận hỏng.**
+> Chỉ lo khi `CrashLoopBackOff` hoặc `describe` báo lỗi mount/image.
+>
+> ⚠️ `get endpoints ragflow-minio` **phải có IP pod**. Rỗng ⟹ sai tên port
+> hoặc sai selector.
+
+---
+
 ## 8. Rủi ro đang theo dõi
 
 | # | Rủi ro | Mức | Ghi chú |
@@ -2160,7 +2384,11 @@ thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest
 | 🔴 **R19** | **Migrate KHÔNG sửa nguyên nhân gốc — chỉ mua thời gian** | 🔴 **CAO** | Đo 26/08: 2.831.983 file / **2.832.065 thư mục** (tỉ lệ 1:1). Inode đích sẽ nhảy **4% → ~49%**. vmlp-09 chỉ hơn ở chỗ bảng inode **13,1M vs 6,55M**. MinIO vẫn ăn ~3 inode/object ⟹ **sẽ bò lên lại**. Sửa gốc = giảm số object / gộp file nhỏ / filesystem inode động (XFS). Xem 7c.2e |
 | 🔴 **R20** | Đích là **`/` chứ không phải partition riêng** | 🔴 **CAO** | `/home` nằm trên `/dev/vda1` = **cùng `/`**. Inode/disk cạn ở đây **giết cả kubelet, containerd, log hệ thống** trên vmlp-09, không chỉ MinIO. Rủi ro tập trung **cao hơn** một mount riêng ⟹ alert `df -i` là **bắt buộc**, không phải tuỳ chọn |
 | **R21** | `chmod o+x` mở đường trên 3 thư mục cha của `/home/app` | 🟡 | Đã nới quyền `/home/app`, `/home/app/app_data`, `/home/app/app_data/ragflow` từ `0700` → `0701` cho vt_admin đi qua (7c.1b). **Chỉ cho đi xuyên qua, không cho liệt kê.** Cân nhắc trả về `0700` sau khi migrate xong nếu chính sách yêu cầu |
-| **R22** | vrp-07 **không có `screen`/`tmux`** | 🟡 | rsync chạy trực tiếp ⟹ VDI rớt phiên là tiến trình chết. Giảm nhẹ: rsync **idempotent** + `--partial` ⟹ chạy lại được, nhưng **mất ~13 phút quét lại** mỗi lần. Xem 7c.2c |
+| ~~R22~~ | ~~vrp-07 không có `screen`/`tmux`~~ | ✅ **ĐÓNG 26/08** | rsync chạy một mạch **40 phút 10 giây**, không đứt. `xfr#2831983`, `to-chk=0/5664048` |
+| 🔴 **R23** | **MinIO khởi động lần đầu quét 2,83 triệu object → RẤT LÂU** | 🔴 **CAO** | Không có `startupProbe` thì `livenessProbe` **giết pod giữa chừng** ⟹ `CrashLoopBackOff` lặp vô hạn, và log nhìn như lỗi dữ liệu. Đã đặt `startupProbe` chờ tối đa **10 phút**. ⚠️ Nếu vẫn không lên, **tăng `failureThreshold`**, đừng vội nghi dữ liệu hỏng |
+| 🔴 **R24** | `hostPath.type` nếu để `DirectoryOrCreate` + gõ sai path ⟹ **mất dữ liệu âm thầm** | 🟠 | k8s tạo thư mục **rỗng**, MinIO thấy trống ⟹ **khởi tạo lại từ đầu**. Dữ liệu cũ vẫn còn ở path đúng nhưng MinIO không biết. ✅ Đã dùng **`type: Directory`** ⟹ sai path là **báo lỗi ngay** thay vì hỏng ngầm |
+| **R25** | PVC không khai `volumeName` ⟹ bind nhầm PV | 🟡 | Cụm vMLP có sẵn nhiều PV. ✅ Đã khai `volumeName` ép bind đúng |
+| **R26** | Secret bê từ vRP còn dính metadata Helm của cụm cũ | 🟡 | `meta.helm.sh/release-name` khiến Helm bên vMLP hiểu nhầm quyền sở hữu. ✅ Đã lọc ở 7d.2. ⚠️ **Nhớ `rm` file tạm** — chứa credential base64 |
 
 ---
 
@@ -2280,3 +2508,11 @@ thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest
 | 26/08 | vrp-07 không có `screen`/`tmux` | Chỉ có `nohup`/`setsid`. Kiên chốt **chạy trực tiếp, tự canh** ⟹ **R22** |
 | 26/08 ~14:50 | 🔄 **rsync bản thật BẮT ĐẦU** | `xfr#174` sau vài phút. Theo dõi bằng **`xfr#`**, KHÔNG dùng `%` (bẫy incremental file list) |
 | 26/08 | 🎓 Kiên hỏi metadata-bound vs bandwidth-bound | Viết mục **7c.2e** — giải thích đầy đủ + nối vào R19: **3 hiện tượng (inode cạn / copy chậm / du≠size) đều CÙNG MỘT nguyên nhân** |
+| 26/08 15:30 | ✅ **rsync HOÀN TẤT** | **40 phút 10 giây**, 8.64 MB/s. `xfr#2831983` = đúng số dry-run, `to-chk=**0**/5664048` ⟹ **không sót file nào**, không có dòng lỗi |
+| 26/08 | Đối chiếu inode đích | `IUsed` 475.758 → **6.144.243** = **+5.668.485** ≈ 5.664.048 mục ✅. `IFree` **6.962.957** (dự báo ~6,97M). Inode **4% → 47%** ⟹ **R19 hiện hình bằng số thật** |
+| 26/08 | `chown -R root:root` xong | `ls -ld` → `drwxr-xr-x. **40** root root ... **Jul 20 17:35**` ⟹ **link count VÀ mtime trùng khít nguồn** ⟹ `-t` giữ đúng timestamp |
+| 26/08 | 🔴 **Phát hiện 13** | Namespace `ragflow` **CHƯA TỒN TẠI** trên vMLP ⟹ phải tạo. (Trả lời câu hỏi ban đầu: **giữ được** tên ns `ragflow`) |
+| 26/08 | 🔴 **Phát hiện 14** | vmlp-09 **KHÔNG có label `ragflow-target`** ⟹ đổi nodeAffinity sang **`kubernetes.io/hostname`**, không phải đụng vào node |
+| 26/08 | Làm rõ StorageClass | `host-storage` **không có** trong `get sc` ⟹ xác nhận là nhãn tự bịa. Dùng **`local-storage`** (`no-provisioner`) vì **có thật**. Không dùng `local-path` default (tự chọn path, không trỏ được vào dữ liệu sẵn có) |
+| 26/08 | Đọc Service + Secret nguồn | ⭐ `targetPort` dạng **TÊN** (`s3`/`console`) ⟹ StatefulSet **bắt buộc** khai `ports.name` khớp, sai là Endpoints rỗng |
+| 26/08 | ✍️ Soạn manifest | **`manifests-vmlp/minio-vmlp.yaml`** — ns + PV + PVC + STS + 2 svc. Thêm **R23–R26** |
