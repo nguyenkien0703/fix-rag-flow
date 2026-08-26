@@ -205,11 +205,17 @@ spec:
     app.kubernetes.io/instance: ragflow
     app.kubernetes.io/component: minio
   ports:
+    # ⚠️ DAI NodePort cua cum vMLP la 8000-10000, KHONG phai mac dinh 30000-32767
+    #    (phat hien 15). Dat ngoai dai => API server tu choi.
     - name: s3
       port: 9000
       targetPort: s3
-      nodePort: 30900       # RAGFlow ben vRP se tro vao 10.208.137.43:30900
+      # ⭐ PHAI la 9000: RAGFlow doc ConfigMap ragflow-service-config
+      #    (service_conf.yaml), KHONG doc MINIO_PORT cua secret => no luon goi
+      #    <MINIO_HOST>:9000. Doi nodePort cho khop RE HON sua ConfigMap.
+      #    Xem phat hien 16 trong file tracking.
+      nodePort: 9000        # RAGFlow ben vRP tro vao 10.208.137.43:9000
     - name: console
       port: 9001
       targetPort: console
-      nodePort: 30901
+      nodePort: 9901        # console: http://10.208.137.43:9901

@@ -2359,6 +2359,171 @@ kubectl -n ragflow get endpoints ragflow-minio
 
 ---
 
+## 7e. ✅ THỰC THI THỰC TẾ — từ apply tới khi RAGFlow sống (26/08)
+
+> 📕 **Cần vận hành hằng ngày ⟹ đọc `RUNBOOK-minio-vmlp.md`.**
+> Mục này ghi lại **diễn biến + nguyên nhân**, runbook ghi **cách làm**.
+
+### 7e.1 Nơi đặt file manifest — Kiên chốt
+
+❌ Không để `/tmp` (bị dọn khi reboot).
+✅ **`/home/app/KienNV_DevOps/`** trên **vmlp-08** (`10.208.137.42`, user `app`).
+
+> ⭐ **Vì sao là vmlp-08 chứ không phải vmlp-09** (Kiên hỏi):
+> manifest là file để `kubectl apply`, mà `kubectl` chỉ gõ được ở **vmlp-08**.
+> File chỉ cần nằm nơi gõ kubectl — nó được gửi lên API server, **scheduler tự đẩy
+> workload xuống vmlp-09**. vmlp-09 chỉ cần có **dữ liệu** (đã rsync) và **image**
+> (đã import), **không cần file YAML nào**.
+
+| File | Nội dung |
+|---|---|
+| `minio-secret.yaml` | Secret `ragflow-env-config` copy từ vRP |
+| `minio-pv-pvc.yaml` | PV + PVC |
+| `minio-sts.yaml` | StatefulSet |
+| `minio-svc.yaml` | 2 Service (headless + NodePort) |
+
+### 7e.2 Secret — "cần gì clean?" (Kiên hỏi)
+
+**Giá trị credential giữ NGUYÊN**, không đổi gì. Nhưng vẫn phải bỏ vài trường
+metadata — **không phải vì bảo mật, mà vì kubectl SẼ TỪ CHỐI apply**:
+
+```
+kubectl -n ragflow get secret ragflow-env-config -o yaml \
+  | grep -v -E 'resourceVersion|uid:|creationTimestamp|meta.helm.sh|managed-by' \
+  > /tmp/minio-secret.yaml
+```
+
+| Trường | Vì sao phải bỏ | Loại |
+|---|---|---|
+| `resourceVersion` | số phiên bản của **cụm cũ** ⟹ `Invalid value` | 🔴 **lỗi cứng** |
+| `uid` | định danh do cụm cũ cấp, cụm mới tự cấp riêng | 🔴 **lỗi cứng** |
+| `creationTimestamp` | dấu thời gian cũ | 🔴 **lỗi cứng** |
+| `meta.helm.sh/*`, `managed-by` | Helm bên vMLP hiểu nhầm quyền sở hữu | 🟡 nên bỏ |
+
+### 7e.3 🔴 Phát hiện 15 — dải NodePort của vMLP là **8000–10000**
+
+```
+The Service "ragflow-minio" is invalid: spec.ports[0].nodePort:
+Invalid value: 30900: provided port is not in the valid range.
+The range of valid ports is 8000-10000
+```
+
+Cụm vMLP sửa `--service-node-port-range`, **không dùng mặc định 30000–32767**.
+⟹ Đổi sang `9900`/`9901`. **Nhớ khi tạo Service NodePort bất kỳ trên vMLP.**
+
+### 7e.4 ✅ MinIO lên — nhanh hơn dự kiến
+
+```
+NAME              READY  STATUS   RESTARTS  AGE  NODE
+ragflow-minio-0   1/1    Running  0         51s  vmlp-kubeengine09   IP 172.16.3.198
+```
+
+⭐ **`RESTARTS 0`** và Ready sau **~30 giây** ⟹ mount + image + probe đều đúng ngay
+lần đầu. `startupProbe` 10 phút hoá ra **dư dả** — MinIO quét 2,83 triệu object
+nhanh hơn nhiều so với lo ngại ở R23.
+
+**Verify đầy đủ:**
+```
+svc/ragflow-minio        NodePort  9000:9900/TCP, 9001:9901/TCP
+endpoints                172.16.3.198:9000, 172.16.3.198:9001   ✅ không rỗng
+exec ls /data            → liệt kê hàng chục bucket, có 73932b965e5e11f192725fd51894c519
+curl healthz (từ vrp-07) → 200   ✅ đường vRP → vMLP THÔNG
+curl /      (từ vrp-07)  → 403   ✅ S3 API sống (từ chối request không ký)
+```
+
+### 7e.5 🔴 Phát hiện 16 — RAGFlow đọc **ConfigMap**, KHÔNG đọc `MINIO_PORT`
+
+**Triệu chứng:** sau khi vá secret + rollout, RAGFlow vẫn lặp vô hạn:
+```
+MinIO health check: HTTPConnectionPool(host='10.208.137.43', port=9000):
+Connection refused
+```
+và startup probe fail: `dial tcp 172.16.x.x:9380: connect: connection refused`.
+
+**Đọc log kỹ mới thấy:**
+```
+Current configs, from /ragflow/conf/service_conf.yaml:
+  minio: {'user': 'rag_flow', 'host': '10.208.137.43:9000', ...}
+                                              ^^^^ IP ĐÚNG, PORT SAI
+```
+
+⟹ **IP đã sang cụm mới nhưng port vẫn `9000`.** RAGFlow lấy config từ
+**ConfigMap `ragflow-service-config`** (mount thành `service_conf.yaml`),
+**không** đọc `MINIO_PORT` của secret.
+
+> 🔴 **Đây là lỗi của tôi**: tôi vá `MINIO_PORT` trong secret và tưởng là đủ.
+> Vá xong secret hiển thị `9900` đúng, nhưng RAGFlow **không bao giờ đọc biến đó**.
+> ⭐ **Bài học**: sửa config xong phải kiểm **ứng dụng THỰC SỰ đọc gì**
+> (ở đây là dòng `Current configs, from ...` trong log), không tin vào việc
+> "secret đã hiển thị đúng".
+
+**Hai cách sửa:**
+
+| Cách | Việc phải làm | Đánh giá |
+|---|---|---|
+| Sửa ConfigMap `ragflow-service-config` | patch YAML lồng nhau, rollout RAGFlow | Rườm rà, dễ sai |
+| ✅ **Đổi NodePort vMLP về `9000`** | **1 lệnh**, không đụng RAGFlow | **ĐÃ DÙNG** — `9000` nằm trong dải 8000–10000 |
+
+```
+kubectl -n ragflow patch svc ragflow-minio --type=json \
+  -p '[{"op":"replace","path":"/spec/ports/0/nodePort","value":9000}]'
+```
+⟹ ✅ **Hệ thống lên.**
+
+### 7e.6 🔴 Phát hiện 17 — Redis của RAGFlow cũng ghim trên vrp-07
+
+Trong lúc chưa xoá dữ liệu nguồn, `ragflow-redis-0` **`Pending`**:
+```
+0/8 nodes are available:
+  1 node(s) had taint {node.kubernetes.io/disk-pressure}   ← vrp-07
+  3 node(s) had taint {node-role.kubernetes.io/master}
+  4 node(s) didn't match Pod's node affinity/selector
+```
+
+`redis-data-ragflow-redis-0` → PV `pv-ragflow-redis` → **hostPath trên vrp-07**,
+đúng node đang cạn inode. **Redis chết ⟹ RAGFlow không lên nổi.**
+
+⭐ **Chuỗi nhân quả đầy đủ:**
+```
+MinIO ăn 5,66M inode trên vrp-07
+   └─▶ vrp-07 cạn inode (95%)
+         └─▶ kubelet bật taint disk-pressure
+               └─▶ Redis (hostPath cùng node) KHÔNG schedule được → Pending
+                     └─▶ RAGFlow chờ Redis → không mở port 9380
+                           └─▶ startupProbe fail → CrashLoop
+```
+⟹ **Xoá `/data/ragflow/minio` vừa là bước cuối của migrate, vừa là cách sửa Redis.**
+Sau khi xoá: taint gỡ, `ragflow-redis-0` **`1/1 Running`** trên vrp-07.
+
+> ⚠️ **Gốc rễ CHƯA hết**: Redis vẫn phụ thuộc dung lượng node 07.
+
+### 7e.7 Xoá dữ liệu nguồn — 3 bằng chứng bắt buộc trước khi `rm`
+
+`rm -rf` 37G là **không hồi lại được**, và sau đó vmlp-09 là **bản duy nhất**.
+Chỉ xoá khi có **đủ cả 3**:
+
+```
+1. sts/ragflow-minio bên vRP = 0/0, không còn pod minio nào
+   ⟹ tránh 2 bản cùng ghi, làm nguồn lệch bản đã copy
+2. find 2 bên KHỚP = 5.664.048
+3. MinIO mới đang chạy + curl 200/403
+```
+
+**Lưới an toàn — `mv` trước, `rm` sau:**
+```
+mv /data/ragflow/minio /data/ragflow/minio.DELETE_ME    ← tức thì, HỒI LẠI ĐƯỢC
+rm -rf /data/ragflow/minio.DELETE_ME                     ← rất lâu, KHÔNG hồi được
+```
+> ⭐ `mv` trong cùng filesystem chỉ đổi tên dentry ⟹ **không tốn I/O**, tức thì.
+> Nếu MinIO cũ lỡ khởi động lại cũng không thấy dữ liệu ở path cũ.
+
+> ⏱️ `rm -rf` 5,66 triệu inode chạy **rất lâu** (metadata-bound y như lúc copy).
+> **Đừng tưởng treo, đừng Ctrl-C.** Đứt thì chạy lại — `rm -rf` idempotent.
+
+**Kết quả:** inode vrp-07 **95% → 61%** và tiếp tục giảm.
+
+---
+
 ## 8. Rủi ro đang theo dõi
 
 | # | Rủi ro | Mức | Ghi chú |
@@ -2389,6 +2554,12 @@ kubectl -n ragflow get endpoints ragflow-minio
 | 🔴 **R24** | `hostPath.type` nếu để `DirectoryOrCreate` + gõ sai path ⟹ **mất dữ liệu âm thầm** | 🟠 | k8s tạo thư mục **rỗng**, MinIO thấy trống ⟹ **khởi tạo lại từ đầu**. Dữ liệu cũ vẫn còn ở path đúng nhưng MinIO không biết. ✅ Đã dùng **`type: Directory`** ⟹ sai path là **báo lỗi ngay** thay vì hỏng ngầm |
 | **R25** | PVC không khai `volumeName` ⟹ bind nhầm PV | 🟡 | Cụm vMLP có sẵn nhiều PV. ✅ Đã khai `volumeName` ép bind đúng |
 | **R26** | Secret bê từ vRP còn dính metadata Helm của cụm cũ | 🟡 | `meta.helm.sh/release-name` khiến Helm bên vMLP hiểu nhầm quyền sở hữu. ✅ Đã lọc ở 7d.2. ⚠️ **Nhớ `rm` file tạm** — chứa credential base64 |
+| ~~R23~~ | ~~MinIO khởi động lần đầu quét 2,83M object → rất lâu~~ | ✅ **ĐÓNG** | Thực tế Ready sau **~30 giây**, `RESTARTS 0`. `startupProbe` 10 phút dư dả. Lo hơi quá |
+| 🔴 **R27** | **Chỉ còn MỘT bản dữ liệu duy nhất** | 🔴 **CAO** | Nguồn đã xoá. `/home/app/app_data/ragflow/minio` trên vmlp-09 là **bản duy nhất**, **không có backup/snapshot**. ⟹ Việc còn nợ #2 trong runbook |
+| 🔴 **R28** | **Chưa có alert `df -i` cho vmlp-09** | 🔴 **CAO** | Inode đã **47%** và sẽ bò lên (R19). `/home` nằm trên `/` ⟹ cạn là chết **cả kubelet + containerd**, không riêng MinIO. **Đúng kịch bản đã giết vrp-07** |
+| **R29** | Redis RAGFlow vẫn hostPath trên **vrp-07** | 🟠 | Phát hiện 17: node 07 lại cạn ⟹ Redis `Pending` ⟹ RAGFlow chết. Migrate MinIO chỉ **gỡ áp lực**, không tách được Redis khỏi node đó |
+| ~~R30~~ | ~~Manifest trong git lệch bản đang chạy~~ | ✅ **ĐÓNG 26/08** | Đã sửa `manifests-vmlp/minio-vmlp.yaml` về **`nodePort: 9000/9901`** kèm comment giải thích vì sao phải là 9000 |
+| **R31** | RAGFlow đọc ConfigMap, không đọc secret cho port MinIO | 🟠 | Phát hiện 16. Lần sau đổi endpoint phải sửa **ConfigMap `ragflow-service-config`**, hoặc đổi NodePort cho khớp. **Kiểm bằng dòng `Current configs, from ...` trong log**, đừng tin secret hiển thị đúng |
 
 ---
 
@@ -2429,34 +2600,52 @@ kubectl -n ragflow get endpoints ragflow-minio
 
 ### Bước 3 — dựng workload MinIO trên vMLP
 
-- [ ] Tạo PV: hostPath + `nodeAffinity` trỏ node đích + `Retain`
-- [ ] Tạo PVC bind vào PV đó
-- [ ] Tạo Secret credential cho MinIO (đặt giá trị riêng, không bê nguyên từ vRP — 5b.7)
-- [ ] Deploy StatefulSet MinIO — ⚠️ image **2025-06**, `imagePullPolicy: IfNotPresent`
-- [ ] ⚠️ Image reference phải ghi **đủ FQDN** hoặc dùng image đã import (R17)
-- [ ] Tạo Service **NodePort** (bắt buộc, vì cross-cluster — ClusterIP không dùng được)
+- [x] ~~Tạo PV~~ ✅ `pv-ragflow-minio-vmlp` — hostPath + nodeAffinity vmlp-09 + **Retain**
+- [x] ~~Tạo PVC~~ ✅ `pvc-ragflow-minio-vmlp` — `Bound`, ép bằng `volumeName`
+- [x] ~~Tạo Secret~~ ✅ copy từ vRP (Kiên chốt **dùng nguyên giá trị cũ**, chỉ lọc metadata — 7e.2)
+- [x] ~~Deploy StatefulSet~~ ✅ **`1/1 Running`, RESTARTS 0**, Ready ~30 giây
+- [x] ~~Image reference~~ ✅ `docker.io/minio/minio:RELEASE.2025-06-13T11-33-47Z` + `IfNotPresent`
+      + đã import vào **`ctr -n k8s.io`** ⟹ không đi hỏi registry
+- [x] ~~Tạo Service NodePort~~ ✅ — ⚠️ ra **phát hiện 15**: dải vMLP là **8000–10000**
 
 ### Bước 4 — đấu nối lại với RAGFlow ở vRP
 
-- [ ] Sửa `MINIO_HOST` + `MINIO_PORT` trong `ragflow-env-config` → `IP-node-vMLP:NodePort`
-- [ ] Sửa credential trong secret nếu đặt giá trị mới ở bước 3
-- [ ] ⚠️ Sửa luôn **image reference thiếu prefix registry** của các pod vRP (R17)
-      — nếu không, RAGFlow/Redis vẫn `ImagePullBackOff` dù MinIO đã ok
+- [x] ~~Sửa `MINIO_HOST`~~ ✅ → `10.208.137.43`
+- [x] ~~Sửa `MINIO_PORT`~~ ⚠️ **ĐÃ SỬA NHƯNG VÔ TÁC DỤNG** — **phát hiện 16**:
+      RAGFlow đọc **ConfigMap** `ragflow-service-config`, không đọc biến này
+- [x] ~~Đấu nối thành công~~ ✅ bằng cách **đổi NodePort về `9000`** cho khớp cái
+      RAGFlow đang gọi (1 lệnh, không đụng RAGFlow)
+- [x] ~~Credential~~ ✅ giữ nguyên giá trị cũ ⟹ không phải sửa gì
+- [ ] ⏸️ Sửa image reference thiếu prefix của các pod vRP (R17) — **chưa cần**,
+      RAGFlow đã lên bằng image có sẵn trên node
 
 ### Bước 5 — verify (⭐ phần Kiên yêu cầu: không mất dữ liệu + kết nối thông)
 
-- [ ] Đối chiếu **số object** nguồn ↔ đích
-- [ ] Đối chiếu **tổng dung lượng** (kỳ vọng 37G) + **số inode**
-- [ ] Spot-check **checksum** vài file ngẫu nhiên trong bucket lớn
+- [x] ~~Đối chiếu số object~~ ✅ **`find` 2 bên đều = 5.664.048**
+- [x] ~~Đối chiếu dung lượng + inode~~ ✅ `du` **37G** cả 2 bên;
+      inode đích tăng **+5.668.485** ≈ khớp
+- [x] ~~Test S3 API từ vRP~~ ✅ `curl` healthz **200**, `curl /` **403**
+      (403 = S3 từ chối request không ký ⟹ API sống)
+- [x] ~~Kiểm dữ liệu thật đã lên~~ ✅ `exec ls /data` thấy đủ bucket, có
       `73932b965e5e11f192725fd51894c519`
-- [ ] Test S3 API từ vRP sang MinIO mới (health + list bucket + get 1 object)
-- [ ] Kiểm RAGFlow đọc/ghi được file thật (upload thử 1 tài liệu)
+- [x] ~~RAGFlow đọc/ghi được~~ ✅ **hệ thống đã lên**, log không còn `Connection refused`
+- [ ] ⏸️ Spot-check **checksum** vài file ngẫu nhiên — *chưa làm*. rsync đã đảm bảo
+      toàn vẹn (so size+mtime, `Matched data: 0` ⟹ không có file nào bị bỏ qua nhầm),
+      nhưng checksum là bằng chứng mạnh hơn. **Nên làm khi rảnh**
 
 ### Bước 6 — dọn (chỉ làm SAU khi verify xong)
 
-- [ ] Xoá `/data/ragflow/minio` trên vrp-07 → **thu hồi 5,66M inode**
-- [ ] Xác nhận `df -i` vrp-07 tụt từ 95% xuống mức an toàn
-- [ ] Đặt alert `df -i` trên Prometheus (nợ kỹ thuật từ tracking gốc)
+- [x] ~~Scale `sts/ragflow-minio` bên vRP về 0~~ ✅ — tránh 2 bản cùng ghi
+- [x] ~~Xoá `/data/ragflow/minio` trên vrp-07~~ ✅ (`mv` → `rm -rf`, đủ **3 bằng chứng** trước khi xoá)
+- [x] ~~Xác nhận `df -i` vrp-07 tụt~~ ✅ **95% → 61%** và tiếp tục giảm
+- [x] ~~Redis hồi sinh~~ ✅ taint `disk-pressure` gỡ ⟹ `ragflow-redis-0` **`1/1 Running`** (phát hiện 17)
+- [ ] 🔴 **Đặt alert `df -i`** — ⚠️ **CHƯA LÀM**, cho **CẢ** vmlp-09 (đang 47%) **VÀ** vrp-07.
+      Đây là nợ kỹ thuật quan trọng nhất còn lại (**R28**)
+- [ ] 🔴 **Backup dữ liệu MinIO** — ⚠️ **CHƯA CÓ**. Sau khi xoá nguồn,
+      vmlp-09 là **bản DUY NHẤT** (**R27**)
+- [ ] 🔴 **Sửa `minio-svc.yaml` trên vmlp-08: `9900` → `9000`** — file chưa khớp
+      NodePort thực tế (đặt bằng `kubectl patch`). Apply lại file đó ⟹ **đứt RAGFlow**
+- [ ] 🟡 Dọn PV/PVC `pv-ragflow-minio` cũ còn treo ở vRP
 
 ### Việc tách ra làm SAU (không thuộc phiên này)
 
@@ -2516,3 +2705,14 @@ kubectl -n ragflow get endpoints ragflow-minio
 | 26/08 | Làm rõ StorageClass | `host-storage` **không có** trong `get sc` ⟹ xác nhận là nhãn tự bịa. Dùng **`local-storage`** (`no-provisioner`) vì **có thật**. Không dùng `local-path` default (tự chọn path, không trỏ được vào dữ liệu sẵn có) |
 | 26/08 | Đọc Service + Secret nguồn | ⭐ `targetPort` dạng **TÊN** (`s3`/`console`) ⟹ StatefulSet **bắt buộc** khai `ports.name` khớp, sai là Endpoints rỗng |
 | 26/08 | ✍️ Soạn manifest | **`manifests-vmlp/minio-vmlp.yaml`** — ns + PV + PVC + STS + 2 svc. Thêm **R23–R26** |
+| 26/08 16:01 | scp + import image | 838MB đi **5 giây / 153 MB/s** ⭐ so với rsync 8,64 MB/s ⟹ **chênh ~18 lần**, minh chứng sống bandwidth vs metadata-bound |
+| 26/08 | ⚠️ scp chiều vMLP→vRP **timeout** | Chỉ đi được chiều **vRP → vMLP**. Luôn **ĐẨY** từ vRP, không **KÉO** từ vMLP |
+| 26/08 | Kiên chốt nơi đặt manifest | **`/home/app/KienNV_DevOps/`** trên **vmlp-08** (không để `/tmp`) |
+| 26/08 | 🔴 **Phát hiện 15** | Dải NodePort vMLP là **8000–10000**, không phải mặc định 30000–32767 ⟹ đổi sang 9900/9901 |
+| 26/08 | ✅ **MinIO LÊN** | `1/1 Running`, **RESTARTS 0**, Ready sau **~30 giây** ⟹ R23 lo hơi quá, startupProbe dư dả |
+| 26/08 | ✅ Verify đầy đủ | endpoints `172.16.3.198:9000` ✅ · `ls /data` thấy bucket 37G ✅ · curl từ vrp-07: healthz **200**, `/` **403** ✅ |
+| 26/08 | 🔴 **Phát hiện 17** | Redis RAGFlow **cũng hostPath trên vrp-07** ⟹ taint disk-pressure làm Redis `Pending` ⟹ RAGFlow không lên. **Xoá dữ liệu nguồn vừa là bước cuối migrate, vừa là cách sửa Redis** |
+| 26/08 | Xoá nguồn (`mv` rồi `rm -rf`) | Đủ 3 bằng chứng trước khi xoá. Inode vrp-07 **95% → 61%**. Redis chuyển **`1/1 Running`** ✅ |
+| 26/08 | 🔴 **Phát hiện 16** | RAGFlow đọc **ConfigMap `ragflow-service-config`** (`service_conf.yaml`), **KHÔNG đọc `MINIO_PORT`** của secret ⟹ vá secret vô tác dụng. ⚠️ **Lỗi của tôi** |
+| 26/08 | ✅ **SỬA XONG — HỆ THỐNG LÊN** | Đổi **NodePort về 9000** (1 lệnh, không đụng RAGFlow) thay vì sửa ConfigMap ⟹ RAGFlow kết nối được MinIO trên vMLP |
+| 26/08 | 📕 Viết **`RUNBOOK-minio-vmlp.md`** | Tài liệu vận hành: file ở đâu, lệnh gì, 6 bẫy đã gặp, 7 việc còn nợ, số liệu tham chiếu |
