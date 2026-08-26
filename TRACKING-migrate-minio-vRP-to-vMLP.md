@@ -18,6 +18,17 @@ Từ phiên này trở đi **bắt buộc** dùng prefix khi nhắc tên node, t
 
 Kiên **ssh trực tiếp được vào từng node của cả 2 cụm**.
 
+### 🔴 Khác biệt QUAN TRỌNG về đăng nhập (phát hiện 26/08 — xem 7c.-1)
+
+| Cụm | ssh thẳng `root@`? | Cách vào root | sudo của user thường |
+|---|---|---|---|
+| **vRP** | ✅ **được** | ssh `root@<node>` | — |
+| **vMLP** | ❌ **BỊ CHẶN** (`PermitRootLogin no`) | ssh `vt_admin@<node>` → `su -` (cần mật khẩu root) | `vt_admin` có sudo nhưng **ĐÒI MẬT KHẨU** |
+
+> ⚠️ **Hệ quả**: mọi lệnh **từ xa** chạy vào vMLP (`rsync`, `scp`, `ssh ... 'cmd'`)
+> **phải dùng `vt_admin@`**, và **không thể** dựa vào `sudo` trong phiên không TTY.
+> Đây là nguồn gốc của 3 lần sửa lệnh rsync — xem 7c.-1.
+
 ---
 
 ## 1. Mục tiêu & phạm vi
@@ -1264,6 +1275,94 @@ df -h /home
 > ✅ **Kiên chốt 26/08**: node đích **vmlp-09** (`10.208.137.43`),
 > path **`/home/app/app_data/ragflow/minio`**
 
+### 🔴 7c.-1 PHÁT HIỆN 10–12 — chuỗi 3 lỗi liên tiếp của lệnh rsync (26/08)
+
+> Lệnh rsync phải sửa **3 lần** mới chạy được. Ghi lại đầy đủ vì đây là
+> **bài học về mô hình quyền giữa 2 cụm**, sẽ gặp lại ở mọi lần copy sau này.
+
+#### Phát hiện 10 — vmlp-09 **CHẶN ssh trực tiếp bằng `root`**
+
+```
+$ rsync ... root@10.208.137.43:...
+root@10.208.137.43's password:
+Permission denied, please try again.
+```
+Không phải sai mật khẩu — sshd cấu hình **`PermitRootLogin no`**.
+
+**Mô hình đăng nhập thật của vMLP:**
+```
+ssh vt_admin@<node>   →   su -   →   root
+     (user duy nhất          (cần mật khẩu root)
+      ssh vào được)
+```
+⚠️ **Khác hẳn vRP** (ssh thẳng `root@` được). Đây là điểm phân biệt 2 cụm,
+bổ sung vào §0.
+
+#### Phát hiện 11 — `vt_admin` có sudo nhưng **ĐÒI MẬT KHẨU**
+
+```
+$ ssh vt_admin@10.208.137.43 'sudo -n true && echo OK || echo CAN_MAT_KHAU'
+sudo: a password is required
+SUDO_CAN_MAT_KHAU
+```
+
+⟹ **Giết luôn phương án `--rsync-path="sudo rsync"`**:
+
+```
+--rsync-path="sudo rsync"  làm gì?
+│  rsync chạy Ở HAI ĐẦU. Khi gõ trên vrp-07, nó ssh sang đích rồi
+│  TỰ KHỞI ĐỘNG một tiến trình rsync bên kia làm phía NHẬN.
+│  Mặc định lệnh gọi bên đích là `rsync`.
+│  --rsync-path="sudo rsync" = đổi lệnh đó thành `sudo rsync`
+│  ⟹ tiến trình nhận chạy quyền root ⟹ ghi được file root:root
+│
+❌ VÌ SAO KHÔNG DÙNG ĐƯỢC Ở ĐÂY:
+   phiên ssh của rsync KHÔNG CÓ TTY ⟹ sudo không có chỗ hỏi mật khẩu
+   ⟹ chết ngay ("sudo: no tty present") hoặc treo
+   ⟹ KHÔNG thể gõ tay vì rsync tự gọi lệnh đó
+
+❌ `sudo -S` (đọc mật khẩu từ stdin) cũng KHÔNG cứu được:
+   stdin của rsync đích CHÍNH LÀ luồng dữ liệu giao thức rsync
+   ⟹ nhét mật khẩu vào đó = hỏng protocol
+```
+
+Còn 1 cách nếu bắt buộc: cấp NOPASSWD **phạm vi hẹp đúng 1 binary**
+(`/etc/sudoers.d/rsync-minio-migrate` chứa
+`vt_admin ALL=(root) NOPASSWD: /usr/bin/rsync`, `chmod 440`, `visudo -c`).
+⟹ **Kiên không dùng**, đã chọn hướng bỏ `-o -g` — đơn giản hơn, không đụng sudoers.
+
+#### Phát hiện 12 — `Permission denied` nằm ở **THƯ MỤC CHA**, không phải đích
+
+```
+$ rsync -rlptDHAX ... vt_admin@10.208.137.43:/home/app/app_data/ragflow/minio/
+rsync: ERROR: cannot stat destination "/home/app/app_data/ragflow/minio/":
+       Permission denied (13)
+```
+…**dù thư mục đích đã `chown vt_admin:vt_admin`**.
+
+Nguyên nhân: `namei -l` cho thấy `/home/app`, `/home/app/app_data`,
+`/home/app/app_data/ragflow` đều là **`drwx------` (0700) thuộc `app`**.
+Kernel kiểm quyền **execute trên MỌI thư mục dọc đường** ⟹ vt_admin
+không đi xuyên qua được, dù đích cuối đã thuộc về nó.
+
+> 🔴 **Chính lệnh `chown app:app` ở 7c.1 (do tôi đưa) đã tạo ra lỗi này.**
+> Lúc soạn 7c.1 tôi tính cho MinIO đọc, chưa lường việc rsync phải vào bằng vt_admin.
+
+**Cách sửa** → 7c.1b: `chmod o+x` 3 thư mục cha (chỉ cho *đi xuyên qua*,
+không cho *liệt kê* — tác động tối thiểu).
+
+#### 🎓 Bài học rút ra (áp dụng cho mọi lần copy vMLP về sau)
+
+| # | Bài học |
+|---|---|
+| 1 | **vMLP không cho ssh root.** Mọi lệnh từ xa phải qua `vt_admin`; muốn root thì `su -` tại chỗ |
+| 2 | **`-a` của rsync chứa `-o -g`** — hai cờ này **cần root BÊN NHẬN**. Copy xuyên máy mà không có root ở đích ⟹ dùng `-rlptD` rồi `chown -R` sau |
+| 3 | **Debug `Permission denied` phải dùng `namei -l`**, không phải `ls -ld`. `ls -ld` chỉ thấy đích cuối, không thấy thư mục cha đang chặn |
+| 4 | Trên **thư mục**: `x` = đi xuyên qua, `r` = liệt kê nội dung. Cấp `o+x` (không `o+r`) là cách mở đường ít rủi ro nhất |
+| 5 | **Giữ owner uid không phải là yêu cầu bất biến.** Data chỉ cần đúng *nội dung + cấu trúc*; owner sửa sau bằng 1 lệnh cục bộ, rẻ hơn nhiều so với vật lộn sudo/sshd |
+
+---
+
 ### 7c.0 ⚠️ Kiểm tra TRƯỚC KHI CHẠY — 3 điều phải xác minh
 
 Chạy trên **vmlp-09** (`10.208.137.43`):
@@ -1364,9 +1463,12 @@ Lý do: `-a` (chứa `-o`/`-g`) cố **giữ owner `root:root`** ở đích. Nh�
 bằng `app` (uid 1001, không sudo) thì **không có quyền `chown` sang uid 0**
 ⟹ rsync báo hàng loạt `failed to set ownership`, hoặc **âm thầm đổi owner sang `app`**.
 
-✅ **Sửa: dùng `root@10.208.137.43`.**
+~~✅ Sửa: dùng `root@10.208.137.43`.~~
+🔴 **CÁCH SỬA NÀY CŨNG SAI** — vmlp-09 chặn `PermitRootLogin` (phát hiện 10).
+✅ **Cách sửa CUỐI CÙNG**: bỏ `-o -g` ⟹ **`-rlptDHAX` + `vt_admin@`**, rồi
+`chown -R root:root` sau (7c.3b). Xem 7c.-1.
 
-⭐ **Và giữ nguyên owner `root:root` là ĐÚNG, đừng đổi sang `app`:**
+⭐ **Nhưng KẾT LUẬN dưới đây vẫn ĐÚNG — đích PHẢI về `root:root`:**
 - StatefulSet MinIO ở vRP chạy `securityContext: {}` ⟹ mặc định **uid 0**
 - Tenant mẫu ở vMLP cũng `runAsUser: 0, runAsGroup: 0, fsGroup: 0` (5c.6)
 ⟹ Cả 2 cụm đều chạy MinIO bằng root ⟹ dữ liệu thuộc root là khớp.
@@ -1378,16 +1480,83 @@ bằng `app` (uid 1001, không sudo) thì **không có quyền `chown` sang uid 
 
 ### 7c.1 Tạo thư mục đích trên vmlp-09 — user **`root`**
 
-> ✅ Đã cập nhật theo kết quả đo: Kiên là **root** ⟹ **bỏ `sudo`**.
+> ✅ Kiên là **root** (qua `vt_admin` rồi `su -`) ⟹ **bỏ `sudo`**.
+> 🔴 **ĐÃ CHẠY 26/08 nhưng CHƯA ĐỦ** — phải bổ sung 2 lệnh ở 7c.1b vì
+> `chown app:app` bên dưới đã **tự tay tạo ra** lỗi `Permission denied` (phát hiện 12).
 
+**Đã chạy (26/08 14:14):**
 ```
 mkdir -p /home/app/app_data/ragflow/minio
 chown app:app /home/app/app_data/ragflow
 ls -ld /home/app/app_data/ragflow /home/app/app_data/ragflow/minio
 ```
 
+#### 🔴 7c.1b BẮT BUỘC BỔ SUNG — mở đường cho `vt_admin` (phát hiện 12)
+
+Vẫn trên **vmlp-09**, user **`root`**:
+```
+namei -l /home/app/app_data/ragflow/minio
+chown vt_admin:vt_admin /home/app/app_data/ragflow/minio
+chmod o+x /home/app /home/app/app_data /home/app/app_data/ragflow
+namei -l /home/app/app_data/ragflow/minio
+```
+
+Xác nhận từ **vrp-07** (`root`) rằng đã ghi được:
+```
+ssh vt_admin@10.208.137.43 'ls -ld /home/app/app_data/ragflow/minio && touch /home/app/app_data/ragflow/minio/.wtest && rm /home/app/app_data/ragflow/minio/.wtest && echo WRITE_OK'
+```
+
 <details>
-<summary>Giải nghĩa (bấm để mở)</summary>
+<summary>⭐ Giải nghĩa 7c.1b — vì sao PHẢI có bước này (bấm để mở)</summary>
+
+```
+namei -l <đường dẫn>
+│ └─ -l  long: in quyền + owner của TỪNG THÀNH PHẦN trên đường dẫn
+│   ⭐ Đây là công cụ ĐÚNG để debug "Permission denied" —
+│      `ls -ld` chỉ xem được ĐÍCH CUỐI, không thấy thư mục CHA chặn ở đâu
+│
+chown vt_admin:vt_admin /home/app/app_data/ragflow/minio
+│   ⟹ rsync đăng nhập bằng vt_admin nên nó phải SỞ HỮU thư mục đích để ghi
+│   ⚠️ KHÔNG -R: bên trong sẽ có 5,66 triệu inode. Lúc này thư mục còn RỖNG
+│      nên chown 1 thư mục là đủ và tức thì
+│
+chmod o+x /home/app /home/app/app_data /home/app/app_data/ragflow
+│ └─ o+x  = others + execute
+│   ⭐⭐ VÌ SAO CẦN: để chạm tới /home/app/app_data/ragflow/minio,
+│      kernel kiểm quyền EXECUTE trên MỌI thư mục dọc đường:
+│         /  →  /home  →  /home/app  →  /home/app/app_data
+│              →  /home/app/app_data/ragflow  →  minio
+│      Cả 3 thư mục giữa đang là drwx------ (0700) THUỘC app
+│      ⟹ vt_admin KHÔNG phải app, KHÔNG thuộc group app
+│      ⟹ không đi XUYÊN QUA được, dù đích cuối đã thuộc về nó
+│
+│   ⭐ Trên THƯ MỤC, x và r nghĩa KHÁC NHAU:
+│      ├─ x (execute/search) = được ĐI XUYÊN QUA, truy cập file nếu biết tên
+│      └─ r (read)           = được LIỆT KÊ danh sách nội dung
+│      ⟹ chỉ cấp o+x = cho đi qua, KHÔNG cho xem có gì bên trong
+│         ⟹ tác động TỐI THIỂU, an toàn hơn o+rx
+```
+
+**Kết quả đo được (26/08 14:33) — `namei -l` TRƯỚC và SAU:**
+```
+TRƯỚC chmod                          SAU chmod
+─────────────────────────────        ─────────────────────────────
+dr-xr-xr-x root  root  /             dr-xr-xr-x root  root  /
+drwxr-xr-x root  root  home          drwxr-xr-x root  root  home
+drwx------ app   app   app      ❌   drwx-----x app   app   app      ✅
+drwx------ app   app   app_data ❌   drwx-----x app   app   app_data ✅
+drwx------ app   app   ragflow  ❌   drwx-----x app   app   ragflow  ✅
+drwx------ vt_admin ... minio        drwx------ vt_admin ... minio
+```
+⟹ sau đó `ssh ... touch` trả về **`WRITE_OK`** ✅
+
+⚠️ **Ghi nhớ về sau**: khi dựng PV/StatefulSet, MinIO chạy **uid 0** nên bit `o+x`
+này không ảnh hưởng gì tới nó. Nhưng nếu sau này đổi sang chạy uid khác thì
+phải rà lại toàn bộ đường dẫn bằng `namei -l`.
+</details>
+
+<details>
+<summary>Giải nghĩa 7c.1 gốc (bấm để mở)</summary>
 
 ```
 mkdir -p /home/app/app_data/ragflow/minio
@@ -1398,12 +1567,13 @@ mkdir -p /home/app/app_data/ragflow/minio
 │
 chown app:app /home/app/app_data/ragflow
 │   ⟹ thư mục CHA 'ragflow' để app:app cho khớp bố cục /home/app.
-│   ⚠️ CHỈ chown thư mục cha, KHÔNG chown xuống 'minio'.
-│      Thư mục 'minio' bên trong sẽ do rsync mang owner root:root
-│      từ nguồn sang — ĐÚNG như mong muốn (MinIO chạy uid 0).
-│   ⚠️ TUYỆT ĐỐI KHÔNG dùng chown -R: thư mục sẽ chứa 5,66 TRIỆU inode,
-│      lệnh đệ quy sẽ chạy rất lâu và tạo tải I/O lớn — mà lại vô ích
-│      vì rsync đã set owner đúng rồi
+│   🔴 CHÍNH LỆNH NÀY ĐÃ GÂY RA LỖI Permission denied (phát hiện 12):
+│      thư mục thành 0700 thuộc app ⟹ vt_admin không đi xuyên qua được.
+│      ⟹ PHẢI chạy tiếp 7c.1b để mở bit o+x
+│   ❌ Ghi chú cũ "rsync sẽ mang owner root:root từ nguồn sang" ĐÃ SAI —
+│      đã bỏ -o -g nên rsync KHÔNG set owner. Xem 7c.3b: chown thủ công sau
+│   ⚠️ TUYỆT ĐỐI KHÔNG dùng chown -R Ở BƯỚC NÀY: sau rsync thư mục sẽ chứa
+│      5,66 TRIỆU inode. (Riêng 7c.3b buộc phải -R, chạy đúng 1 lần)
 │
 ls -ld <2 đường dẫn>   → xác nhận cả thư mục cha và con đã tạo đúng
     └─ -d  chỉ xem thông tin THƯ MỤC, không liệt kê nội dung
@@ -1425,20 +1595,250 @@ không cần thiết trên thư mục MinIO.
 
 ### 7c.2 ⭐ rsync 37G — chặng chính
 
-> 🔴 **ĐÃ SỬA `app@` → `root@`** theo phát hiện 9. Dùng bản dưới đây, **không dùng bản cũ**.
+> 🔴🔴 **BẢN CUỐI CÙNG — đã sửa 2 lần.** Lịch sử sai để không lặp lại:
+> - Bản 1: `-aHAX ... root@` → **chết**, sshd vmlp-09 chặn `PermitRootLogin` (phát hiện 10)
+> - Bản 2: `-aHAX ... vt_admin@` → **chết**, `-a` gồm `-o -g` cần root bên nhận (phát hiện 11)
+> - ✅ Bản 3 (đang dùng): **`-rlptDHAX ... vt_admin@`** — bỏ `-o -g`, chown lại sau
 
 Chạy trên **vrp-07** (`10.208.137.54`, user `root`):
 
 **Chạy thử trước (dry-run) — không copy gì, chỉ xem sẽ làm gì:**
 ```
-rsync -aHAX --numeric-ids --dry-run --stats /data/ragflow/minio/ root@10.208.137.43:/home/app/app_data/ragflow/minio/
+rsync -rlptDHAX --numeric-ids --dry-run --stats /data/ragflow/minio/ vt_admin@10.208.137.43:/home/app/app_data/ragflow/minio/
 ```
 
 **Chạy thật:**
 ```
-screen -S minio-rsync
-rsync -aHAX --numeric-ids --info=progress2 --partial /data/ragflow/minio/ root@10.208.137.43:/home/app/app_data/ragflow/minio/
+rsync -rlptDHAX --numeric-ids --info=progress2 --partial /data/ragflow/minio/ vt_admin@10.208.137.43:/home/app/app_data/ragflow/minio/
 ```
+
+Theo dõi inode bên đích — **vmlp-09** (`root`), tab riêng:
+```
+watch -n 60 'df -i /home | tail -1'
+```
+
+> ⚠️ **vrp-07 KHÔNG có `screen` và KHÔNG có `tmux`** (đo 26/08) — chỉ có `nohup`, `setsid`.
+> Kiên chốt: chạy trực tiếp, tự canh. Đứt phiên thì **chạy lại y hệt lệnh trên**,
+> rsync bỏ qua phần đã xong (idempotent) — xem 7c.2c.
+
+#### ✅ Kết quả dry-run (26/08 14:46) — KHỚP HOÀN TOÀN
+
+```
+Number of files:                 5,664,048  (reg: 2,831,983, dir: 2,832,065)
+Number of created files:         5,664,047  (reg: 2,831,983, dir: 2,832,064)
+Number of deleted files:         0
+Number of regular files transferred: 2,831,983
+Total file size:            21,845,814,562 bytes
+Total transferred file size: 21,845,814,562 bytes
+Matched data: 0 bytes      File list size: 84,145,065
+sent 200,732,477  received 19,869,374  →  257,561 bytes/sec  (DRY RUN)
+```
+
+| Chỉ số | Giá trị | Nhận định |
+|---|---|---|
+| `Number of files` | **5.664.048** | ✅ khớp **tuyệt đối** con số đã đo ⟹ đường dẫn + dấu `/` ĐÚNG, không lồng thừa cấp |
+| `created files` | 5.664.047 | ít hơn đúng **1** = thư mục gốc `minio/` đã tồn tại ⟹ hợp lý |
+| `deleted files` | 0 | ✅ đích sạch, không đè lên dữ liệu nào |
+| reg / dir | 2.831.983 / 2.832.065 | ⭐ **tỉ lệ ~1:1** — mỗi object MinIO nằm trong 1 thư mục riêng |
+| `Total file size` | 21.845.814.562 B ≈ **20,3 GiB** | ⚠️ **KHÁC** `du -sh` = 37G — xem 7c.2d |
+
+> ⭐ **Tỉ lệ file:thư mục ~1:1 chính là chân dung của sự cố node 07.**
+> Không phải "nhiều dữ liệu" mà là "nhiều **mục**" — mỗi object ăn inode cho cả
+> thư mục lẫn file bên trong.
+
+#### ⚠️ 7c.2d — Vì sao `du` báo 37G mà rsync báo 20,3 GiB?
+
+**Không mâu thuẫn — hai công cụ đo hai thứ khác nhau:**
+
+```
+du -sh            → đếm BLOCK ĐÃ CẤP PHÁT trên đĩa      = 37 G
+rsync Total size  → đếm KÍCH THƯỚC LOGIC của nội dung   = 20,3 GiB
+                                                   chênh ≈ 17 G
+```
+
+Phần chênh ~17G là **slack space**, sinh ra từ 2 nguồn:
+
+```
+1. Làm tròn block cho FILE
+   2.831.983 file × trung bình 7,7 KB
+   ext4 cấp phát theo block 4 KB ⟹ file 7,7 KB chiếm trọn 2 block = 8 KB
+   ⟹ mỗi file phí ~0,3 KB, nhưng nhân 2,83 triệu lần
+
+2. Bản thân THƯ MỤC cũng chiếm chỗ
+   2.832.065 thư mục × 4 KB (1 block tối thiểu mỗi thư mục)
+   ≈ 11,3 GB  ← chỉ để CHỨA TÊN, không chứa dữ liệu nào
+```
+
+**⟹ Gần một nửa dung lượng đĩa đang bị tiêu cho việc "có nhiều file",
+không phải cho nội dung.**
+
+Hệ quả thực tế:
+- Truyền qua mạng: chỉ ~**20,3 GiB** (rsync gửi nội dung logic)
+- Chiếm chỗ ở đích: vẫn ~**37G** (đích cũng ext4 block 4K, tái tạo y hệt slack)
+- Ngân sách 140G trống ⟹ vẫn thừa
+
+---
+
+#### 🎓 7c.2e — **BANDWIDTH-BOUND vs METADATA-BOUND** (Kiên hỏi 26/08)
+
+> Vì sao `3.03MB/s` nghe thảm hại nhưng **không phải dấu hiệu hỏng**, và vì sao
+> **không được dùng MB/s để đo tiến độ** của job này.
+
+Hai khái niệm này trả lời cùng một câu hỏi: **cái gì đang là nút cổ chai?**
+— thứ mà nếu tăng nó lên thì job nhanh hơn, còn tăng mọi thứ khác thì vô ích.
+
+##### Bandwidth-bound = nghẽn ở ĐƯỜNG TRUYỀN
+
+Hình dung copy **1 file 20GB**:
+```
+đọc tuần tự ──► đầu đọc chạy một mạch, không seek
+             ──► dữ liệu chảy đều qua dây
+             ──► mạng 1Gbps ⟹ trần ~110 MB/s, và bạn THẤY ĐÚNG con số đó
+             ──► nâng lên 10Gbps ⟹ nhanh gấp 10
+⟹ MB/s phản ánh TRUNG THỰC tiến độ
+```
+
+##### Metadata-bound = nghẽn ở THAO TÁC INODE — **đây là job của chúng ta**
+
+20GB nhưng chia thành **2,83 triệu file + 2,83 triệu thư mục**.
+Với **mỗi một file bé ~7,7 KB**, hệ thống phải làm chừng này việc:
+
+```
+PHÍA NGUỒN (vrp-07)
+├─ lstat()          đọc metadata: size, mtime, permission
+├─ open()
+├─ read() 7,7 KB    ← phần "dữ liệu thật" DUY NHẤT
+└─ close()
+
+PHÍA ĐÍCH (vmlp-09)
+├─ cấp phát INODE mới   tìm inode trống trong bảng + đánh dấu vào bitmap
+├─ tạo DENTRY           thêm mục vào thư mục cha, có thể phải ghi lại block thư mục
+├─ cấp block dữ liệu + ghi 7,7 KB
+├─ utime() + chmod()    set metadata
+└─ ghi JOURNAL ext4     đảm bảo an toàn khi mất điện — BẮT BUỘC CHỜ ĐĨA XÁC NHẬN
+
+⟹ ~chục syscall + vài lượt ghi đĩa   CHO 7,7 KB DỮ LIỆU
+⟹ phần "đẩy 7,7 KB qua dây" là chuyện VẶT NHẤT trong danh sách
+⟹ nhân lên 2,83 TRIỆU lần
+```
+
+##### Vì sao con số MB/s trông thảm hại
+
+`MB/s` là phép chia: **byte truyền được ÷ thời gian**.
+Nhưng thời gian phần lớn **không** tiêu vào việc truyền byte — nó tiêu vào việc
+**chờ đĩa xác nhận đã tạo xong inode và ghi xong journal**.
+⟹ mẫu số bị thổi phồng bởi công việc không sinh ra byte nào ⟹ thương số nhỏ.
+
+| Kịch bản | Dữ liệu | Số file | Thời gian thực tế |
+|---|---|---|---|
+| 1 file lớn | 20 GB | 1 | vài phút |
+| **Job này** | 20 GB | **5,66 M** | **hàng giờ** |
+
+Cùng 20GB. Khác nhau ở **số lần phải chạm vào metadata**.
+
+##### Vì sao ghi metadata chậm hơn ghi dữ liệu
+
+```
+Ghi 20GB tuần tự  → ghi LIÊN TIẾP. Đĩa (kể cả SSD) xử lý rất tốt:
+                     controller gộp lệnh, ghi thành dải lớn
+
+Tạo 1 inode       → ghi RẢI RÁC, đụng 4–5 vùng CÁCH XA NHAU trên đĩa:
+                     ├─ bảng inode      (một chỗ)
+                     ├─ bitmap inode    (chỗ khác)
+                     ├─ block thư mục   (chỗ khác nữa)
+                     └─ journal         (chỗ khác nữa)
+                     + fsync/journal barrier: BUỘC chờ hoàn tất THẬT SỰ,
+                       không được đệm lại
+```
+
+Thêm một lớp nữa: **`/dev/vda1`** — tên `vda` = **virtio block device** ⟹ máy ảo.
+Mỗi thao tác cộng thêm overhead qua hypervisor xuống storage backend.
+
+##### ⭐ 3 hệ quả thực tế
+
+1. **Nâng mạng KHÔNG cứu được.** 10Gbps thay vì 1Gbps ⟹ job này gần như không
+   nhanh hơn. Nút cổ chai không nằm ở đó.
+
+2. **Chỉ số theo dõi phải là `xfr#`, KHÔNG phải MB/s.** MB/s đang đo sai thứ.
+   `xfr#` đếm file đã xong — đơn vị công việc thật. Xem 7c.2f.
+
+3. 🔴 **Metadata-bound chính là CÙNG MỘT nguyên nhân đã giết node 07.**
+   ```
+   Inode cạn        vì mỗi object MinIO ăn ~3 inode
+   Job copy chậm    vì phải TẠO 5,66 triệu inode
+   du 37G ≠ 20,3GiB vì 2,83 triệu thư mục mỗi cái chiếm 4KB
+
+   ⟹ BA hiện tượng, MỘT sự thật:
+      MinIO lưu hàng triệu object bé làm chi phí dồn hết vào
+      METADATA của filesystem, KHÔNG vào dung lượng.
+   ```
+   **Bài học mang sang:** chuyển sang vmlp-09 **mua thêm thời gian**
+   (bảng inode 13,1M so với 6,55M) nhưng **KHÔNG sửa nguyên nhân**.
+   Muốn sửa thật phải **giảm số object**: gộp file nhỏ, đổi chiến lược lưu trữ,
+   hoặc dùng filesystem có **inode động** như XFS. ⟹ ghi vào R19.
+
+---
+
+#### 📊 7c.2f — Đọc dòng progress của rsync (⚠️ có BẪY)
+
+```
+734,401  11%  3.03MB/s  0:00:00 (xfr#174, ir-chk=1000/1430)
+```
+
+| Phần | Nghĩa | Tin được? |
+|---|---|---|
+| `734,401` | số **byte** đã truyền (~734 KB) | ✅ đúng nhưng ít ý nghĩa |
+| `11%` | ⚠️ **KHÔNG phải 11% toàn job** | ❌ **BẪY** |
+| `3.03MB/s` | tốc độ byte | ❌ đo sai thứ (xem 7c.2e) |
+| `0:00:00` | ETA | ❌ vô nghĩa, hệ quả của `11%` sai |
+| `xfr#174` | đã truyền xong **174 file** | ✅ ⭐ **CHỈ SỐ ĐÁNG TIN NHẤT** |
+| `ir-chk=1000/1430` | còn 1000/1430 mục **của nhánh đang quét** | ⚠️ không phải toàn cây |
+
+> 🔴 **Vì sao `%` là bẫy:** rsync 3.x dùng **incremental file list** — nó
+> **vừa quét vừa copy**, tại thời điểm in ra nó **chưa biết tổng**.
+> `%` được tính trên phần file list *đã biết đến lúc đó*
+> ⟹ con số này sẽ **nhảy loạn, tụt xuống rồi lại lên** suốt quá trình.
+> **Đừng dùng nó để ước lượng thời gian còn lại.**
+
+**Cách theo dõi ĐÚNG:**
+```
+rsync   → xfr#  phải bò tới ~2.831.983   (tăng đều = khỏe;
+                                          đứng yên nhiều phút = có vấn đề)
+vmlp-09 → IFree phải bò 12.629.445 → ~6.970.000
+```
+
+**Ước lượng thời gian còn lại đáng tin hơn `%`:**
+lấy `xfr#` tại **2 mốc cách nhau 5 phút** → tính file/giây → chia `2.831.983`.
+
+---
+
+#### 🔁 7c.2c — Đứt giữa chừng thì sao? (vrp-07 không có screen/tmux)
+
+**rsync là IDEMPOTENT** ⟹ chạy lại **đúng lệnh cũ**, nó tự bỏ qua file đã copy đủ
+(so sánh **size + mtime**), chỉ làm tiếp phần thiếu. `--partial` giữ file dở dang.
+
+```
+✅ KHÔNG mất công đã làm
+⚠️ NHƯNG phải trả giá: quét lại 5,66 triệu file CẢ HAI ĐẦU để biết cái nào xong
+   ⟹ đúng cái vừa ngốn ~13 phút ở dry-run
+   ⟹ đứt vài lần = cộng thêm cả tiếng
+```
+
+Rủi ro thật **không phải** Kiên bỏ đi, mà là **VDI rớt phiên ssh**
+(idle timeout / mạng chớp / VPN reset) ⟹ sshd gửi `SIGHUP` ⟹ rsync chết
+dù Kiên vẫn đang ngồi trước màn hình.
+
+Nếu muốn miễn nhiễm `SIGHUP` (⚠️ **cần ssh key trước**, vì `nohup` tách stdin
+nên rsync **không hỏi được mật khẩu**):
+```
+ssh-keygen -t rsa -b 2048 -N '' -f /root/.ssh/id_rsa
+ssh-copy-id vt_admin@10.208.137.43
+ssh -o BatchMode=yes vt_admin@10.208.137.43 'echo KEY_OK'
+
+nohup rsync -rlptDHAX --numeric-ids --info=progress2 --partial /data/ragflow/minio/ vt_admin@10.208.137.43:/home/app/app_data/ragflow/minio/ > /root/rsync-minio.log 2>&1 &
+tail -f /root/rsync-minio.log
+```
+> Kiên chốt 26/08: **không dùng**, chạy trực tiếp và tự canh.
 
 <details>
 <summary>Giải nghĩa phần MỚI THÊM: dry-run và screen (bấm để mở)</summary>
@@ -1477,18 +1877,27 @@ screen -S minio-rsync
 <summary>⭐ Giải nghĩa TỪNG CỜ — đọc kỹ, sai một cờ là hỏng dữ liệu (bấm để mở)</summary>
 
 ```
-rsync -aHAX --numeric-ids --info=progress2 --partial <nguồn>/ <đích>/
+rsync -rlptDHAX --numeric-ids --info=progress2 --partial <nguồn>/ <đích>/
 │
-├─ -a   archive: cờ GỘP, tương đương -rlptgoD
+├─ -rlptD  = chính là -a NHƯNG ĐÃ BỎ -o VÀ -g  ⭐⭐ ĐIỂM MẤU CHỐT
 │       │  r = recursive     đệ quy xuống thư mục con
 │       │  l = links         giữ symlink thành symlink
 │       │  p = perms         giữ quyền (rwx)
 │       │  t = times         giữ mtime — ⭐ QUAN TRỌNG với MinIO
-│       │  g = group         giữ group
-│       │  o = owner         giữ owner (cần quyền root bên nhận)
 │       │  D = devices+specials
-│       ⟹ Đây là cờ CỐT LÕI. Thiếu -a thì mất hết metadata,
-│          MinIO có thể không nhận diện được object
+│       │
+│       │  ❌ o = owner  ĐÃ BỎ — cần quyền root BÊN NHẬN
+│       │  ❌ g = group  ĐÃ BỎ — cần quyền root BÊN NHẬN
+│       │
+│       ⟹ VÌ SAO BỎ: bên nhận đăng nhập bằng `vt_admin` (uid thường),
+│          KHÔNG phải root ⟹ không thể chown file thành root:root
+│          ⟹ nếu giữ -o -g: rsync báo hàng loạt "failed to set ownership"
+│
+│       ⟹ CÓ AN TOÀN KHÔNG? CÓ. Data MinIO chỉ là file dữ liệu —
+│          quan trọng là NỘI DUNG + CẤU TRÚC THƯ MỤC, không phải uid
+│          ghi trên inode. Copy xong owner sẽ là vt_admin, rồi
+│          `chown -R root:root` một phát ở bước 7c.3b là xong
+│          (thao tác metadata CỤC BỘ, nhanh hơn nhiều so với copy)
 │
 ├─ -H   hard-links: giữ HARDLINK.
 │       ⭐ MinIO KHÔNG dùng hardlink nhiều, nhưng bật để chắc chắn —
@@ -1505,8 +1914,8 @@ rsync -aHAX --numeric-ids --info=progress2 --partial <nguồn>/ <đích>/
 │       ⭐ BẮT BUỘC khi copy giữa 2 máy: cùng một TÊN user có thể mang
 │       UID khác nhau trên 2 máy. Không có cờ này, rsync dịch theo TÊN
 │       và owner bị đổi sai âm thầm.
-│       ⟹ Ở đây: giữ nguyên uid 0 (root) từ nguồn sang đích — khớp với
-│          MinIO chạy uid 0 ở cả 2 cụm (xem phát hiện 9)
+│       ⟹ Ở đây: đã bỏ -o -g nên cờ này ít tác dụng, nhưng GIỮ LẠI
+│          vì vô hại và phòng khi sau này thêm lại -o -g
 │
 ├─ --info=progress2
 │       Hiện tiến độ TỔNG THỂ (%, tốc độ, thời gian còn lại) trên MỘT dòng,
@@ -1541,7 +1950,7 @@ chạy hàng giờ. ❓ *Chưa đo thực tế.*
 > Giữ lại phòng khi rsync gặp sự cố.
 
 ```
-tar -cf - -C /data/ragflow/minio . | ssh root@10.208.137.43 'tar -xf - -C /home/app/app_data/ragflow/minio'
+tar -cf - -C /data/ragflow/minio . | ssh vt_admin@10.208.137.43 'tar -xf - -C /home/app/app_data/ragflow/minio'
 ```
 
 <details>
@@ -1570,6 +1979,51 @@ tar -cf - -C /data/ragflow/minio .  |  ssh <đích> 'tar -xf - -C <thư mục>'
    - KHÔNG so sánh được 2 bên khi chạy lại
    ⟹ CHỈ dùng khi node đích không có rsync và không cài được (airgap)
 ```
+</details>
+
+---
+
+### 🔴 7c.3b BẮT BUỘC — trả owner về `root:root` sau khi rsync xong
+
+> Hệ quả trực tiếp của việc bỏ `-o -g` (xem 7c.2). Sau rsync, toàn bộ 5,66 triệu
+> mục đang thuộc **`vt_admin:vt_admin`**. MinIO chạy **uid 0** ⟹ phải trả về root.
+> **Chạy TRƯỚC khi tạo PV/StatefulSet, SAU khi rsync báo hoàn tất.**
+
+Trên **vmlp-09**, user **`root`**:
+```
+chown -R root:root /home/app/app_data/ragflow/minio
+ls -ld /home/app/app_data/ragflow/minio
+ls -l /home/app/app_data/ragflow/minio | head -5
+```
+
+<details>
+<summary>Giải nghĩa + cảnh báo thời gian (bấm để mở)</summary>
+
+```
+chown -R root:root /home/app/app_data/ragflow/minio
+│ └─ -R  recursive: áp dụng xuống TOÀN BỘ cây con
+│
+│   ⚠️ ĐÂY LÀ NGOẠI LỆ DUY NHẤT của luật "không chạy lệnh đệ quy trên
+│      thư mục MinIO". Bắt buộc phải có vì rsync không set owner.
+│
+│   ⏱️ THỜI GIAN: chạm vào 5.664.048 inode ⟹ chạy LÂU (nhiều phút tới
+│      hàng chục phút). NHƯNG vẫn nhanh hơn NHIỀU so với rsync vì:
+│      ├─ thao tác CỤC BỘ, không qua mạng, không qua ssh/mã hoá
+│      ├─ chỉ GHI trường uid/gid trong inode — không đụng block dữ liệu
+│      └─ không phải cấp phát inode mới, không tạo dentry
+│      ⟹ đây chính là lý do "copy về vt_admin rồi chown sau" RẺ HƠN
+│         là vật lộn với sudo/PermitRootLogin (xem phát hiện 10, 11)
+│
+│   ⚠️ KHÔNG Ctrl-C giữa chừng. Nếu lỡ đứt: chạy LẠI cùng lệnh —
+│      chown là idempotent, mục đã đúng owner thì set lại vô hại
+│
+ls -l ... | head -5   → xem 5 mục đầu, xác nhận đã là root root
+    ⚠️ KHÔNG chạy `ls -l` trần trên thư mục này — nó sẽ cố liệt kê
+       hàng triệu mục. Luôn có `| head`
+```
+
+✅ **Kỳ vọng sau khi chạy**: mọi mục đều `root root`, khớp uid 0 mà MinIO dùng
+ở cả 2 cụm (xem §4 — `securityContext: {}` ⟹ chạy uid 0).
 </details>
 
 ---
@@ -1631,8 +2085,11 @@ Nhưng **số file phải khớp TUYỆT ĐỐI**.
 
 Copy tar sang trước — chạy trên **vrp-07** (`root`):
 ```
-scp /tmp/ragflow-images.tar root@10.208.137.43:/tmp/
+scp /tmp/ragflow-images.tar vt_admin@10.208.137.43:/tmp/
 ```
+
+> 🔴 **ĐÃ SỬA `root@` → `vt_admin@`** — vmlp-09 chặn `PermitRootLogin` (phát hiện 10).
+> `/tmp` là `1777` nên vt_admin ghi được, không cần thêm quyền gì.
 
 Rồi trên **vmlp-09**, user **`root`**:
 ```
@@ -1644,8 +2101,10 @@ ctr -n k8s.io images ls | grep -i minio
 <summary>⚠️ Giải nghĩa — LUẬT CỨNG về -n k8s.io (bấm để mở)</summary>
 
 ```
-scp /tmp/ragflow-images.tar root@10.208.137.43:/tmp/
+scp /tmp/ragflow-images.tar vt_admin@10.208.137.43:/tmp/
 │   scp = secure copy, copy file qua ssh. 838M, mạng nội bộ ⟹ nhanh
+│   ⭐ 1 file lớn ⟹ BANDWIDTH-bound, nhanh thật (khác hẳn rsync 5,66M
+│      file nhỏ ở 7c.2 vốn METADATA-bound — xem 7c.2e)
 │
 ctr -n k8s.io images import /tmp/ragflow-images.tar
 │ │
@@ -1698,6 +2157,10 @@ thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest
 | ~~R16~~ | ~~Operator v5.0.6 có hỗ trợ tính năng cần không~~ | ⏸️ **HOÃN** | Cùng lý do R15 — chỉ liên quan khi chuyển sang Tenant |
 | **R17** | Image reference thiếu prefix registry | 🟠 | Lỗi này **sẽ tái phát ở cụm mới** nếu bê nguyên values sang. Phải sửa thành FQDN registry ở cả 2 nơi |
 | **R18** | `mountPath` vMLP là `/export`, vRP là `/data` | 🟡 | Khác biệt layout — không được bê nguyên config vRP sang Tenant vMLP |
+| 🔴 **R19** | **Migrate KHÔNG sửa nguyên nhân gốc — chỉ mua thời gian** | 🔴 **CAO** | Đo 26/08: 2.831.983 file / **2.832.065 thư mục** (tỉ lệ 1:1). Inode đích sẽ nhảy **4% → ~49%**. vmlp-09 chỉ hơn ở chỗ bảng inode **13,1M vs 6,55M**. MinIO vẫn ăn ~3 inode/object ⟹ **sẽ bò lên lại**. Sửa gốc = giảm số object / gộp file nhỏ / filesystem inode động (XFS). Xem 7c.2e |
+| 🔴 **R20** | Đích là **`/` chứ không phải partition riêng** | 🔴 **CAO** | `/home` nằm trên `/dev/vda1` = **cùng `/`**. Inode/disk cạn ở đây **giết cả kubelet, containerd, log hệ thống** trên vmlp-09, không chỉ MinIO. Rủi ro tập trung **cao hơn** một mount riêng ⟹ alert `df -i` là **bắt buộc**, không phải tuỳ chọn |
+| **R21** | `chmod o+x` mở đường trên 3 thư mục cha của `/home/app` | 🟡 | Đã nới quyền `/home/app`, `/home/app/app_data`, `/home/app/app_data/ragflow` từ `0700` → `0701` cho vt_admin đi qua (7c.1b). **Chỉ cho đi xuyên qua, không cho liệt kê.** Cân nhắc trả về `0700` sau khi migrate xong nếu chính sách yêu cầu |
+| **R22** | vrp-07 **không có `screen`/`tmux`** | 🟡 | rsync chạy trực tiếp ⟹ VDI rớt phiên là tiến trình chết. Giảm nhẹ: rsync **idempotent** + `--partial` ⟹ chạy lại được, nhưng **mất ~13 phút quét lại** mỗi lần. Xem 7c.2c |
 
 ---
 
@@ -1717,17 +2180,24 @@ thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest
 - [x] ~~Chốt đường dẫn hostPath~~ ✅ **`/home/app/app_data/ragflow/minio`**
 - [x] ~~Chạy 7c.0 kiểm tra trước~~ ✅ **XONG 26/08** — cả 2 node có rsync 3.1.2,
       Kiên có root, `/home/app/app_data` tồn tại. ⚠️ Ra **phát hiện 9**: nguồn `root:root`
-      ⟹ **đổi `app@` → `root@`** trong lệnh rsync
+- [x] ~~Tạo thư mục đích (7c.1)~~ ✅ **XONG 26/08 14:14**
+- [x] ~~Mở đường cho vt_admin (7c.1b)~~ ✅ **XONG 26/08 14:33** — `chown vt_admin` thư mục đích
+      + `chmod o+x` 3 thư mục cha ⟹ `WRITE_OK`
+- [x] ~~Sửa lệnh rsync (phát hiện 10–12)~~ ✅ **bản cuối: `-rlptDHAX ... vt_admin@`**
+- [x] ~~Dry-run đối chiếu~~ ✅ **XONG 26/08 14:46** — `Number of files` = **5.664.048** KHỚP TUYỆT ĐỐI
 - [ ] Tạo namespace `ragflow` trên vMLP
-- [ ] scp `/tmp/ragflow-images.tar` (838M) từ vrp-07 → node đích
+- [ ] scp `/tmp/ragflow-images.tar` (838M) từ vrp-07 → node đích — ⚠️ dùng **`vt_admin@`**
 - [ ] `ctr -n k8s.io images import` trên node đích — ⚠️ **nhớ `-n k8s.io`**, không thì kubelet không thấy
 - [ ] Xác minh image đã vào đúng namespace: `ctr -n k8s.io images ls | grep minio`
 
 ### Bước 2 — copy dữ liệu (37G, nguồn ĐỨNG YÊN)
 
-- [ ] `rsync` từ vrp-07 (**chỉ ĐỌC**, không xoá gì bên nguồn) → node đích
-- [ ] ⚠️ Dùng cờ giữ nguyên quyền/owner/timestamp — MinIO nhạy với metadata
-- [ ] Đối chiếu **số inode** và **dung lượng** 2 bên sau khi copy xong
+- [x] ~~Đo ngân sách inode đích~~ ✅ 26/08: **12.629.445 free** / 13.107.200 (4%), **140G trống** / 197G
+      ⟹ đủ, sau copy còn ~6,97M inode (dùng ~49%)
+- [ ] 🔄 **rsync ĐANG CHẠY** (bắt đầu 26/08 ~14:50) — theo dõi `xfr#` → **2.831.983**
+- [x] ~~Chốt cờ giữ metadata~~ ✅ `-rlptDHAX` — **bỏ `-o -g`** (không có root ở đích), bù bằng 7c.3b
+- [ ] 🔴 **`chown -R root:root` (7c.3b)** — BẮT BUỘC sau rsync, trước khi dựng workload
+- [ ] Đối chiếu **số inode** và **dung lượng** 2 bên sau khi copy xong (7c.3)
 
 ### Bước 3 — dựng workload MinIO trên vMLP
 
@@ -1798,3 +2268,15 @@ thì **phải tag lại** hoặc khai đúng y hệt chuỗi đó trong manifest
 | 26/08 | Kiên chốt node + path | ✅ **vmlp-09** (`.43`), `/home/app/app_data/ragflow/minio` |
 | 26/08 | Chạy kiểm tra 7c.0 | ✅ rsync 3.1.2 cả 2 node, có root, thư mục cha tồn tại |
 | 26/08 | ⚠️ **Phát hiện 9** | Nguồn `root:root` vs đích `app:app` ⟹ **sửa lệnh rsync: `app@` → `root@`** |
+| 26/08 14:14 | Chạy 7c.1 tạo thư mục đích | ✅ `/home/app/app_data/ragflow/minio` (root root), cha `ragflow` → `app:app` |
+| 26/08 | 🔴 **Phát hiện 10** | rsync `root@` **chết** — vmlp-09 chặn `PermitRootLogin`. Vào vMLP phải qua `vt_admin` → `su -` |
+| 26/08 | 🔴 **Phát hiện 11** | `vt_admin` sudo **đòi mật khẩu** ⟹ **giết** phương án `--rsync-path="sudo rsync"` (phiên ssh không TTY) |
+| 26/08 | ⭐ Đổi hướng | Bỏ `-o -g` khỏi `-a` ⟹ **`-rlptDHAX` + `vt_admin@`**, chown lại sau. Không đụng sudoers/sshd |
+| 26/08 | 🔴 **Phát hiện 12** | `Permission denied` **không ở đích mà ở THƯ MỤC CHA** — 3 thư mục `0700` thuộc `app`. ⚠️ Do chính lệnh `chown app:app` tôi đưa ở 7c.1 gây ra |
+| 26/08 14:33 | Chạy 7c.1b | `namei -l` xác nhận, `chmod o+x` 3 cha → `drwx-----x` ⟹ **`WRITE_OK`** ✅ |
+| 26/08 | Đo ngân sách inode đích | 12.629.445 free / 13,1M (**4%**), 140G/197G. Sau copy → dùng ~49% ⟹ **R19, R20** |
+| 26/08 14:46 | ✅ **Dry-run KHỚP TUYỆT ĐỐI** | `Number of files` = **5.664.048**; reg 2.831.983 / dir 2.832.065 (**tỉ lệ 1:1**); `deleted: 0` |
+| 26/08 | ⚠️ Làm rõ chênh lệch dung lượng | `du` **37G** vs rsync **20,3 GiB** — chênh ~17G là **slack space** (block 4K + 2,83M thư mục × 4K). Không mâu thuẫn |
+| 26/08 | vrp-07 không có `screen`/`tmux` | Chỉ có `nohup`/`setsid`. Kiên chốt **chạy trực tiếp, tự canh** ⟹ **R22** |
+| 26/08 ~14:50 | 🔄 **rsync bản thật BẮT ĐẦU** | `xfr#174` sau vài phút. Theo dõi bằng **`xfr#`**, KHÔNG dùng `%` (bẫy incremental file list) |
+| 26/08 | 🎓 Kiên hỏi metadata-bound vs bandwidth-bound | Viết mục **7c.2e** — giải thích đầy đủ + nối vào R19: **3 hiện tượng (inode cạn / copy chậm / du≠size) đều CÙNG MỘT nguyên nhân** |
