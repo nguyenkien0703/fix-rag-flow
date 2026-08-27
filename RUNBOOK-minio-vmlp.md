@@ -32,6 +32,7 @@ vì node 07 cạn inode. RAGFlow **vẫn ở lại vRP**, gọi sang MinIO qua N
 | **Console MinIO** | `10.208.137.43:9901` |
 | **Image** | `docker.io/minio/minio:RELEASE.2025-06-13T11-33-47Z` |
 | **Dung lượng** | 37G on-disk / 20,3 GiB logic / **5.664.048 inode** |
+| **Nguồn cấu hình endpoint** | ⭐ **`values.yaml` của Helm chart** trên `vrp-04:~/helm_ragflow_v0.26.4/` — **KHÔNG** phải `kubectl patch` (xem 5.5, 6.7) |
 
 ---
 
@@ -47,6 +48,21 @@ Thư mục: **`/home/app/KienNV_DevOps/`** (user `app`)
 | `minio-pv-pvc.yaml` | PersistentVolume + PersistentVolumeClaim |
 | `minio-sts.yaml` | StatefulSet MinIO |
 | `minio-svc.yaml` | 2 Service: headless + NodePort |
+
+### 2.1b ⭐ Trên node vrp-04 (`10.208.137.51`) — Helm chart của RAGFlow
+
+Thư mục: **`~/helm_ragflow_v0.26.4/`** (user `app`)
+
+| File | Vai trò |
+|:---|:---|
+| **`values.yaml`** | ⭐ **NGUỒN SỰ THẬT** cho endpoint MinIO. Chứa `minio.enabled: false` + `env.MINIO_HOST/MINIO_PORT` |
+| `values.yaml.truoc-tat-minio` | Backup trước khi tắt MinIO (27/08) |
+| `templates/env.yaml` | Dòng ~35: nhánh `if .Values.minio.enabled` quyết định lấy host từ đâu |
+| `templates/_ragflow_config.yaml.bk` | ⚠️ File `.bk` **nằm trong `templates/`** — Helm render **mọi** file ở đây, kể cả đuôi `.bk`. Hiện không khai `minio` nên vô hại, **nhưng nên chuyển ra ngoài** |
+
+> [!danger] Mọi thay đổi cấu hình RAGFlow phải đi qua đây
+> `kubectl patch` / `kubectl edit` trên object Helm quản lý chỉ sống **tới lần
+> `helm upgrade` kế tiếp**. Xem 6.7.
 
 ### 2.2 Trong git repo `fix-rag-flow`
 
@@ -191,19 +207,61 @@ kubectl -n ragflow get secret ragflow-env-config -o jsonpath='{.data.MINIO_ROOT_
 kubectl -n ragflow get secret ragflow-env-config -o jsonpath='{.data.MINIO_HOST}' | base64 -d; echo
 ```
 
-### 5.5 Đổi endpoint MinIO mà RAGFlow trỏ tới
-⚠️ RAGFlow đọc **`/ragflow/conf/service_conf.yaml`** (từ ConfigMap
-`ragflow-service-config`), **KHÔNG** đọc trực tiếp `MINIO_PORT` trong secret.
+### 5.5 Đổi endpoint MinIO mà RAGFlow trỏ tới — ⚠️ SỬA TRONG HELM CHART
 
-Trên **vrp-04** (`app`):
+> 🔴 **KHÔNG dùng `kubectl patch secret`.** Secret `ragflow-env-config` do **Helm quản lý**
+> ⟹ lần `helm upgrade` kế tiếp sẽ **ghi đè** giá trị vừa patch, RAGFlow âm thầm quay về
+> endpoint cũ. Đã mắc thật 26–27/08, xem 6.7.
+
+**Nguồn sự thật duy nhất**: `values.yaml` của chart, trên **vrp-04**
+tại `~/helm_ragflow_v0.26.4/`.
+
+Chart đã có sẵn nhánh xử lý MinIO ngoài cụm (`templates/env.yaml`):
+
+```gotemplate
+{{- if .Values.minio.enabled }}
+MINIO_HOST: {{ printf "%s-minio.%s.svc" (include "ragflow.fullname" .) .Release.Namespace }}
+MINIO_PORT: "9000"
+{{- else }}
+MINIO_HOST: {{ default "" .Values.env.MINIO_HOST | quote }}
+MINIO_PORT: {{ default "9000" .Values.env.MINIO_PORT | quote }}
+{{- end }}
 ```
-kubectl -n ragflow get cm ragflow-service-config -o yaml | grep -A3 minio
-echo -n '<ip-moi>' | base64
-kubectl -n ragflow patch secret ragflow-env-config -p '{"data":{"MINIO_HOST":"<base64>"}}'
-kubectl -n ragflow rollout restart deploy ragflow
+
+⟹ Đặt `minio.enabled: false` thì chart **tự chuyển sang đọc `env.MINIO_HOST`**.
+
+**Cấu hình đang dùng** trong `values.yaml`:
+
+```yaml
+env:
+  MINIO_HOST: "10.208.137.43"
+  MINIO_PORT: "9000"
+  # ... các biến khác
+
+minio:
+  enabled: false        # ⭐ tắt MinIO nội cụm trên vRP
 ```
-> 💡 **Mẹo đã dùng**: thay vì sửa RAGFlow, **đổi NodePort bên vMLP cho khớp** —
-> nhanh hơn và ít rủi ro hơn. Xem 6.1.
+
+Sửa xong, **render thử trước khi upgrade**:
+
+```bash
+helm template ragflow . -n ragflow | grep -E "MINIO_HOST|MINIO_PORT"
+```
+
+```bash
+helm template ragflow . -n ragflow | grep -E "^kind:|^  name:" | grep -B1 -i minio
+```
+
+Lệnh 1 phải ra IP mới. Lệnh 2 phải **rỗng** (không còn object MinIO nào được render).
+
+```bash
+helm -n ragflow upgrade ragflow . --wait --timeout 5m
+```
+
+> [!tip] Mẹo: đôi khi sửa phía KIA rẻ hơn
+> Khi RAGFlow gọi port X mà MinIO nghe port Y, có **hai** cách. Sửa ConfigMap/chart rồi
+> rollout, hoặc **đổi NodePort bên vMLP về đúng port RAGFlow đang gọi** — 1 lệnh,
+> không đụng ứng dụng, không downtime. Đã dùng cách 2 khi cần gấp (xem 6.1).
 
 ### 5.6 Đổi NodePort của MinIO
 Trên **vmlp-08** (`app`):
@@ -294,6 +352,45 @@ vMLP không cho ssh root ⟹ phải dùng **`-rlptDHAX`** (bỏ `-o -g`) rồi
 
 ---
 
+### 6.7 🔴 `kubectl patch` bị `helm upgrade` GHI ĐÈ — sửa phải vào chart
+
+**Triệu chứng**: đã `kubectl patch secret` đổi `MINIO_HOST` sang IP cụm mới, verify
+`base64 -d` in đúng giá trị mới, RAGFlow chạy tốt. Nhưng sau một lần `helm upgrade`
+(vì việc **khác**, không liên quan MinIO), RAGFlow **âm thầm** quay lại gọi
+`ragflow-minio.ragflow.svc:9000` — endpoint cũ trong cụm vRP.
+
+**Nguyên nhân**: Secret `ragflow-env-config` do **Helm quản lý**
+(`meta.helm.sh/release-name: ragflow`). Mọi `kubectl patch/edit` trên object Helm
+quản lý chỉ sống **tới lần upgrade kế tiếp** — Helm render lại từ chart và ghi đè.
+
+> [!danger] Vì sao rất khó phát hiện
+> MinIO cũ đã `scale --replicas=0` nhưng **Service `ragflow-minio` vẫn tồn tại**
+> ⟹ tên DNS **vẫn phân giải được** ⟹ RAGFlow kết nối "thành công" tới một MinIO **rỗng**.
+> Lỗi hiện ra là `NoSuchKey` (không tìm thấy object), **KHÔNG** phải `Connection refused`.
+> Rất dễ đọc nhầm thành "kết nối OK, chỉ thiếu dữ liệu".
+
+**Cách phân biệt** — đọc dòng ứng dụng tự khai config:
+
+```bash
+kubectl -n ragflow logs deploy/ragflow -c ragflow --since=10m | grep -A12 "Current configs" | grep -i minio
+```
+
+| Kết quả | Nghĩa |
+|:---|:---|
+| `'host': '10.208.137.43:9000'` | ✅ Đúng — đang gọi MinIO trên vMLP |
+| `'host': 'ragflow-minio.ragflow.svc:9000'` | 🔴 **SAI** — đang gọi MinIO cũ trong cụm vRP |
+
+**Cách sửa triệt để**: sửa `values.yaml` (mục 5.5), **không** `kubectl patch`.
+
+> [!success] Đã fix 27/08 — không tái phát được nữa
+> `minio.enabled: false` giải quyết **cả hai** vấn đề cùng lúc:
+> 1. Chart **không render** StatefulSet/Service/PVC MinIO ⟹ `helm upgrade` không dựng lại
+> 2. Chart **tự chuyển** sang đọc `env.MINIO_HOST` ⟹ endpoint trỏ đúng vMLP
+>
+> Không còn phụ thuộc vào việc nhớ hay quên xóa phần MinIO trước mỗi lần upgrade.
+
+---
+
 ## 7. 🔴 VIỆC CÒN NỢ — cần làm sớm
 
 | # | Việc | Vì sao gấp |
@@ -304,8 +401,10 @@ vMLP không cho ssh root ⟹ phải dùng **`-rlptDHAX`** (bỏ `-o -g`) rồi
 | **3** | Giảm số object của MinIO | 🟠 Nguyên nhân gốc **chưa được sửa**. Migrate chỉ **mua thêm thời gian** (bảng inode 13,1M so với 6,55M). Hướng: gộp file nhỏ / đổi chiến lược lưu / filesystem inode động (XFS) |
 | **4** | Đồng bộ manifest git ↔ thực tế | 🟡 `manifests-vmlp/minio-vmlp.yaml` còn ghi `nodePort: 30900/30901`, thực tế là `9000/9901` |
 | **5** | Trả quyền `/home/app*` về `0700` | 🟡 Đã `chmod o+x` 3 thư mục cha để rsync đi qua (chỉ cho *đi xuyên*, không cho *liệt kê*). Cân nhắc trả lại nếu chính sách yêu cầu |
-| **6** | Dọn `sts/ragflow-minio` cũ ở vRP | 🟡 Đang `replicas=0`. Còn PV/PVC `pv-ragflow-minio` treo ở đó |
+| ~~**6**~~ | ~~Dọn `sts/ragflow-minio` cũ ở vRP~~ | ✅ **XONG 27/08** — `helm upgrade` với `minio.enabled: false` xoá STS + Service; PVC `ragflow-minio` + PV `pv-ragflow-minio`, `pv-ragflow-custom-minio` đã `delete` thủ công |
 | **7** | Rotate token RAGFlow + mật khẩu ES | 🟡 Đã lọt git history từ trước (xem `CLAUDE.md`) |
+| **8** | Chuyển `templates/_ragflow_config.yaml.bk` **ra khỏi** `templates/` | 🟡 Helm render **mọi** file trong `templates/`, kể cả đuôi `.bk`. Hiện không khai `minio` nên vô hại, nhưng là mìn chờ — kiểu file này đã từng gây sự cố "sửa config không có tác dụng" ở phiên trước |
+| **9** | Thử **upload tài liệu thật** qua UI RAGFlow | 🟠 Mọi verify tới giờ chứng minh *cấu hình đúng* và *đọc được*. Chưa có phép kiểm nào chứng minh **đường GHI** sang MinIO vMLP hoạt động |
 
 ---
 
