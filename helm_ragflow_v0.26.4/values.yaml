@@ -169,14 +169,43 @@ ragflow:
     # Con so: node worker 8C/16G (.51/.52/.54) va 16C/32G (.53/.55).
     # replicas=3 voi requests 2C/4Gi => tong dat cho 6C/12Gi, vua voi cum.
     # ⚠️ Nen do lai bang `kubectl top pod` sau vai ngay va chinh theo p95 thuc te.
+    # ⭐ 2026-09-14 — memory 8Gi -> 12Gi. ROOT CAUSE THAT SU CUA VU RESTART.
+    # dmesg -T tren vrp-kubeengine06 (ngay 10/09 09:19, 10/09 11:42, 14/09 14:48):
+    #   python3 invoked oom-killer ... oom_score_adj=873
+    #   mem_cgroup_out_of_memory                  <-- OOM CUA CGROUP, khong phai node
+    #   Killed process 19716 (python3) anon-rss:5691980kB   <-- task_executor ~5.7GB
+    #   Killed process 19727 (python3) anon-rss:1154168kB   <-- ragflow_server ~1.1GB
+    # entrypoint.sh line 220/309 deu bao "Killed" => ca 2 tien trinh bi SIGKILL.
+    #
+    # ⭐ VI SAO POD VAN "Running" MA LAI 0/1 ROI TU SONG LAI:
+    # entrypoint.sh dong vai supervisor - no RESPAWN tien trinh bi OOM-kill.
+    # Container KHONG chet => k8s khong ghi OOMKilled, RESTARTS khong tang.
+    # Chi co khoang trong giua luc bi giet va luc respawn xong: port 9380 khong
+    # ai listen => probe "connection refused" => pod 0/1 => respawn xong => 1/1.
+    # ⟹ describe pod chi thay probe fail, HOAN TOAN KHONG thay dau vet OOM.
+    #    Phai doc dmesg tren NODE moi thay. Bay chan doan rat de dinh.
+    #
+    # Dinh do duoc ~6.6GB rieng 2 tien trinh python + nginx/admin => cham tran 8Gi.
+    # 12Gi = bien ~1.5x so voi dinh. KHONG dat 16Gi vi node 04/05/07 chi co
+    # 15.9Gi allocatable => limits 16Gi se khong schedule duoc len cac node do.
+    #
+    # CPU GIU NGUYEN: cpu.stat do duoc nr_throttled 65/7920 period (0.8%)
+    # => CPU khong phai nut that, tang CPU chi ton quota cum.
+    #
+    # ⚠️ Giam replicas 3->2 KHONG sua duoc loi nay: OOM la mem_cgroup (tran cua
+    #    TUNG pod), khong phai node het RAM. Bot pod thi pod con lai van limits
+    #    8Gi va van OOM, con OOM nhanh hon vi ganh nhieu ingest hon.
+    #
+    # 🔶 Neu 12Gi van OOM => tach task_executor ra Deployment RIENG. No ngon
+    #    5.7GB va dang keo sap ca ragflow_server nam chung cgroup.
     resources:
       requests:
         cpu: "2"
-        memory: 4Gi
+        memory: 6Gi
         ephemeral-storage: 2Gi
       limits:
         cpu: "4"
-        memory: 8Gi
+        memory: 12Gi
         ephemeral-storage: 10Gi
 
     # --- Probes (them 2026-08-21) ------------------------------------------
