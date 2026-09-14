@@ -169,14 +169,43 @@ ragflow:
     # Con so: node worker 8C/16G (.51/.52/.54) va 16C/32G (.53/.55).
     # replicas=3 voi requests 2C/4Gi => tong dat cho 6C/12Gi, vua voi cum.
     # ⚠️ Nen do lai bang `kubectl top pod` sau vai ngay va chinh theo p95 thuc te.
+    # ⭐ 2026-09-14 — memory 8Gi -> 12Gi. ROOT CAUSE THAT SU CUA VU RESTART.
+    # dmesg -T tren vrp-kubeengine06 (ngay 10/09 09:19, 10/09 11:42, 14/09 14:48):
+    #   python3 invoked oom-killer ... oom_score_adj=873
+    #   mem_cgroup_out_of_memory                  <-- OOM CUA CGROUP, khong phai node
+    #   Killed process 19716 (python3) anon-rss:5691980kB   <-- task_executor ~5.7GB
+    #   Killed process 19727 (python3) anon-rss:1154168kB   <-- ragflow_server ~1.1GB
+    # entrypoint.sh line 220/309 deu bao "Killed" => ca 2 tien trinh bi SIGKILL.
+    #
+    # ⭐ VI SAO POD VAN "Running" MA LAI 0/1 ROI TU SONG LAI:
+    # entrypoint.sh dong vai supervisor - no RESPAWN tien trinh bi OOM-kill.
+    # Container KHONG chet => k8s khong ghi OOMKilled, RESTARTS khong tang.
+    # Chi co khoang trong giua luc bi giet va luc respawn xong: port 9380 khong
+    # ai listen => probe "connection refused" => pod 0/1 => respawn xong => 1/1.
+    # ⟹ describe pod chi thay probe fail, HOAN TOAN KHONG thay dau vet OOM.
+    #    Phai doc dmesg tren NODE moi thay. Bay chan doan rat de dinh.
+    #
+    # Dinh do duoc ~6.6GB rieng 2 tien trinh python + nginx/admin => cham tran 8Gi.
+    # 12Gi = bien ~1.5x so voi dinh. KHONG dat 16Gi vi node 04/05/07 chi co
+    # 15.9Gi allocatable => limits 16Gi se khong schedule duoc len cac node do.
+    #
+    # CPU GIU NGUYEN: cpu.stat do duoc nr_throttled 65/7920 period (0.8%)
+    # => CPU khong phai nut that, tang CPU chi ton quota cum.
+    #
+    # ⚠️ Giam replicas 3->2 KHONG sua duoc loi nay: OOM la mem_cgroup (tran cua
+    #    TUNG pod), khong phai node het RAM. Bot pod thi pod con lai van limits
+    #    8Gi va van OOM, con OOM nhanh hon vi ganh nhieu ingest hon.
+    #
+    # 🔶 Neu 12Gi van OOM => tach task_executor ra Deployment RIENG. No ngon
+    #    5.7GB va dang keo sap ca ragflow_server nam chung cgroup.
     resources:
       requests:
         cpu: "2"
-        memory: 4Gi
+        memory: 6Gi
         ephemeral-storage: 2Gi
       limits:
         cpu: "4"
-        memory: 8Gi
+        memory: 12Gi
         ephemeral-storage: 10Gi
 
     # --- Probes (them 2026-08-21) ------------------------------------------
@@ -205,10 +234,13 @@ ragflow:
         port: 9380
       initialDelaySeconds: 20
       periodSeconds: 10
-      timeoutSeconds: 5
-      # failureThreshold 3 = hong 3 lan lien tiep (30s) moi rut khoi Endpoints.
-      # Khong de 1 vi ES/MySQL co the nhay mot nhip ngan.
-      failureThreshold: 3
+      # ⭐ 2026-09-14: 5 -> 15. healthz la DEEP CHECK (db+redis+ES+MinIO) VA
+      # dung chung worker pool voi request ingest. Do duoc trong container:
+      # healthz = 0.014s luc ranh, nhung khi pod dang ingest chunks thi request
+      # phai xep hang => vuot 5s => probe fail du app hoan toan song.
+      timeoutSeconds: 15
+      # 3 -> 5: 5 x 10s = 50s hong lien tuc moi rut khoi Endpoints.
+      failureThreshold: 5
       successThreshold: 1
 
     livenessProbe:
@@ -219,10 +251,22 @@ ragflow:
       # va phai cho qua giai doan khoi dong (load model, ket noi).
       initialDelaySeconds: 60
       periodSeconds: 20
-      timeoutSeconds: 5
-      # 6 lan x 20s = 2 phut treo lien tuc moi restart. Cao co chu dich:
-      # restart pod ragflow rat dat (image 7-8GB, phai load lai).
-      failureThreshold: 6
+      # ⭐ 2026-09-14: 5 -> 15. DAY LA NGUYEN NHAN POD BI RESTART OAN.
+      # Bang chung do duoc 14/09:
+      #   - trong container: ping = 0.003s, healthz = 0.014s, moi dependency "ok"
+      #   - cpu.stat: nr_throttled 65/7920 period (0.8%) => KHONG bi bop CPU
+      #   - log --previous truoc luc restart: app dang ingest chunks binh thuong,
+      #     khong crash / khong traceback / khong OOM
+      #   - curl tu node .52 vao pod: baseline 0.003s nhung CO SPIKE 1.001s
+      # => app song, chi la /system/ping XEP HANG sau request ingest nang.
+      #
+      # ⚠️ Gia dinh cu ("liveness dung ping thi ES chap chon khong giet pod")
+      # CHI DUNG neu ping co luong rieng. Thuc te ping dung CHUNG worker pool
+      # voi ingest => tach endpoint KHONG cuu duoc, vi nghen nam o worker pool.
+      timeoutSeconds: 15
+      # 6 -> 10: 10 x 20s = ~3.3 phut treo lien tuc moi restart.
+      # Restart pod ragflow rat dat (image 7-8GB) => tha cham con hon giet oan.
+      failureThreshold: 10
 
     # startupProbe: cho pod khoi dong cham ma KHONG bi liveness giet oan.
     # 30 x 10s = toi da 5 phut de start. Trong luc startupProbe chua pass,
