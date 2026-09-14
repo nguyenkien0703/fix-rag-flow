@@ -205,10 +205,13 @@ ragflow:
         port: 9380
       initialDelaySeconds: 20
       periodSeconds: 10
-      timeoutSeconds: 5
-      # failureThreshold 3 = hong 3 lan lien tiep (30s) moi rut khoi Endpoints.
-      # Khong de 1 vi ES/MySQL co the nhay mot nhip ngan.
-      failureThreshold: 3
+      # ⭐ 2026-09-14: 5 -> 15. healthz la DEEP CHECK (db+redis+ES+MinIO) VA
+      # dung chung worker pool voi request ingest. Do duoc trong container:
+      # healthz = 0.014s luc ranh, nhung khi pod dang ingest chunks thi request
+      # phai xep hang => vuot 5s => probe fail du app hoan toan song.
+      timeoutSeconds: 15
+      # 3 -> 5: 5 x 10s = 50s hong lien tuc moi rut khoi Endpoints.
+      failureThreshold: 5
       successThreshold: 1
 
     livenessProbe:
@@ -219,10 +222,22 @@ ragflow:
       # va phai cho qua giai doan khoi dong (load model, ket noi).
       initialDelaySeconds: 60
       periodSeconds: 20
-      timeoutSeconds: 5
-      # 6 lan x 20s = 2 phut treo lien tuc moi restart. Cao co chu dich:
-      # restart pod ragflow rat dat (image 7-8GB, phai load lai).
-      failureThreshold: 6
+      # ⭐ 2026-09-14: 5 -> 15. DAY LA NGUYEN NHAN POD BI RESTART OAN.
+      # Bang chung do duoc 14/09:
+      #   - trong container: ping = 0.003s, healthz = 0.014s, moi dependency "ok"
+      #   - cpu.stat: nr_throttled 65/7920 period (0.8%) => KHONG bi bop CPU
+      #   - log --previous truoc luc restart: app dang ingest chunks binh thuong,
+      #     khong crash / khong traceback / khong OOM
+      #   - curl tu node .52 vao pod: baseline 0.003s nhung CO SPIKE 1.001s
+      # => app song, chi la /system/ping XEP HANG sau request ingest nang.
+      #
+      # ⚠️ Gia dinh cu ("liveness dung ping thi ES chap chon khong giet pod")
+      # CHI DUNG neu ping co luong rieng. Thuc te ping dung CHUNG worker pool
+      # voi ingest => tach endpoint KHONG cuu duoc, vi nghen nam o worker pool.
+      timeoutSeconds: 15
+      # 6 -> 10: 10 x 20s = ~3.3 phut treo lien tuc moi restart.
+      # Restart pod ragflow rat dat (image 7-8GB) => tha cham con hon giet oan.
+      failureThreshold: 10
 
     # startupProbe: cho pod khoi dong cham ma KHONG bi liveness giet oan.
     # 30 x 10s = toi da 5 phut de start. Trong luc startupProbe chua pass,
